@@ -38,7 +38,7 @@ For text to image, you can go like this.
 ```python
 prompt = "1girl, 1boy"
 negative_prompt = "1girl"
-guidance_scale = 0.8
+guidance_scale = 7.5
 num_steps = 50
 image_size = (512, 512)  # width, height
 
@@ -57,9 +57,9 @@ For image to image, here is what you need.
 ```python
 prompt = "1girl, 1boy"
 negative_prompt = "1girl"
-guidance_scale = 0.8
+guidance_scale = 7.5
 init_image = "init_image.png"
-strength = 7.5
+strength = 0.8
 num_steps = 50
 image_size = (512, 512)  # width, height
 
@@ -86,10 +86,10 @@ Finally, this is the code for inpaint.
 ```python
 prompt = "1girl, 1boy"
 negative_prompt = "1girl"
-guidance_scale = 0.8
+guidance_scale = 7.5
 init_image = "init_image.png"
 mask_image = "mask_image.png"
-strength = 7.5
+strength = 0.8
 num_steps = 50
 image_size = (512, 512)  # width, height
 
