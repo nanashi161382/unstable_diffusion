@@ -1,6 +1,8 @@
 # unstable_diffusion
 
-This is a library to use the [stable_diffusion pipeline (v0.4.1)](https://github.com/huggingface/diffusers/tree/v0.4.1/src/diffusers/pipelines) more easily.
+This is a library to use the [stable_diffusion pipeline (v0.4.1)](https://github.com/huggingface/diffusers/tree/v0.4.1/src/diffusers/pipelines) more easily for the interactive use cases. The official pipeline classes are more suitable for the batch use cases, but a bit cumbersome to use for the interactive use cases especially on Google Colab. This library works as a wrapper to the library to give better experiences for the purpose.
+
+This library also aims to give additional functionalities for advanced users.
 
 ## [pipeline_unstable_diffusion.py](pipeline_unstable_diffusion.py)
 
@@ -29,7 +31,7 @@ auth_token = "" # auth token for HuggingFace if needed
 pipe = UnstableDiffusionPipeline().Connect(dataset, auth_token)
 ```
 
-Now you are ready for runnin the stable diffusion pipeline.
+Now you are ready for running the stable diffusion pipeline.
 
 For text to image, you can go like this.
 
@@ -38,10 +40,10 @@ prompt = "1girl, 1boy"
 negative_prompt = "1girl"
 guidance_scale = 0.8
 num_steps = 50
-image_size = (512, 512)
+image_size = (512, 512)  # width, height
 
 image = pipe(
-    pipeline_type=Txt2Img(*image_size),
+    pipeline_type=Txt2Img(image_size),
     prompt=prompt,
     negative_prompt=negative_prompt,
     guidance_scale=guidance_scale,
@@ -59,7 +61,7 @@ guidance_scale = 0.8
 init_image = "init_image.png"
 strength = 7.5
 num_steps = 50
-image_size = (512, 512)
+image_size = (512, 512)  # width, height
 
 def OpenImage(filename):
     image = Image.open(filename).convert("RGB")
@@ -89,7 +91,7 @@ init_image = "init_image.png"
 mask_image = "mask_image.png"
 strength = 7.5
 num_steps = 50
-image_size = (512, 512)
+image_size = (512, 512)  # width, height
 
 def OpenImage(filename):
     image = Image.open(filename).convert("RGB")
@@ -111,4 +113,4 @@ display(image)
 ```
 
 They work almost the same as the original stable diffusion pipelines, but there are some differences.
-Please check the description of the [initial commit](https://github.com/nanashi161382/unstable_diffusion/commit/7c94b3c74e7a23375e4158b54b85bbc6630302bf).
+Please check the description in the [initial commit](https://github.com/nanashi161382/unstable_diffusion/commit/7c94b3c74e7a23375e4158b54b85bbc6630302bf).
