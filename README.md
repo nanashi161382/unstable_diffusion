@@ -81,7 +81,7 @@ image = pipe(
 display(image)
 ```
 
-Finally, this is the code for inpaint.
+Finally, this is the code for inpaint. (note: the inpaint logic is equivalent to StableDiffusionInpaintPipelineLegacy, but not StableDiffusionInpaintPipeline.)
 
 ```python
 prompt = "1girl, 1boy"
