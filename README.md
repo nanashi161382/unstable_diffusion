@@ -1,6 +1,6 @@
 # unstable_diffusion
 
-This is a library to use the [stable_diffusion pipeline (v0.4.1)](https://github.com/huggingface/diffusers/tree/v0.4.1/src/diffusers/pipelines/stable_diffusion) more easily for the interactive use cases. The official pipeline classes are more suitable for the batch use cases, but a bit cumbersome to use for the interactive use cases especially on Google Colab. This library works as a wrapper to the library to give better experiences for the purpose.
+This is a library to use the [stable_diffusion pipeline](https://github.com/huggingface/diffusers/tree/main/src/diffusers/pipelines/stable_diffusion) more easily for the interactive use cases. The official pipeline classes are more suitable for the batch use cases, but a bit cumbersome to use for the interactive use cases especially on Google Colab. This library works as a wrapper to the library to give better experiences for the purpose.
 
 This library also aims to give additional functionalities for advanced users.
 
@@ -17,7 +17,7 @@ from pipeline_unstable_diffusion import Txt2Img, Img2Img, Inpaint, ImageModel, U
 You can import the library in Google Colab like this.
 
 ```python
-!pip install --upgrade diffusers==0.4.1 transformers scipy
+!pip install --upgrade diffusers transformers scipy accelerate
 # Original code: https://github.com/nanashi161382/unstable_diffusion/blob/main/pipeline_unstable_diffusion.py
 !wget 'https://raw.githubusercontent.com/nanashi161382/unstable_diffusion/main/pipeline_unstable_diffusion.py'
 from pipeline_unstable_diffusion import Txt2Img, Img2Img, Inpaint, ImageModel, UnstableDiffusionPipeline
