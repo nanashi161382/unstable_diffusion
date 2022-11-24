@@ -1,7 +1,7 @@
 # @title UnstableDiffusionPipeline
 # See the following web page for the usage.
 # https://github.com/nanashi161382/unstable_diffusion/tree/main
-from diffusers import StableDiffusionInpaintPipeline
+from diffusers import StableDiffusionInpaintPipelineLegacy
 from diffusers import DDIMScheduler
 import inspect
 import IPython
@@ -30,6 +30,8 @@ class PipelineType:
             self._generator = torch.Generator(device=pipe.device.type)
         self._generator.manual_seed(self._rand_seed)
         print(f"Setting random seed to {self._rand_seed}")
+
+    def GetGenerator(self):
         return self._generator
 
 
@@ -65,7 +67,7 @@ class Txt2Img(PipelineType):
         latents_dtype,
         num_inference_steps: int,
     ):
-        generator = self.InitializeGenerator(pipe)
+        generator = self.GetGenerator()
 
         # get the initial random noise unless the user supplied it
 
@@ -106,7 +108,7 @@ class Txt2Img(PipelineType):
         return latents, timesteps, None
 
 
-class Img2Img:
+class Img2Img(PipelineType):
     def __init__(
         self,
         init_image: PIL.Image.Image,
@@ -137,7 +139,7 @@ class Img2Img:
         latents_dtype,
         num_inference_steps: int,
     ):
-        generator = self.InitializeGenerator(pipe)
+        generator = self.GetGenerator()
 
         init_latents = pipe.image_model.Encode(self._init_image, generator)
         noise = torch.randn(init_latents.shape, generator=generator, device=pipe.device)
@@ -161,7 +163,7 @@ class Img2Img:
         return init_latents_noise, timesteps, None
 
 
-class Inpaint:
+class Inpaint(PipelineType):
     def __init__(
         self,
         init_image,
@@ -195,7 +197,7 @@ class Inpaint:
         latents_dtype,
         num_inference_steps: int,
     ):
-        generator = self.InitializeGenerator(pipe)
+        generator = self.GetGenerator()
 
         init_latents = pipe.image_model.Encode(self._init_image, generator)
         mask = pipe.image_model.PreprocessMask(self._mask_image)
@@ -320,7 +322,7 @@ class UnstableDiffusionPipeline:
             extra_args["revision"] = "diffusers-60k"
 
         # Prepare the StableDiffusion pipeline.
-        pipe = StableDiffusionInpaintPipeline.from_pretrained(dataset, **extra_args).to(
+        pipe = StableDiffusionInpaintPipelineLegacy.from_pretrained(dataset, **extra_args).to(
             self._devicetype_str
         )
         return self.SetPipeline(pipe)
@@ -334,9 +336,6 @@ class UnstableDiffusionPipeline:
         self.vae = self._pipe.vae
         self.image_model = ImageModel(self._pipe, self.vae, self.device)
         return self
-
-    def text_encoder(self, *input, **kwargs):
-        return self._pipe.text_encoder(*input, **kwargs)
 
     def progress_bar(self, *input, **kwargs):
         return self._pipe.progress_bar(*input, **kwargs)
@@ -357,7 +356,7 @@ class UnstableDiffusionPipeline:
                 f" {max_length} tokens: {removed_text}"
             )
             text_input_ids = text_input_ids[:, :max_length]
-        text_embeddings = self.text_encoder(text_input_ids.to(self.device))[0]
+        text_embeddings = self._pipe.text_encoder(text_input_ids.to(self.device))[0]
 
         # duplicate text embeddings for each generation per prompt
         return text_embeddings.repeat_interleave(1, dim=0)  # meaningless?
@@ -419,35 +418,35 @@ class UnstableDiffusionPipeline:
             generated images
         """
         with autocast(self._devicetype_str):
+            pipeline_type.InitializeGenerator(self)
+
             # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
             # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
             # corresponds to doing no classifier free guidance.
             do_classifier_free_guidance = guidance_scale > 1.0
 
-            text_embeddings = self.GetTextEmbeddings(
-                prompt, negative_prompt, do_classifier_free_guidance
+            #text_embeddings = self.GetTextEmbeddings(
+            #    prompt, negative_prompt, do_classifier_free_guidance
+            #)
+            text_embeddings = self._pipe._encode_prompt(
+                prompt, self.device, 1, do_classifier_free_guidance, negative_prompt
             )
 
             # set timesteps and initial latents
+            # TODO: Check the new version
             self.scheduler.set_timesteps(num_inference_steps)
             (
-                latents,
+                latents, 
                 timesteps,
                 apply_mask,
             ) = pipeline_type.GetInitialLatentsAndTimesteps(
                 self, text_embeddings.dtype, num_inference_steps
             )
 
-            # prepare extra kwargs for the scheduler step, since not all schedulers have the same signature
-            # eta (η) is only used with the DDIMScheduler, it will be ignored for other schedulers.
-            # eta corresponds to η in DDIM paper: https://arxiv.org/abs/2010.02502
-            # and should be between [0, 1]
-            accepts_eta = "eta" in set(
-                inspect.signature(self.scheduler.step).parameters.keys()
+            # 8. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
+            extra_step_kwargs = self._pipe.prepare_extra_step_kwargs(
+                pipeline_type.GetGenerator(), eta
             )
-            extra_step_kwargs = {}
-            if accepts_eta:
-                extra_step_kwargs["eta"] = eta
 
             for i, t in enumerate(self.progress_bar(timesteps)):
                 # expand the latents if we are doing classifier free guidance
