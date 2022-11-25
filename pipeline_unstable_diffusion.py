@@ -14,14 +14,17 @@ from typing import Optional, List, Union, Callable, Tuple
 
 
 class PipelineType:
-    def __init__(self, rand_seed: Optional[int]):
+    def __init__(self, rand_seed: Optional[int], use_new_timesteps: bool = True):
         """
         Args:
             rand_seed (`int`, *optional*):
                 A random seed for [torch generator](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make generation deterministic.
+            use_new_timesteps (`bool`, *optional*):
+                Switch the implementation of GetTimestepsWithStrength().
         """
         self._rand_seed = rand_seed
         self._generator = None
+        self._use_new_timesteps = use_new_timesteps
 
     def InitializeGenerator(self, pipe):
         if not self._rand_seed:
@@ -33,6 +36,68 @@ class PipelineType:
 
     def GetGenerator(self):
         return self._generator
+
+    def Rand(self, shape, device, dtype):
+        generator = self.GetGenerator()
+        if device.type == "mps":
+            # randn does not work reproducibly on mps
+            return torch.randn(
+                shape,
+                generator=generator,
+                device="cpu",
+                dtype=dtype,
+            ).to(device)
+        else:
+            return torch.randn(
+                shape,
+                generator=generator,
+                device=device,
+                dtype=dtype,
+            )
+
+    def GetTimestepsWithStrength(self, pipe, num_inference_steps, strength):
+        # Probably the new version is fine, but keep the old version for a while.
+        if self._use_new_timesteps:
+            return self.GetTimestepsWithStrengthNew(pipe, num_inference_steps, strength)
+        else:
+            return self.GetTimestepsWithStrengthOld(pipe, num_inference_steps, strength)
+
+    # Modified a copy from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img.StableDiffusionImg2ImgPipeline.get_timesteps
+    # Note: A bit skeptical about the correctness of the computation of `latent_timestep`
+    def GetTimestepsWithStrengthNew(self, pipe, num_inference_steps, strength):
+        # get the original timestep using init_timestep
+        offset = pipe.scheduler.config.get("steps_offset", 0)
+        init_timestep = int(num_inference_steps * strength) + offset
+        init_timestep = min(init_timestep, num_inference_steps)
+
+        # Some schedulers like PNDM have timesteps as arrays
+        # It's more optimized to move all timesteps to correct device beforehand
+        t_start = max(num_inference_steps - init_timestep + offset, 0)
+        timesteps = pipe.scheduler.timesteps[t_start:].to(pipe.device)
+
+        latent_timestep = timesteps[:1].repeat(1)  # is `repeat(1)` meaningful?
+
+        return timesteps, latent_timestep
+
+    # Old version of computing latent_timestep before refactoring.
+    def GetTimestepsWithStrengthOld(self, pipe, num_inference_steps, strength):
+        # get the original timestep using init_timestep
+        offset = pipe.scheduler.config.get("steps_offset", 0)
+        init_timestep = int(num_inference_steps * strength) + offset
+        init_timestep = min(init_timestep, num_inference_steps)
+
+        # Some schedulers like PNDM have timesteps as arrays
+        # It's more optimized to move all timesteps to correct device beforehand
+        t_start = max(num_inference_steps - init_timestep + offset, 0)
+        timesteps = pipe.scheduler.timesteps[t_start:].to(pipe.device)
+
+        # add noise to latents using the timesteps
+        latent_timestep = pipe.scheduler.timesteps[-init_timestep]
+        latent_timestep = torch.tensor(
+            [latent_timestep], device=pipe.device
+        )  # meaningless?
+
+        return timesteps, latent_timestep
 
 
 class Txt2Img(PipelineType):
@@ -53,25 +118,27 @@ class Txt2Img(PipelineType):
         """
         PipelineType.__init__(self, rand_seed)
         width, height = size
-        if height % 8 != 0 or width % 8 != 0:
-            raise ValueError(
-                f"`width` and `height` have to be divisible by 8 but are {width} and {height}."
-            )
         self._width = width
         self._height = height
         self._latents = latents
 
-    def GetInitialLatentsAndTimesteps(
-        self,
-        pipe,
-        latents_dtype,
-        num_inference_steps: int,
-    ):
+    def GetInitialLatentsAndTimesteps(self, pipe, dtype, num_inference_steps: int):
+        scale_factor = pipe.vae_scale_factor()
         generator = self.GetGenerator()
 
-        # get the initial random noise unless the user supplied it
+        if self._height % scale_factor != 0 or self._width % scale_factor != 0:
+            print(
+                f"`width` and `height` have to be divisible by {scale_factor}. "
+                "Automatically rounded."
+            )
 
-        latents_shape = (1, pipe.unet.in_channels, self._height // 8, self._width // 8)
+        # get the initial random noise unless the user supplied it
+        latents_shape = (
+            1,
+            pipe.unet.in_channels,
+            self._height // scale_factor,
+            self._width // scale_factor,
+        )
         if self._latents:  # user supplied latents
             if latents.shape != latents_shape:
                 raise ValueError(
@@ -79,24 +146,7 @@ class Txt2Img(PipelineType):
                 )
             latents = latents.to(pipe.device)
         else:
-            # Unlike in other pipelines, latents need to be generated in the target device
-            # for 1-to-1 results reproducibility with the CompVis implementation.
-            # However this currently doesn't work in `mps`.
-            if pipe.device.type == "mps":
-                # randn does not exist on mps
-                latents = torch.randn(
-                    latents_shape,
-                    generator=generator,
-                    device="cpu",
-                    dtype=latents_dtype,
-                ).to(pipe.device)
-            else:
-                latents = torch.randn(
-                    latents_shape,
-                    generator=generator,
-                    device=pipe.device,
-                    dtype=latents_dtype,
-                )
+            latents = self.Rand(latents_shape, pipe.device, dtype)
 
         # scale the initial noise by the standard deviation required by the scheduler
         latents = latents * pipe.scheduler.init_noise_sigma
@@ -114,6 +164,7 @@ class Img2Img(PipelineType):
         init_image: PIL.Image.Image,
         strength: float = 0.8,
         rand_seed: Optional[int] = None,
+        use_new_timesteps: bool = True,
     ):
         """
         Args:
@@ -124,8 +175,10 @@ class Img2Img(PipelineType):
                 `init_image` will be used as a starting point, adding more noise to it the larger the `strength`. The number of denoising steps depends on the amount of noise initially added. When `strength` is 1, added noise will be maximum and the denoising process will run for the full number of iterations specified in `num_inference_steps`. A value of 1, therefore, essentially ignores `init_image`.
             rand_seed (`int`, *optional*):
                 A random seed for [torch generator](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make generation deterministic.
+            use_new_timesteps (`bool`, *optional*):
+                Switch the implementation of GetTimestepsWithStrength().
         """
-        PipelineType.__init__(self, rand_seed)
+        PipelineType.__init__(self, rand_seed, use_new_timesteps)
         if strength < 0 or strength > 1:
             raise ValueError(
                 f"The value of strength should in [0.0, 1.0] but is {strength}"
@@ -133,32 +186,18 @@ class Img2Img(PipelineType):
         self._strength = strength
         self._init_image = init_image
 
-    def GetInitialLatentsAndTimesteps(
-        self,
-        pipe,
-        latents_dtype,
-        num_inference_steps: int,
-    ):
+    def GetInitialLatentsAndTimesteps(self, pipe, dtype, num_inference_steps: int):
         generator = self.GetGenerator()
 
-        init_latents = pipe.image_model.Encode(self._init_image, generator)
-        noise = torch.randn(init_latents.shape, generator=generator, device=pipe.device)
+        init_latents = pipe.image_model.Encode(self._init_image, dtype, generator)
+        noise = self.Rand(init_latents.shape, pipe.device, dtype)
+        timesteps, latent_timestep = self.GetTimestepsWithStrength(
+            pipe, num_inference_steps, self._strength
+        )
 
-        # get the original timestep using init_timestep
-        offset = pipe.scheduler.config.get("steps_offset", 0)
-        init_timestep = int(num_inference_steps * self._strength) + offset
-        init_timestep = min(init_timestep, num_inference_steps)
-
-        timesteps = pipe.scheduler.timesteps[-init_timestep]
-        timesteps = torch.tensor([timesteps], device=pipe.device)  # meaningless?
-
-        # add noise to latents using the timesteps
-        init_latents_noise = pipe.scheduler.add_noise(init_latents, noise, timesteps)
-
-        # Some schedulers like PNDM have timesteps as arrays
-        # It's more optimized to move all timesteps to correct device beforehand
-        t_start = max(num_inference_steps - init_timestep + offset, 0)
-        timesteps = pipe.scheduler.timesteps[t_start:].to(pipe.device)
+        init_latents_noise = pipe.scheduler.add_noise(
+            init_latents, noise, latent_timestep
+        )
 
         return init_latents_noise, timesteps, None
 
@@ -166,10 +205,11 @@ class Img2Img(PipelineType):
 class Inpaint(PipelineType):
     def __init__(
         self,
-        init_image,
+        init_image: PIL.Image.Image,
         mask_image: PIL.Image.Image,
         strength: float = 0.8,
         rand_seed: Optional[int] = None,
+        use_new_timesteps: bool = True,
     ):
         """
         Args:
@@ -181,8 +221,10 @@ class Inpaint(PipelineType):
                 Conceptually, indicates how much to inpaint the masked area. Must be between 0 and 1. When `strength` is 1, the denoising process will be run on the masked area for the full number of iterations specified in `num_inference_steps`. `init_image` will be used as a reference for the masked area, adding more noise to that region the larger the `strength`. If `strength` is 0, no inpainting will occur.
             rand_seed (`int`, *optional*):
                 A random seed for [torch generator](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make generation deterministic.
+            use_new_timesteps (`bool`, *optional*):
+                Switch the implementation of GetTimestepsWithStrength().
         """
-        PipelineType.__init__(self, rand_seed)
+        PipelineType.__init__(self, rand_seed, use_new_timesteps)
         if strength < 0 or strength > 1:
             raise ValueError(
                 f"The value of strength should in [0.0, 1.0] but is {strength}"
@@ -191,48 +233,33 @@ class Inpaint(PipelineType):
         self._init_image = init_image
         self._mask_image = mask_image
 
-    def GetInitialLatentsAndTimesteps(
-        self,
-        pipe,
-        latents_dtype,
-        num_inference_steps: int,
-    ):
+    def GetInitialLatentsAndTimesteps(self, pipe, dtype, num_inference_steps: int):
         generator = self.GetGenerator()
 
-        init_latents = pipe.image_model.Encode(self._init_image, generator)
-        mask = pipe.image_model.PreprocessMask(self._mask_image)
-        apply_mask = self.ApplyMask(pipe, init_latents, mask, generator)
+        init_latents = pipe.image_model.Encode(self._init_image, dtype, generator)
+        mask = pipe.image_model.PreprocessMask(self._mask_image, dtype)
+        noise = self.Rand(init_latents.shape, pipe.device, dtype)
+        apply_mask = self.ApplyMask(pipe, init_latents, mask, noise)
 
         # check sizes
         if not mask.shape == init_latents.shape:
             raise ValueError("The mask and init_image should be the same size!")
 
-        # get the original timestep using init_timestep
-        offset = pipe.scheduler.config.get("steps_offset", 0)
-        init_timestep = int(num_inference_steps * self._strength) + offset
-        init_timestep = min(init_timestep, num_inference_steps)
-
-        timesteps = pipe.scheduler.timesteps[-init_timestep]
-        timesteps = torch.tensor([timesteps], device=pipe.device)  # meaningless?
+        timesteps, latent_timestep = self.GetTimestepsWithStrength(
+            pipe, num_inference_steps, self._strength
+        )
 
         # add noise to latents using the timesteps
-        init_latents_noise = apply_mask.AddNoise(timesteps)
-
-        # Some schedulers like PNDM have timesteps as arrays
-        # It's more optimized to move all timesteps to correct device beforehand
-        t_start = max(num_inference_steps - init_timestep + offset, 0)
-        timesteps = pipe.scheduler.timesteps[t_start:].to(pipe.device)
+        init_latents_noise = apply_mask.AddNoise(latent_timestep)
 
         return init_latents_noise, timesteps, apply_mask
 
     class ApplyMask:
-        def __init__(self, pipe, init_latents, mask, generator):
+        def __init__(self, pipe, init_latents, mask, noise):
             self._pipe = pipe
             self._init_latents = init_latents
             self._mask = mask
-            self._noise = torch.randn(
-                init_latents.shape, generator=generator, device=pipe.device
-            )
+            self._noise = noise
 
         def AddNoise(self, ts):
             return self._pipe.scheduler.add_noise(self._init_latents, self._noise, ts)
@@ -243,13 +270,12 @@ class Inpaint(PipelineType):
 
 
 class ImageModel:
-    def __init__(self, pipe, vae, device):
+    def __init__(self, pipe: UnstableDiffusionPipeline):
         self._pipe = pipe
-        self._vae = vae
-        self._device = device
 
     def Preprocess(self, image: PIL.Image.Image):
         w, h = image.size
+        # Shouldn't this be consistent with vae_scale_factor?
         w, h = map(lambda x: x - x % 32, (w, h))  # resize to integer multiple of 32
         image = image.resize((w, h), resample=PIL.Image.LANCZOS)
         image = np.array(image).astype(np.float32) / 255.0
@@ -257,11 +283,13 @@ class ImageModel:
         image = torch.from_numpy(image)
         return 2.0 * image - 1.0
 
-    def Encode(self, image: PIL.Image.Image, generator: Optional[torch.Generator]):
-        image = self.Preprocess(image)
+    def Encode(
+        self, image: PIL.Image.Image, dtype, generator: Optional[torch.Generator]
+    ):
+        image = self.Preprocess(image).to(device=self._pipe.device, dtype=dtype)
 
         # encode the init image into latents and scale the latents
-        latent_dist = self._vae.encode(image.to(self._device)).latent_dist
+        latent_dist = self._pipe.vae.encode(image).latent_dist
         latents = latent_dist.sample(generator=generator)
         latents = 0.18215 * latents
 
@@ -270,24 +298,27 @@ class ImageModel:
 
     def Decode(self, latents):
         latents = 1 / 0.18215 * latents
-        image = self._vae.decode(latents).sample
-
+        image = self._pipe.vae.decode(latents).sample
         image = (image / 2 + 0.5).clamp(0, 1)
-        image = image.cpu().permute(0, 2, 3, 1).numpy()
+        # we always cast to float32 as this does not cause significant overhead and is compatible with bfloa16
+        image = image.cpu().permute(0, 2, 3, 1).float().numpy()
+        return self._pipe._pipe.numpy_to_pil(image)
 
-        return self._pipe.numpy_to_pil(image)
-
-    def PreprocessMask(self, mask: PIL.Image.Image):
+    def PreprocessMask(self, mask: PIL.Image.Image, dtype):
+        scale_factor = self._pipe.vae_scale_factor()
         # preprocess mask
         mask = mask.convert("L")
         w, h = mask.size
+        # Shouldn't this be consistent with vae_scale_factor?
         w, h = map(lambda x: x - x % 32, (w, h))  # resize to integer multiple of 32
-        mask = mask.resize((w // 8, h // 8), resample=PIL.Image.NEAREST)
+        mask = mask.resize(
+            (w // scale_factor, h // scale_factor), resample=PIL.Image.NEAREST
+        )
         mask = np.array(mask).astype(np.float32) / 255.0
         mask = np.tile(mask, (4, 1, 1))
         mask = mask[None].transpose(0, 1, 2, 3)  # what does this step do?
         mask = 1 - mask  # repaint white, keep black
-        mask = torch.from_numpy(mask).to(self._device)
+        mask = torch.from_numpy(mask).to(device=self._pipe.device, dtype=dtype)
         return torch.cat([mask])  # meaningless?
 
 
@@ -322,9 +353,9 @@ class UnstableDiffusionPipeline:
             extra_args["revision"] = "diffusers-60k"
 
         # Prepare the StableDiffusion pipeline.
-        pipe = StableDiffusionInpaintPipelineLegacy.from_pretrained(dataset, **extra_args).to(
-            self._devicetype_str
-        )
+        pipe = StableDiffusionInpaintPipelineLegacy.from_pretrained(
+            dataset, **extra_args
+        ).to(self._devicetype_str)
         return self.SetPipeline(pipe)
 
     def SetPipeline(self, pipe):
@@ -334,11 +365,19 @@ class UnstableDiffusionPipeline:
         self.unet = self._pipe.unet
         self.scheduler = self._pipe.scheduler
         self.vae = self._pipe.vae
-        self.image_model = ImageModel(self._pipe, self.vae, self.device)
+        self.image_model = ImageModel(self)
         return self
 
     def progress_bar(self, *input, **kwargs):
         return self._pipe.progress_bar(*input, **kwargs)
+
+    def vae_scale_factor(self):
+        if "vae_scale_factor" in dir(self._pipe):
+            print(
+                "vae_scale_factor is available in StableDiffusionInpaintPipelineLegacy."
+            )
+            return self._pipe.vae_scale_factor
+        return 2 ** (len(self.vae.config.block_out_channels) - 1)
 
     def EncodeText(self, text: str, max_length):
         text_inputs = self.tokenizer(
@@ -356,7 +395,10 @@ class UnstableDiffusionPipeline:
                 f" {max_length} tokens: {removed_text}"
             )
             text_input_ids = text_input_ids[:, :max_length]
-        text_embeddings = self._pipe.text_encoder(text_input_ids.to(self.device))[0]
+        text_embeddings = self._pipe.text_encoder(
+            text_input_ids.to(self.device),
+            attention_mask=None,
+        )[0]
 
         # duplicate text embeddings for each generation per prompt
         return text_embeddings.repeat_interleave(1, dim=0)  # meaningless?
@@ -425,18 +467,14 @@ class UnstableDiffusionPipeline:
             # corresponds to doing no classifier free guidance.
             do_classifier_free_guidance = guidance_scale > 1.0
 
-            #text_embeddings = self.GetTextEmbeddings(
-            #    prompt, negative_prompt, do_classifier_free_guidance
-            #)
-            text_embeddings = self._pipe._encode_prompt(
-                prompt, self.device, 1, do_classifier_free_guidance, negative_prompt
+            text_embeddings = self.GetTextEmbeddings(
+                prompt, negative_prompt, do_classifier_free_guidance
             )
 
             # set timesteps and initial latents
-            # TODO: Check the new version
             self.scheduler.set_timesteps(num_inference_steps)
             (
-                latents, 
+                latents,
                 timesteps,
                 apply_mask,
             ) = pipeline_type.GetInitialLatentsAndTimesteps(
