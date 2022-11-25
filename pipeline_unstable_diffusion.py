@@ -14,17 +14,14 @@ from typing import Optional, List, Union, Callable, Tuple
 
 
 class PipelineType:
-    def __init__(self, rand_seed: Optional[int], use_new_timesteps: bool = True):
+    def __init__(self, rand_seed: Optional[int]):
         """
         Args:
             rand_seed (`int`, *optional*):
                 A random seed for [torch generator](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make generation deterministic.
-            use_new_timesteps (`bool`, *optional*):
-                Switch the implementation of GetTimestepsWithStrength().
         """
         self._rand_seed = rand_seed
         self._generator = None
-        self._use_new_timesteps = use_new_timesteps
 
     def InitializeGenerator(self, pipe):
         if not self._rand_seed:
@@ -55,16 +52,8 @@ class PipelineType:
                 dtype=dtype,
             )
 
-    def GetTimestepsWithStrength(self, pipe, num_inference_steps, strength):
-        # Probably the new version is fine, but keep the old version for a while.
-        if self._use_new_timesteps:
-            return self.GetTimestepsWithStrengthNew(pipe, num_inference_steps, strength)
-        else:
-            return self.GetTimestepsWithStrengthOld(pipe, num_inference_steps, strength)
-
     # Modified a copy from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img.StableDiffusionImg2ImgPipeline.get_timesteps
-    # Note: A bit skeptical about the correctness of the computation of `latent_timestep`
-    def GetTimestepsWithStrengthNew(self, pipe, num_inference_steps, strength):
+    def GetTimestepsWithStrength(self, pipe, num_inference_steps, strength):
         # get the original timestep using init_timestep
         offset = pipe.scheduler.config.get("steps_offset", 0)
         init_timestep = int(num_inference_steps * strength) + offset
@@ -75,27 +64,7 @@ class PipelineType:
         t_start = max(num_inference_steps - init_timestep + offset, 0)
         timesteps = pipe.scheduler.timesteps[t_start:].to(pipe.device)
 
-        latent_timestep = timesteps[:1].repeat(1)  # is `repeat(1)` meaningful?
-
-        return timesteps, latent_timestep
-
-    # Old version of computing latent_timestep before refactoring.
-    def GetTimestepsWithStrengthOld(self, pipe, num_inference_steps, strength):
-        # get the original timestep using init_timestep
-        offset = pipe.scheduler.config.get("steps_offset", 0)
-        init_timestep = int(num_inference_steps * strength) + offset
-        init_timestep = min(init_timestep, num_inference_steps)
-
-        # Some schedulers like PNDM have timesteps as arrays
-        # It's more optimized to move all timesteps to correct device beforehand
-        t_start = max(num_inference_steps - init_timestep + offset, 0)
-        timesteps = pipe.scheduler.timesteps[t_start:].to(pipe.device)
-
-        # add noise to latents using the timesteps
-        latent_timestep = pipe.scheduler.timesteps[-init_timestep]
-        latent_timestep = torch.tensor(
-            [latent_timestep], device=pipe.device
-        )  # meaningless?
+        latent_timestep = timesteps[:1]
 
         return timesteps, latent_timestep
 
@@ -164,7 +133,6 @@ class Img2Img(PipelineType):
         init_image: PIL.Image.Image,
         strength: float = 0.8,
         rand_seed: Optional[int] = None,
-        use_new_timesteps: bool = True,
     ):
         """
         Args:
@@ -175,10 +143,8 @@ class Img2Img(PipelineType):
                 `init_image` will be used as a starting point, adding more noise to it the larger the `strength`. The number of denoising steps depends on the amount of noise initially added. When `strength` is 1, added noise will be maximum and the denoising process will run for the full number of iterations specified in `num_inference_steps`. A value of 1, therefore, essentially ignores `init_image`.
             rand_seed (`int`, *optional*):
                 A random seed for [torch generator](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make generation deterministic.
-            use_new_timesteps (`bool`, *optional*):
-                Switch the implementation of GetTimestepsWithStrength().
         """
-        PipelineType.__init__(self, rand_seed, use_new_timesteps)
+        PipelineType.__init__(self, rand_seed)
         if strength < 0 or strength > 1:
             raise ValueError(
                 f"The value of strength should in [0.0, 1.0] but is {strength}"
@@ -209,7 +175,6 @@ class Inpaint(PipelineType):
         mask_image: PIL.Image.Image,
         strength: float = 0.8,
         rand_seed: Optional[int] = None,
-        use_new_timesteps: bool = True,
     ):
         """
         Args:
@@ -221,10 +186,8 @@ class Inpaint(PipelineType):
                 Conceptually, indicates how much to inpaint the masked area. Must be between 0 and 1. When `strength` is 1, the denoising process will be run on the masked area for the full number of iterations specified in `num_inference_steps`. `init_image` will be used as a reference for the masked area, adding more noise to that region the larger the `strength`. If `strength` is 0, no inpainting will occur.
             rand_seed (`int`, *optional*):
                 A random seed for [torch generator](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make generation deterministic.
-            use_new_timesteps (`bool`, *optional*):
-                Switch the implementation of GetTimestepsWithStrength().
         """
-        PipelineType.__init__(self, rand_seed, use_new_timesteps)
+        PipelineType.__init__(self, rand_seed)
         if strength < 0 or strength > 1:
             raise ValueError(
                 f"The value of strength should in [0.0, 1.0] but is {strength}"
@@ -270,7 +233,12 @@ class Inpaint(PipelineType):
 
 
 class ImageModel:
-    def __init__(self, pipe: UnstableDiffusionPipeline):
+    def __init__(self, pipe):
+        """
+        Args:
+            pipe (`UnstableDiffusionPipeline`):
+                Pipeline object
+        """
         self._pipe = pipe
 
     def Preprocess(self, image: PIL.Image.Image):
@@ -293,8 +261,7 @@ class ImageModel:
         latents = latent_dist.sample(generator=generator)
         latents = 0.18215 * latents
 
-        # expand init_latents for batch_size
-        return torch.cat([latents], dim=0)  # meaningless?
+        return latents
 
     def Decode(self, latents):
         latents = 1 / 0.18215 * latents
@@ -319,7 +286,7 @@ class ImageModel:
         mask = mask[None].transpose(0, 1, 2, 3)  # what does this step do?
         mask = 1 - mask  # repaint white, keep black
         mask = torch.from_numpy(mask).to(device=self._pipe.device, dtype=dtype)
-        return torch.cat([mask])  # meaningless?
+        return mask
 
 
 class UnstableDiffusionPipeline:
@@ -400,8 +367,7 @@ class UnstableDiffusionPipeline:
             attention_mask=None,
         )[0]
 
-        # duplicate text embeddings for each generation per prompt
-        return text_embeddings.repeat_interleave(1, dim=0)  # meaningless?
+        return text_embeddings
 
     def GetTextEmbeddings(
         self,
