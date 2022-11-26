@@ -21,7 +21,7 @@ You can import the library in Google Colab like this.
 use_xformers = False
 # Original code: https://github.com/nanashi161382/unstable_diffusion/blob/main/pipeline_unstable_diffusion.py
 !wget 'https://raw.githubusercontent.com/nanashi161382/unstable_diffusion/main/pipeline_unstable_diffusion.py'
-from pipeline_unstable_diffusion import Txt2Img, Img2Img, Inpaint, ImageModel, UnstableDiffusionPipeline
+from pipeline_unstable_diffusion import Txt2Img, Img2Img, Inpaint, ImageModel, StandardEncoding, EotEncoding, SegmentedEotEncoding, SegmentedEncoding, UnstableDiffusionPipeline
 ```
 
 If you want to enable xformers memory efficient attention (probably only available for stable diffusion 2 series?), you can run this instead.
@@ -33,7 +33,7 @@ If you want to enable xformers memory efficient attention (probably only availab
 use_xformers = True
 # Original code: https://github.com/nanashi161382/unstable_diffusion/blob/main/pipeline_unstable_diffusion.py
 !wget 'https://raw.githubusercontent.com/nanashi161382/unstable_diffusion/main/pipeline_unstable_diffusion.py'
-from pipeline_unstable_diffusion import Txt2Img, Img2Img, Inpaint, ImageModel, UnstableDiffusionPipeline
+from pipeline_unstable_diffusion import Txt2Img, Img2Img, Inpaint, ImageModel, StandardEncoding, EotEncoding, SegmentedEotEncoding, SegmentedEncoding, UnstableDiffusionPipeline
 ```
 
 Then initialize the pipeline as follows.
@@ -57,8 +57,10 @@ image_size = (512, 512)  # width, height
 
 image = pipe(
     pipeline_type=Txt2Img(image_size),
-    prompt=prompt,
-    negative_prompt=negative_prompt,
+    text_input=StandardEncoding(
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+    ),
     guidance_scale=guidance_scale,
     num_inference_steps=num_steps,
   )[0]
@@ -85,9 +87,11 @@ image = pipe(
     pipeline_type=Img2Img(
       init_image=OpenImage(init_image),
       strength=strength,
-    )
-    prompt=prompt,
-    negative_prompt=negative_prompt,
+    ),
+    text_input=StandardEncoding(
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+    ),
     guidance_scale=guidance_scale,
     num_inference_steps=num_steps,
   )[0]
@@ -116,9 +120,11 @@ image = pipe(
       init_image=OpenImage(init_image),
       mask_image=OpenImage(mask_image),
       strength=strength,
-    )
-    prompt=prompt,
-    negative_prompt=negative_prompt,
+    ),
+    text_input=StandardEncoding(
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+    ),
     guidance_scale=guidance_scale,
     num_inference_steps=num_steps,
   )[0]
