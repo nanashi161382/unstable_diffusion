@@ -1,9 +1,12 @@
 # @title UnstableDiffusionPipeline
 # See the following web page for the usage.
 # https://github.com/nanashi161382/unstable_diffusion/tree/main
-from diffusers import StableDiffusionInpaintPipelineLegacy
-from diffusers import DDIMScheduler
-from diffusers import DiffusionPipeline
+from diffusers import (
+    StableDiffusionInpaintPipelineLegacy,
+    DDIMScheduler,
+    DiffusionPipeline,
+    DPMSolverMultistepScheduler,
+)
 import inspect
 import IPython
 from IPython.display import display
@@ -245,10 +248,6 @@ class ImageModel:
         self._vae_scale_factor = vae_scale_factor
         self._device = device
 
-        # def numpy_to_pil(image):
-        #    return pipe._pipe.numpy_to_pil(image)
-        # self._numpy_to_pil = numpy_to_pil
-
     def vae_scale_factor(self):
         return self._vae_scale_factor
 
@@ -312,14 +311,18 @@ class TextModel:
         self._text_encoder = text_encoder
         self._device = device
 
-    def EncodeText(self, text: str):
+    def tokenize(self, text: str):
         max_length = self._tokenizer.model_max_length
-        text_inputs = self._tokenizer(
+        return self._tokenizer(
             text,
             padding="max_length",
             max_length=max_length,
             return_tensors="pt",
         )
+
+    def EncodeText(self, text: str):
+        max_length = self._tokenizer.model_max_length
+        text_inputs = self.tokenize(text)
         text_input_ids = text_inputs.input_ids
 
         if text_input_ids.shape[-1] > max_length:
@@ -397,6 +400,12 @@ class UnstableDiffusionPipeline:
         if auth_token:
             extra_args["use_auth_token"] = auth_token
 
+        # use DPM-Solver++ scheduler
+        scheduler = DPMSolverMultistepScheduler.from_pretrained(
+            dataset, subfolder="scheduler"
+        )
+        extra_args["scheduler"] = scheduler
+
         # Prepare the StableDiffusion pipeline.
         pipe = StableDiffusionInpaintPipelineLegacy.from_pretrained(
             dataset, **extra_args
@@ -432,7 +441,7 @@ class UnstableDiffusionPipeline:
         eta: float = 0.0,
         **kwargs,
     ):
-        r"""
+        """
         Function invoked when calling the pipeline for generation.
         Args:
             pipeline_type: (`Txt2Img` or `Img2Img` or `Inpaint`)
