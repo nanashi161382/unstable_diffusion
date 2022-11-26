@@ -299,6 +299,258 @@ class ImageModel:
         return mask
 
 
+class StandardEncoding:
+    def __init__(
+        self,
+        prompt: str,
+        negative_prompt: Optional[str] = None,
+    ):
+        """
+        Args:
+            prompt (`str`):
+                The prompt or prompts to guide the image generation.
+            negative_prompt (`str`, *optional*):
+                The prompt or prompts not to guide the image generation. Ignored when not using guidance (i.e., ignored if `guidance_scale` is less than `1`).
+        """
+        self._prompt = prompt
+        if negative_prompt is None:
+            negative_prompt = ""
+        self._negative_prompt = negative_prompt
+
+    def EncodeText(self, text_model, text: str):
+        return text_model.EncodeText(text)[0]
+
+    def EncodePrompt(self, text_model):
+        return self.EncodeText(text_model, self._prompt)
+
+    def EncodeNegativePrompt(self, text_model):
+        return self.EncodeText(text_model, self._negative_prompt)
+
+    # *** Utility functions for subclasses below ***
+    def AddOrInit(self, v, x):
+        if v is None:
+            return x
+        else:
+            return v + x
+
+    def GetAnnotation(self, chunk: str):
+        words = []
+        weight = 1.0
+        repeat = 1
+        for word in [x.strip() for x in chunk.split(" ")]:
+            if not word:
+                continue
+            if word[0] == "*":
+                if len(word) == 1:
+                    raise ValueError(f"Don't put any spaces after *")
+                weight *= float(word[1:])
+            elif word[0] == "+":
+                if len(word) == 1:
+                    raise ValueError(f"Don't put any spaces after +")
+                repeat += int(word[1:])
+            else:
+                words.append(word)
+        if weight < 0.0:
+            raise ValueError(f"Invalid weight: {weight}")
+        if repeat < 1:
+            raise ValueError(f"Invalid repeat: {repeat}")
+        return " ".join(words), weight, repeat
+
+
+class EotEncoding(StandardEncoding):
+    def __init__(
+        self,
+        prompt: str,
+        negative_prompt: Optional[str] = None,
+        repeat: bool = False,
+    ):
+        """
+        Args:
+            prompt (`str`):
+                The prompt or prompts to guide the image generation.
+            negative_prompt (`str`, *optional*):
+                The prompt or prompts not to guide the image generation. Ignored when not using guidance (i.e., ignored if `guidance_scale` is less than `1`).
+        """
+        StandardEncoding.__init__(self, prompt, negative_prompt)
+        self._repeat = repeat
+
+    def EncodeText(self, text_model, text: str):
+        embeddings = text_model.EncodeText(text)
+        full_states = embeddings[0][0]
+        eot_state = embeddings[1][0]
+        end_state = full_states[-1]
+
+        old_mean = full_states.float().mean(axis=[-2, -1]).to(full_states.dtype)
+        if self._repeat:
+            new_states = torch.cat(
+                (
+                    full_states[0].unsqueeze(0),
+                    eot_state.repeat((len(full_states) - 2), 1),
+                    end_state.unsqueeze(0),
+                ),
+                dim=0,
+            )
+        else:
+            new_states = torch.cat(
+                (
+                    full_states[0].unsqueeze(0),
+                    eot_state.unsqueeze(0),
+                    end_state.repeat((len(full_states) - 2), 1),
+                ),
+                dim=0,
+            )
+        new_mean = new_states.float().mean(axis=[-2, -1]).to(new_states.dtype)
+        display(old_mean)
+        display(new_mean)
+        new_states *= (old_mean / new_mean).unsqueeze(-1)
+        display(full_states.shape)
+        display(new_states.shape)
+        display(new_states)
+        return torch.cat([torch.unsqueeze(new_states, 0)], dim=0).to(text_model._device)
+
+
+class SegmentedEotEncoding(StandardEncoding):
+    def __init__(
+        self,
+        prompt: str,
+        negative_prompt: Optional[str] = None,
+        repeat: bool = False,
+    ):
+        """
+        Args:
+            prompt (`str`):
+                The prompt or prompts to guide the image generation.
+            negative_prompt (`str`, *optional*):
+                The prompt or prompts not to guide the image generation. Ignored when not using guidance (i.e., ignored if `guidance_scale` is less than `1`).
+        """
+        StandardEncoding.__init__(self, prompt, negative_prompt)
+        self._repeat = repeat
+
+    def EncodeText(self, text_model, text: str):
+        chunks = [x.strip() for x in text.split(",")]
+        display(chunks)
+
+        chunk_len = 0
+        old_mean = None
+        begin_state = None
+        eot_state = None
+        end_state = None
+        new_states = []
+        for chunk in chunks:
+            words, weight, repeat = self.GetAnnotation(chunk)
+            display([words, weight, repeat])
+            embeddings = text_model.EncodeText(words)
+            weight = torch.tensor(weight).to(embeddings[0].dtype)
+            mean = embeddings[0][0].float().mean(axis=[-2, -1]).to(embeddings[0].dtype)
+            full = embeddings[0][0] * weight
+            eot = embeddings[1][0] * weight
+
+            chunk_len += repeat
+            for i in range(repeat):
+                old_mean = self.AddOrInit(old_mean, mean)
+                begin_state = self.AddOrInit(begin_state, full[0])
+                eot_state = self.AddOrInit(eot_state, eot)
+                end_state = self.AddOrInit(end_state, full[-1])
+                new_states.append(eot.unsqueeze(0))
+
+        chunk_len = torch.tensor(chunk_len).to(old_mean.dtype)
+        old_mean /= chunk_len
+        begin_state /= chunk_len
+        eot_state /= chunk_len
+        end_state /= chunk_len
+
+        new_states_repeat = 1
+        if self._repeat:
+            new_states_repeat = int((text_model.max_length() - 3) / len(new_states))
+        new_states = (
+            [begin_state.unsqueeze(0)]
+            + (new_states * new_states_repeat)
+            + [eot_state.unsqueeze(0)]
+        )
+        new_states = torch.cat(
+            new_states
+            + ([end_state.unsqueeze(0)] * (text_model.max_length() - len(new_states))),
+            dim=0,
+        )
+
+        new_mean = new_states.float().mean(axis=[-2, -1]).to(new_states.dtype)
+        display(old_mean)
+        display(new_mean)
+        display(new_states.shape)
+        new_states *= (old_mean / new_mean).unsqueeze(-1)
+        display(new_states.shape)
+        display(new_states)
+        return torch.cat([torch.unsqueeze(new_states, 0)], dim=0).to(text_model._device)
+
+
+class SegmentedEncoding(StandardEncoding):
+    def __init__(self, prompt: str, negative_prompt: Optional[str] = None):
+        """
+        Args:
+            prompt (`str`):
+                The prompt or prompts to guide the image generation.
+            negative_prompt (`str`, *optional*):
+                The prompt or prompts not to guide the image generation. Ignored when not using guidance (i.e., ignored if `guidance_scale` is less than `1`).
+        """
+        StandardEncoding.__init__(self, prompt, negative_prompt)
+
+    def EncodeText(self, text_model, text: str):
+        chunks = [x.strip() for x in text.split(",")]
+        display(chunks)
+
+        chunk_len = 0
+        old_mean = None
+        begin_state = None
+        eot_state = None
+        end_state = None
+        new_states = []
+        new_states_len = 0
+        for chunk in chunks:
+            words, weight, repeat = self.GetAnnotation(chunk)
+            display([words, weight, repeat])
+            embeddings = text_model.EncodeText(words)
+            weight = torch.tensor(weight).to(embeddings[0].dtype)
+            mean = embeddings[0][0].float().mean(axis=[-2, -1]).to(embeddings[0].dtype)
+            full = embeddings[0][0] * weight
+            eot = embeddings[1][0] * weight
+            num_tokens = embeddings[2]
+            effective_tokens = full[1:num_tokens]
+            display(eot)
+            display(effective_tokens[-1])
+
+            chunk_len += repeat
+            for i in range(repeat):
+                old_mean = self.AddOrInit(old_mean, mean)
+                begin_state = self.AddOrInit(begin_state, full[0])
+                eot_state = self.AddOrInit(eot_state, eot)
+                end_state = self.AddOrInit(end_state, full[-1])
+                new_states.append(effective_tokens)
+                new_states_len += effective_tokens.shape[0]
+
+        chunk_len = torch.tensor(chunk_len).to(old_mean.dtype)
+        old_mean /= chunk_len
+        begin_state /= chunk_len
+        eot_state /= chunk_len
+        end_state /= chunk_len
+
+        new_states = [begin_state.unsqueeze(0)] + new_states + [eot_state.unsqueeze(0)]
+        new_states_len = new_states_len + 2
+        new_states = torch.cat(
+            new_states
+            + ([end_state.unsqueeze(0)] * (text_model.max_length() - new_states_len)),
+            dim=0,
+        )
+
+        new_mean = new_states.float().mean(axis=[-2, -1]).to(new_states.dtype)
+        display(old_mean)
+        display(new_mean)
+        display(new_states.shape)
+        new_states *= (old_mean / new_mean).unsqueeze(-1)
+        display(new_states.shape)
+        display(new_states)
+        return torch.cat([torch.unsqueeze(new_states, 0)], dim=0).to(text_model._device)
+
+
 class TextModel:
     def __init__(self, tokenizer, text_encoder, device):
         """
@@ -311,8 +563,11 @@ class TextModel:
         self._text_encoder = text_encoder
         self._device = device
 
+    def max_length(self):
+        return self._tokenizer.model_max_length
+
     def tokenize(self, text: str):
-        max_length = self._tokenizer.model_max_length
+        max_length = self.max_length()
         return self._tokenizer(
             text,
             padding="max_length",
@@ -320,39 +575,44 @@ class TextModel:
             return_tensors="pt",
         )
 
+    def decode_tokens(self, tokens):
+        return self._tokenizer.batch_decode(tokens)
+
     def EncodeText(self, text: str):
-        max_length = self._tokenizer.model_max_length
+        max_length = self.max_length()
         text_inputs = self.tokenize(text)
         text_input_ids = text_inputs.input_ids
+        attention_mask = text_inputs.attention_mask
 
         if text_input_ids.shape[-1] > max_length:
-            removed_text = self._tokenizer.batch_decode(text_input_ids[:, max_length:])
+            removed_text = self.decode_tokens(text_input_ids[:, max_length:])
             print(
                 "The following part of your input was truncated because CLIP can only handle sequences up to"
                 f" {max_length} tokens: {removed_text}"
             )
             text_input_ids = text_input_ids[:, :max_length]
-        text_embeddings = self._text_encoder(
+        embeddings = self._text_encoder(
             text_input_ids.to(self._device),
             attention_mask=None,
-        )[0]
+        )
 
-        return text_embeddings
+        num_tokens = 0
+        for m in attention_mask[0]:
+            if m.item() > 0:
+                num_tokens += 1
+        return embeddings[0], embeddings[1], num_tokens
 
     def GetTextEmbeddings(
         self,
-        prompt: str,
-        negative_prompt: Optional[str],
+        text_input: StandardEncoding,
         do_classifier_free_guidance: bool,
     ):
         # get prompt text embeddings
-        text_embeddings = self.EncodeText(prompt)
+        text_embeddings = text_input.EncodePrompt(self)
 
         # get unconditional embeddings for classifier free guidance
         if do_classifier_free_guidance:
-            if negative_prompt is None:
-                negative_prompt = ""
-            uncond_embeddings = self.EncodeText(negative_prompt)
+            uncond_embeddings = text_input.EncodeNegativePrompt(self)
 
             # For classifier free guidance, we need to do two forward passes.
             # Here we concatenate the unconditional and text embeddings into a single batch
@@ -434,8 +694,7 @@ class UnstableDiffusionPipeline:
     def __call__(
         self,
         pipeline_type: Union[Txt2Img, Img2Img, Inpaint],
-        prompt: str,
-        negative_prompt: Optional[str] = None,
+        text_input: StandardEncoding,
         guidance_scale: float = 7.5,
         num_inference_steps: int = 50,
         eta: float = 0.0,
@@ -444,17 +703,13 @@ class UnstableDiffusionPipeline:
         """
         Function invoked when calling the pipeline for generation.
         Args:
-            pipeline_type: (`Txt2Img` or `Img2Img` or `Inpaint`)
+            pipeline_type: (`Txt2Img` or `Img2Img` or `Inpaint`):
                 The pipeline execution type.
-            prompt (`str`):
-                The prompt or prompts to guide the image generation.
-            negative_prompt (`str`, *optional*):
-                The prompt or prompts not to guide the image generation. Ignored when not using guidance (i.e., ignored if `guidance_scale` is less than `1`).
+            text_input: (`StandardEncoding` and its subclasses):
+                Textual input and how it is encoded
             guidance_scale (`float`, *optional*, defaults to 7.5):
                 Guidance scale as defined in [Classifier-Free Diffusion Guidance](https://arxiv.org/abs/2207.12598).
                 `guidance_scale` is defined as `w` of equation 2. of [Imagen Paper](https://arxiv.org/pdf/2205.11487.pdf). Guidance scale is enabled by setting `guidance_scale > 1`. Higher guidance scale encourages to generate images that are closely linked to the text `prompt`, usually at the expense of lower image quality.
-            pipeline_type:
-                Type of pipeline.
             num_inference_steps (`int`, *optional*, defaults to 50):
                 The number of denoising steps. More denoising steps usually lead to a higher quality image at the expense of slower inference.
             eta (`float`, *optional*, defaults to 0.0):
@@ -471,7 +726,7 @@ class UnstableDiffusionPipeline:
             do_classifier_free_guidance = guidance_scale > 1.0
 
             text_embeddings = self.text_model.GetTextEmbeddings(
-                prompt, negative_prompt, do_classifier_free_guidance
+                text_input, do_classifier_free_guidance
             )
 
             # set timesteps and initial latents
