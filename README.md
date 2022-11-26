@@ -1,6 +1,6 @@
 # unstable_diffusion
 
-This is a library to use the [stable_diffusion pipeline](https://github.com/huggingface/diffusers/tree/main/src/diffusers/pipelines/stable_diffusion) more easily for the interactive use cases. The official pipeline classes are more suitable for the batch use cases, but a bit cumbersome to use for the interactive use cases especially on Google Colab. This library works as a wrapper to the library to give better experiences for the purpose.
+This is a library to use the [stable_diffusion pipeline](https://github.com/huggingface/diffusers/tree/main/src/diffusers/pipelines/stable_diffusion) more easily for the interactive use cases. The official pipeline classes are OK for the batch use cases, but a bit cumbersome to use for the interactive use cases especially on Google Colab. Especially if you want to switch different pipeline types such as text-to-image, image-to-image and inpaint. This library works as a wrapper to the library to give better experiences for the purpose.
 
 This library also aims to give additional functionalities for advanced users.
 
@@ -18,6 +18,19 @@ You can import the library in Google Colab like this.
 
 ```python
 !pip install --upgrade diffusers transformers scipy accelerate
+use_xformers = False
+# Original code: https://github.com/nanashi161382/unstable_diffusion/blob/main/pipeline_unstable_diffusion.py
+!wget 'https://raw.githubusercontent.com/nanashi161382/unstable_diffusion/main/pipeline_unstable_diffusion.py'
+from pipeline_unstable_diffusion import Txt2Img, Img2Img, Inpaint, ImageModel, UnstableDiffusionPipeline
+```
+
+If you want to enable xformers memory efficient attention (probably only available for stable diffusion 2 series?), you can run this instead.
+```python
+!pip install --upgrade diffusers transformers scipy accelerate
+# use the pre-release versions for triton
+!pip install --upgrade --pre triton
+!pip install -q https://github.com/metrolobo/xformers_wheels/releases/download/1d31a3ac_various_6/xformers-0.0.14.dev0-cp37-cp37m-linux_x86_64.whl
+use_xformers = True
 # Original code: https://github.com/nanashi161382/unstable_diffusion/blob/main/pipeline_unstable_diffusion.py
 !wget 'https://raw.githubusercontent.com/nanashi161382/unstable_diffusion/main/pipeline_unstable_diffusion.py'
 from pipeline_unstable_diffusion import Txt2Img, Img2Img, Inpaint, ImageModel, UnstableDiffusionPipeline
@@ -28,7 +41,7 @@ Then initialize the pipeline as follows.
 ```python
 dataset = "Linaqruf/anything-v3.0"
 auth_token = "" # auth token for HuggingFace if needed
-pipe = UnstableDiffusionPipeline().Connect(dataset, auth_token)
+pipe = UnstableDiffusionPipeline().Connect(dataset, auth_token=auth_token, use_xformers=use_xformers)
 ```
 
 Now you are ready for running the stable diffusion pipeline.
