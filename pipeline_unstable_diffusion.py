@@ -3,6 +3,7 @@
 # https://github.com/nanashi161382/unstable_diffusion/tree/main
 from diffusers import StableDiffusionInpaintPipelineLegacy
 from diffusers import DDIMScheduler
+from diffusers import DiffusionPipeline
 import inspect
 import IPython
 from IPython.display import display
@@ -92,7 +93,7 @@ class Txt2Img(PipelineType):
         self._latents = latents
 
     def GetInitialLatentsAndTimesteps(self, pipe, dtype, num_inference_steps: int):
-        scale_factor = pipe.vae_scale_factor()
+        scale_factor = pipe.image_model.vae_scale_factor()
         generator = self.GetGenerator()
 
         if self._height % scale_factor != 0 or self._width % scale_factor != 0:
@@ -233,13 +234,23 @@ class Inpaint(PipelineType):
 
 
 class ImageModel:
-    def __init__(self, pipe):
+    def __init__(self, vae, vae_scale_factor, device):
         """
         Args:
-            pipe (`UnstableDiffusionPipeline`):
-                Pipeline object
+            vae:
+            vae_scale_factor:
+            device:
         """
-        self._pipe = pipe
+        self._vae = vae
+        self._vae_scale_factor = vae_scale_factor
+        self._device = device
+
+        # def numpy_to_pil(image):
+        #    return pipe._pipe.numpy_to_pil(image)
+        # self._numpy_to_pil = numpy_to_pil
+
+    def vae_scale_factor(self):
+        return self._vae_scale_factor
 
     def Preprocess(self, image: PIL.Image.Image):
         w, h = image.size
@@ -254,10 +265,10 @@ class ImageModel:
     def Encode(
         self, image: PIL.Image.Image, dtype, generator: Optional[torch.Generator]
     ):
-        image = self.Preprocess(image).to(device=self._pipe.device, dtype=dtype)
+        image = self.Preprocess(image).to(device=self._device, dtype=dtype)
 
         # encode the init image into latents and scale the latents
-        latent_dist = self._pipe.vae.encode(image).latent_dist
+        latent_dist = self._vae.encode(image).latent_dist
         latents = latent_dist.sample(generator=generator)
         latents = 0.18215 * latents
 
@@ -265,14 +276,14 @@ class ImageModel:
 
     def Decode(self, latents):
         latents = 1 / 0.18215 * latents
-        image = self._pipe.vae.decode(latents).sample
+        image = self._vae.decode(latents).sample
         image = (image / 2 + 0.5).clamp(0, 1)
         # we always cast to float32 as this does not cause significant overhead and is compatible with bfloa16
         image = image.cpu().permute(0, 2, 3, 1).float().numpy()
-        return self._pipe._pipe.numpy_to_pil(image)
+        return DiffusionPipeline.numpy_to_pil(image)
 
     def PreprocessMask(self, mask: PIL.Image.Image, dtype):
-        scale_factor = self._pipe.vae_scale_factor()
+        scale_factor = self.vae_scale_factor()
         # preprocess mask
         mask = mask.convert("L")
         w, h = mask.size
@@ -285,69 +296,25 @@ class ImageModel:
         mask = np.tile(mask, (4, 1, 1))
         mask = mask[None].transpose(0, 1, 2, 3)  # what does this step do?
         mask = 1 - mask  # repaint white, keep black
-        mask = torch.from_numpy(mask).to(device=self._pipe.device, dtype=dtype)
+        mask = torch.from_numpy(mask).to(device=self._device, dtype=dtype)
         return mask
 
 
-class UnstableDiffusionPipeline:
-    def __init__(self, devicetype: str = "cuda"):
-        self._devicetype_str = devicetype
+class TextModel:
+    def __init__(self, tokenizer, text_encoder, device):
+        """
+        Args:
+            tokenizer:
+            text_encoder:
+            device:
+        """
+        self._tokenizer = tokenizer
+        self._text_encoder = text_encoder
+        self._device = device
 
-    def Connect(self, dataset: str, auth_token: Optional[str] = None):
-        self._dataset = dataset
-        self._auth_token = auth_token
-
-        extra_args = {
-            # Saving memory
-            "torch_dtype": torch.float32,
-            "revision": "fp16",
-        }
-        if auth_token:
-            extra_args["use_auth_token"] = auth_token
-
-        if dataset == "hakurei/waifu-diffusion":
-            extra_args["scheduler"] = DDIMScheduler(
-                beta_start=0.00085,
-                beta_end=0.012,
-                beta_schedule="scaled_linear",
-                clip_sample=False,
-                set_alpha_to_one=False,
-            )
-        elif dataset == "Linaqruf/anything-v3.0":
-            del extra_args["revision"]
-        elif dataset == "naclbit/trinart_stable_diffusion_v2":
-            del extra_args["torch_dtype"]
-            extra_args["revision"] = "diffusers-60k"
-
-        # Prepare the StableDiffusion pipeline.
-        pipe = StableDiffusionInpaintPipelineLegacy.from_pretrained(
-            dataset, **extra_args
-        ).to(self._devicetype_str)
-        return self.SetPipeline(pipe)
-
-    def SetPipeline(self, pipe):
-        self._pipe = pipe
-        self.tokenizer = self._pipe.tokenizer
-        self.device = self._pipe.device
-        self.unet = self._pipe.unet
-        self.scheduler = self._pipe.scheduler
-        self.vae = self._pipe.vae
-        self.image_model = ImageModel(self)
-        return self
-
-    def progress_bar(self, *input, **kwargs):
-        return self._pipe.progress_bar(*input, **kwargs)
-
-    def vae_scale_factor(self):
-        if "vae_scale_factor" in dir(self._pipe):
-            print(
-                "vae_scale_factor is available in StableDiffusionInpaintPipelineLegacy."
-            )
-            return self._pipe.vae_scale_factor
-        return 2 ** (len(self.vae.config.block_out_channels) - 1)
-
-    def EncodeText(self, text: str, max_length):
-        text_inputs = self.tokenizer(
+    def EncodeText(self, text: str):
+        max_length = self._tokenizer.model_max_length
+        text_inputs = self._tokenizer(
             text,
             padding="max_length",
             max_length=max_length,
@@ -356,14 +323,14 @@ class UnstableDiffusionPipeline:
         text_input_ids = text_inputs.input_ids
 
         if text_input_ids.shape[-1] > max_length:
-            removed_text = self.tokenizer.batch_decode(text_input_ids[:, max_length:])
+            removed_text = self._tokenizer.batch_decode(text_input_ids[:, max_length:])
             print(
                 "The following part of your input was truncated because CLIP can only handle sequences up to"
                 f" {max_length} tokens: {removed_text}"
             )
             text_input_ids = text_input_ids[:, :max_length]
-        text_embeddings = self._pipe.text_encoder(
-            text_input_ids.to(self.device),
+        text_embeddings = self._text_encoder(
+            text_input_ids.to(self._device),
             attention_mask=None,
         )[0]
 
@@ -376,15 +343,13 @@ class UnstableDiffusionPipeline:
         do_classifier_free_guidance: bool,
     ):
         # get prompt text embeddings
-        text_embeddings = self.EncodeText(prompt, self.tokenizer.model_max_length)
+        text_embeddings = self.EncodeText(prompt)
 
         # get unconditional embeddings for classifier free guidance
         if do_classifier_free_guidance:
             if negative_prompt is None:
                 negative_prompt = ""
-            uncond_embeddings = self.EncodeText(
-                negative_prompt, self.tokenizer.model_max_length
-            )
+            uncond_embeddings = self.EncodeText(negative_prompt)
 
             # For classifier free guidance, we need to do two forward passes.
             # Here we concatenate the unconditional and text embeddings into a single batch
@@ -392,6 +357,69 @@ class UnstableDiffusionPipeline:
             text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
 
         return text_embeddings
+
+
+class UnstableDiffusionPipeline:
+    def __init__(self, devicetype: str = "cuda"):
+        self._devicetype_str = devicetype
+
+    def GetRevision(self, dataset: str, revision: Optional[str] = None):
+        # revision is a git branch name assigned to the model repository.
+
+        # Always return the provided revision if any.
+        if revision:
+            return revision
+
+        # We always have the "main" branch.
+        default_revision = "main"
+        # There may be other branches for smaller memory footprint
+        recommended_revision = {
+            "stabilityai/stable-diffusion-2": "fp16",
+            "CompVis/stable-diffusion-v1-4": "fp16",
+            "runwayml/stable-diffusion-v1-5": "fp16",
+            "hakurei/waifu-diffusion": "fp16",
+            "naclbit/trinart_stable_diffusion_v2": "diffusers-60k",
+        }
+
+        return recommended_revision.get(dataset, default_revision)
+
+    def Connect(
+        self,
+        dataset: str,
+        revision: Optional[str] = None,
+        auth_token: Optional[str] = None,
+        use_xformers: bool = False,
+    ):
+        extra_args = {
+            "torch_dtype": torch.float32,
+            "revision": self.GetRevision(dataset, revision),
+        }
+        if auth_token:
+            extra_args["use_auth_token"] = auth_token
+
+        # Prepare the StableDiffusion pipeline.
+        pipe = StableDiffusionInpaintPipelineLegacy.from_pretrained(
+            dataset, **extra_args
+        ).to(self._devicetype_str)
+
+        # Options for efficient execution
+        pipe.enable_attention_slicing()
+        if use_xformers and (self._devicetype_str == "cuda"):
+            pipe.enable_xformers_memory_efficient_attention()
+
+        return self.SetPipeline(pipe)
+
+    def SetPipeline(self, pipe):
+        self._pipe = pipe
+        self.device = self._pipe.device
+        self.unet = self._pipe.unet
+        self.scheduler = self._pipe.scheduler
+        self.text_model = TextModel(pipe.tokenizer, pipe.text_encoder, pipe.device)
+        self.image_model = ImageModel(pipe.vae, pipe.vae_scale_factor, pipe.device)
+        return self
+
+    def progress_bar(self, *input, **kwargs):
+        return self._pipe.progress_bar(*input, **kwargs)
 
     @torch.no_grad()
     def __call__(
@@ -433,7 +461,7 @@ class UnstableDiffusionPipeline:
             # corresponds to doing no classifier free guidance.
             do_classifier_free_guidance = guidance_scale > 1.0
 
-            text_embeddings = self.GetTextEmbeddings(
+            text_embeddings = self.text_model.GetTextEmbeddings(
                 prompt, negative_prompt, do_classifier_free_guidance
             )
 
