@@ -11,7 +11,12 @@ An alternative stable_diffusion pipeline. Part of the code in the file is a copy
 To use the library, you should put it in your current directory and then import like this.
 
 ```python
-from pipeline_unstable_diffusion import Txt2Img, Img2Img, Inpaint, ImageModel, UnstableDiffusionPipeline
+from pipeline_unstable_diffusion import (
+    Txt2Img, Img2Img, Inpaint,
+    ByLatents, Randomly,
+    StandardEncoding, EotEncoding, SegmentedEotEncoding, SegmentedEncoding,
+    UnstableDiffusionPipeline, ImageModel,
+)
 ```
 
 You can import the library in Google Colab like this.
@@ -21,7 +26,12 @@ You can import the library in Google Colab like this.
 use_xformers = False
 # Original code: https://github.com/nanashi161382/unstable_diffusion/blob/main/pipeline_unstable_diffusion.py
 !wget 'https://raw.githubusercontent.com/nanashi161382/unstable_diffusion/main/pipeline_unstable_diffusion.py'
-from pipeline_unstable_diffusion import Txt2Img, Img2Img, Inpaint, ImageModel, StandardEncoding, EotEncoding, SegmentedEotEncoding, SegmentedEncoding, UnstableDiffusionPipeline
+from pipeline_unstable_diffusion import (
+    Txt2Img, Img2Img, Inpaint,
+    ByLatents, Randomly,
+    StandardEncoding, EotEncoding, SegmentedEotEncoding, SegmentedEncoding,
+    UnstableDiffusionPipeline, ImageModel,
+)
 ```
 
 If you want to enable xformers memory efficient attention (probably only available for stable diffusion 2 series?), you can run this instead.
@@ -33,7 +43,12 @@ If you want to enable xformers memory efficient attention (probably only availab
 use_xformers = True
 # Original code: https://github.com/nanashi161382/unstable_diffusion/blob/main/pipeline_unstable_diffusion.py
 !wget 'https://raw.githubusercontent.com/nanashi161382/unstable_diffusion/main/pipeline_unstable_diffusion.py'
-from pipeline_unstable_diffusion import Txt2Img, Img2Img, Inpaint, ImageModel, StandardEncoding, EotEncoding, SegmentedEotEncoding, SegmentedEncoding, UnstableDiffusionPipeline
+from pipeline_unstable_diffusion import (
+    Txt2Img, Img2Img, Inpaint,
+    ByLatents, Randomly,
+    StandardEncoding, EotEncoding, SegmentedEotEncoding, SegmentedEncoding,
+    UnstableDiffusionPipeline, ImageModel,
+)
 ```
 
 Then initialize the pipeline as follows.
@@ -54,10 +69,12 @@ negative_prompt = "1girl"
 guidance_scale = 7.5
 num_steps = 50
 image_size = (512, 512)  # width, height
+symmetric = False
 
 image = pipe(
     pipeline_type=Txt2Img(image_size),
     text_input=StandardEncoding(
+        initialize=Randomly(symmetric=symmetric),
         prompt=prompt,
         negative_prompt=negative_prompt,
     ),
