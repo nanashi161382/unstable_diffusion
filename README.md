@@ -72,9 +72,11 @@ image_size = (512, 512)  # width, height
 symmetric = False
 
 image = pipe(
-    pipeline_type=Txt2Img(image_size),
-    text_input=StandardEncoding(
+    pipeline_type=Txt2Img(
         initialize=Randomly(symmetric=symmetric),
+        size=image_size,
+    ),
+    text_input=StandardEncoding(
         prompt=prompt,
         negative_prompt=negative_prompt,
     ),
@@ -102,8 +104,8 @@ def OpenImage(filename):
 
 image = pipe(
     pipeline_type=Img2Img(
-      init_image=OpenImage(init_image),
-      strength=strength,
+        init_image=OpenImage(init_image),
+        strength=strength,
     ),
     text_input=StandardEncoding(
         prompt=prompt,
@@ -134,9 +136,9 @@ def OpenImage(filename):
 
 image = pipe(
     pipeline_type=Inpaint(
-      init_image=OpenImage(init_image),
-      mask_image=OpenImage(mask_image),
-      strength=strength,
+        init_image=OpenImage(init_image),
+        mask_image=OpenImage(mask_image),
+        strength=strength,
     ),
     text_input=StandardEncoding(
         prompt=prompt,
