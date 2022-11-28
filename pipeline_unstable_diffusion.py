@@ -118,7 +118,7 @@ class ByLatents:
             raise ValueError(
                 f"Unexpected latents shape, got {latents.shape}, expected {latents_shape}"
             )
-        return latents.to(device)
+        return latents.to(device=device, dtype=dtype)
 
 
 class Randomly:
@@ -158,7 +158,7 @@ class Txt2Img(PipelineType):
             rand_seed (`int`, *optional*):
                 A random seed for [torch generator](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make generation deterministic.
         """
-        PipelineType.__init__(self, rand_seed)
+        super().__init__(rand_seed)
         self._size = size
         self._initialize = initialize
 
@@ -197,7 +197,7 @@ class Img2Img(PipelineType):
             rand_seed (`int`, *optional*):
                 A random seed for [torch generator](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make generation deterministic.
         """
-        PipelineType.__init__(self, rand_seed)
+        super().__init__(rand_seed)
         if strength < 0 or strength > 1:
             raise ValueError(
                 f"The value of strength should in [0.0, 1.0] but is {strength}"
@@ -240,7 +240,7 @@ class Inpaint(PipelineType):
             rand_seed (`int`, *optional*):
                 A random seed for [torch generator](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make generation deterministic.
         """
-        PipelineType.__init__(self, rand_seed)
+        super().__init__(rand_seed)
         if strength < 0 or strength > 1:
             raise ValueError(
                 f"The value of strength should in [0.0, 1.0] but is {strength}"
@@ -376,27 +376,29 @@ class StandardEncoding:
         return self.EncodeText(text_model, self._negative_prompt)
 
     # *** Utility functions for subclasses below ***
-    def AddOrInit(self, v, x):
+    @classmethod
+    def AddOrInit(cls, v, x):
         if v is None:
             return x
         else:
             return v + x
 
-    def GetAnnotation(self, chunk: str):
+    @classmethod
+    def GetAnnotation(cls, chunk: str):
         words = []
         weight = 1.0
         repeat = 1
         for word in [x.strip() for x in chunk.split(" ")]:
             if not word:
                 continue
-            if word[0] == "*":
+            if word[0] == ":":
+                if len(word) == 1:
+                    raise ValueError(f"Don't put any spaces after :")
+                weight = float(word[1:])
+            elif word[0] == "*":
                 if len(word) == 1:
                     raise ValueError(f"Don't put any spaces after *")
-                weight *= float(word[1:])
-            elif word[0] == "+":
-                if len(word) == 1:
-                    raise ValueError(f"Don't put any spaces after +")
-                repeat += int(word[1:])
+                repeat = int(word[1:])
             else:
                 words.append(word)
         if weight < 0.0:
@@ -404,6 +406,90 @@ class StandardEncoding:
         if repeat < 1:
             raise ValueError(f"Invalid repeat: {repeat}")
         return " ".join(words), weight, repeat
+
+    class EncodedSegment:
+        def __init__(self, embeddings, weight):
+            self.weight = torch.tensor(weight).to(embeddings[0].dtype)
+            self.unweighted_mean = (
+                embeddings[0][0].float().mean(axis=[-2, -1]).to(embeddings[0].dtype)
+            )
+            self.full = embeddings[0][0] * weight
+            self.sot = self.full[0]
+            self.eot = embeddings[1][0] * weight
+            self.end = self.full[-1]
+            effective_length = embeddings[2]
+            self.words = self.full[1:effective_length]
+
+        @classmethod
+        def Encode(cls, text_model, text, weight, fail_on_truncation: bool = True):
+            embeddings = text_model.EncodeText(text, fail_on_truncation)
+            return cls(embeddings, weight)
+
+        @classmethod
+        def AnnotateAndEncode(cls, text_model, chunk, fail_on_truncation: bool = True):
+            phrase, weight, repeat = StandardEncoding.GetAnnotation(chunk)
+            display([phrase, weight, repeat])
+            return cls.Encode(text_model, phrase, weight, fail_on_truncation), repeat
+
+    class AdjustingBase:
+        def __init__(self):
+            self.unweighted_mean = None
+
+        def Add(self, enc, unweighted_mean):
+            self.unweighted_mean = enc.AddOrInit(self.unweighted_mean, unweighted_mean)
+
+        def Average(self, chunk_len):
+            chunk_len = torch.tensor(chunk_len).to(self.unweighted_mean.dtype)
+            self.unweighted_mean /= chunk_len
+
+        def AdjustMean(self, states, device):
+            new_mean = states.float().mean(axis=[-2, -1]).to(states.dtype)
+            states *= (self.unweighted_mean / new_mean).unsqueeze(-1)
+            display(states.shape)
+            display(states)
+            return torch.cat([torch.unsqueeze(states, 0)], dim=0).to(device)
+
+    class SequentialBase(AdjustingBase):
+        def __init__(self):
+            super().__init__()
+            self.sot_state = None
+            self.eot_state = None
+            self.end_state = None
+            self.word_states = []
+            self.word_states_len = 0
+            self.eot_states = []
+
+        def Add(self, enc, segment):
+            super().Add(enc, segment.unweighted_mean)
+            self.sot_state = enc.AddOrInit(self.sot_state, segment.sot)
+            self.eot_state = enc.AddOrInit(self.eot_state, segment.eot)
+            self.end_state = enc.AddOrInit(self.end_state, segment.end)
+            self.word_states.append(segment.words)
+            self.word_states_len += segment.words.shape[0]
+            self.eot_states.append(segment.eot.unsqueeze(0))
+
+        def Average(self, chunk_len):
+            super().Average(chunk_len)
+            chunk_len = torch.tensor(chunk_len).to(self.unweighted_mean.dtype)
+            self.sot_state /= chunk_len
+            self.eot_state /= chunk_len
+            self.end_state /= chunk_len
+
+    class Parallel(AdjustingBase):
+        def __init__(self):
+            super().__init__()
+            self.states = None
+
+        def Add(self, enc, segment):
+            super().Add(enc, segment.unweighted_mean)
+            self.states = enc.AddOrInit(self.states, segment.full)
+
+        def Average(self, chunk_len):
+            super().Average(chunk_len)
+            self.states /= chunk_len
+
+        def ToStates(self, *input, **kwargs):
+            return self.states
 
 
 class EotEncoding(StandardEncoding):
@@ -420,7 +506,7 @@ class EotEncoding(StandardEncoding):
             negative_prompt (`str`, *optional*):
                 The prompt or prompts not to guide the image generation. Ignored when not using guidance (i.e., ignored if `guidance_scale` is less than `1`).
         """
-        StandardEncoding.__init__(self, prompt, negative_prompt)
+        super().__init__(prompt, negative_prompt)
         self._repeat = repeat
 
     def EncodeText(self, text_model, text: str):
@@ -449,10 +535,7 @@ class EotEncoding(StandardEncoding):
                 dim=0,
             )
         new_mean = new_states.float().mean(axis=[-2, -1]).to(new_states.dtype)
-        display(old_mean)
-        display(new_mean)
         new_states *= (old_mean / new_mean).unsqueeze(-1)
-        display(full_states.shape)
         display(new_states.shape)
         display(new_states)
         return torch.cat([torch.unsqueeze(new_states, 0)], dim=0).to(text_model._device)
@@ -472,132 +555,160 @@ class SegmentedEotEncoding(StandardEncoding):
             negative_prompt (`str`, *optional*):
                 The prompt or prompts not to guide the image generation. Ignored when not using guidance (i.e., ignored if `guidance_scale` is less than `1`).
         """
-        StandardEncoding.__init__(self, prompt, negative_prompt)
+        super().__init__(prompt, negative_prompt)
         self._repeat = repeat
+
+    class Sequential(StandardEncoding.SequentialBase):
+        def ToStates(self, max_length, repeat):
+            states = (
+                [self.sot_state.unsqueeze(0)]
+                + (self.eot_states * repeat)
+                + [self.eot_state.unsqueeze(0)]
+            )
+            states = torch.cat(
+                states + ([self.end_state.unsqueeze(0)] * (max_length - len(states))),
+                dim=0,
+            )
+            return states
 
     def EncodeText(self, text_model, text: str):
         chunks = [x.strip() for x in text.split(",")]
         display(chunks)
 
+        proc = self.Sequential()
         chunk_len = 0
-        old_mean = None
-        begin_state = None
-        eot_state = None
-        end_state = None
-        new_states = []
         for chunk in chunks:
-            words, weight, repeat = self.GetAnnotation(chunk)
-            display([words, weight, repeat])
-            embeddings = text_model.EncodeText(words)
-            weight = torch.tensor(weight).to(embeddings[0].dtype)
-            mean = embeddings[0][0].float().mean(axis=[-2, -1]).to(embeddings[0].dtype)
-            full = embeddings[0][0] * weight
-            eot = embeddings[1][0] * weight
-
+            segment, repeat = self.EncodedSegment.AnnotateAndEncode(text_model, chunk)
             chunk_len += repeat
             for i in range(repeat):
-                old_mean = self.AddOrInit(old_mean, mean)
-                begin_state = self.AddOrInit(begin_state, full[0])
-                eot_state = self.AddOrInit(eot_state, eot)
-                end_state = self.AddOrInit(end_state, full[-1])
-                new_states.append(eot.unsqueeze(0))
+                proc.Add(self, segment)
+        proc.Average(chunk_len)
 
-        chunk_len = torch.tensor(chunk_len).to(old_mean.dtype)
-        old_mean /= chunk_len
-        begin_state /= chunk_len
-        eot_state /= chunk_len
-        end_state /= chunk_len
-
-        new_states_repeat = 1
+        eot_repeat = 1
         if self._repeat:
-            new_states_repeat = int((text_model.max_length() - 3) / len(new_states))
-        new_states = (
-            [begin_state.unsqueeze(0)]
-            + (new_states * new_states_repeat)
-            + [eot_state.unsqueeze(0)]
-        )
-        new_states = torch.cat(
-            new_states
-            + ([end_state.unsqueeze(0)] * (text_model.max_length() - len(new_states))),
-            dim=0,
-        )
-
-        new_mean = new_states.float().mean(axis=[-2, -1]).to(new_states.dtype)
-        display(old_mean)
-        display(new_mean)
-        display(new_states.shape)
-        new_states *= (old_mean / new_mean).unsqueeze(-1)
-        display(new_states.shape)
-        display(new_states)
-        return torch.cat([torch.unsqueeze(new_states, 0)], dim=0).to(text_model._device)
+            eot_repeat = int((text_model.max_length() - 3) / len(proc.eot_states))
+        new_states = proc.ToStates(text_model.max_length(), eot_repeat)
+        return proc.AdjustMean(new_states, text_model._device)
 
 
 class SegmentedEncoding(StandardEncoding):
-    def __init__(self, prompt: str, negative_prompt: Optional[str] = None):
+    def __init__(
+        self,
+        prompt: str,
+        negative_prompt: Optional[str] = None,
+        sequential: bool = True,
+    ):
         """
         Args:
             prompt (`str`):
                 The prompt or prompts to guide the image generation.
             negative_prompt (`str`, *optional*):
                 The prompt or prompts not to guide the image generation. Ignored when not using guidance (i.e., ignored if `guidance_scale` is less than `1`).
+            sequential (`bool`):
         """
-        StandardEncoding.__init__(self, prompt, negative_prompt)
+        super().__init__(prompt, negative_prompt)
+        self._sequential = sequential
+
+    class Sequential(StandardEncoding.SequentialBase):
+        def ToStates(self, max_length):
+            states = (
+                [self.sot_state.unsqueeze(0)]
+                + self.word_states
+                + [self.eot_state.unsqueeze(0)]
+            )
+            states_len = self.word_states_len + 2
+            states = torch.cat(
+                states + ([self.end_state.unsqueeze(0)] * (max_length - states_len)),
+                dim=0,
+            )
+            return states
 
     def EncodeText(self, text_model, text: str):
         chunks = [x.strip() for x in text.split(",")]
         display(chunks)
 
-        chunk_len = 0
-        old_mean = None
-        begin_state = None
-        eot_state = None
-        end_state = None
-        new_states = []
-        new_states_len = 0
-        for chunk in chunks:
-            words, weight, repeat = self.GetAnnotation(chunk)
-            display([words, weight, repeat])
-            embeddings = text_model.EncodeText(words)
-            weight = torch.tensor(weight).to(embeddings[0].dtype)
-            mean = embeddings[0][0].float().mean(axis=[-2, -1]).to(embeddings[0].dtype)
-            full = embeddings[0][0] * weight
-            eot = embeddings[1][0] * weight
-            num_tokens = embeddings[2]
-            effective_tokens = full[1:num_tokens]
-            display(eot)
-            display(effective_tokens[-1])
+        if self._sequential:
+            proc = self.Sequential()
+        else:
+            proc = self.Parallel()
 
+        chunk_len = 0
+        for chunk in chunks:
+            segment, repeat = self.EncodedSegment.AnnotateAndEncode(text_model, chunk)
             chunk_len += repeat
             for i in range(repeat):
-                old_mean = self.AddOrInit(old_mean, mean)
-                begin_state = self.AddOrInit(begin_state, full[0])
-                eot_state = self.AddOrInit(eot_state, eot)
-                end_state = self.AddOrInit(end_state, full[-1])
-                new_states.append(effective_tokens)
-                new_states_len += effective_tokens.shape[0]
+                proc.Add(self, segment)
+        proc.Average(chunk_len)
 
-        chunk_len = torch.tensor(chunk_len).to(old_mean.dtype)
-        old_mean /= chunk_len
-        begin_state /= chunk_len
-        eot_state /= chunk_len
-        end_state /= chunk_len
+        new_states = proc.ToStates(text_model.max_length())
+        return proc.AdjustMean(new_states, text_model._device)
 
-        new_states = [begin_state.unsqueeze(0)] + new_states + [eot_state.unsqueeze(0)]
-        new_states_len = new_states_len + 2
-        new_states = torch.cat(
-            new_states
-            + ([end_state.unsqueeze(0)] * (text_model.max_length() - new_states_len)),
-            dim=0,
-        )
 
-        new_mean = new_states.float().mean(axis=[-2, -1]).to(new_states.dtype)
-        display(old_mean)
-        display(new_mean)
-        display(new_states.shape)
-        new_states *= (old_mean / new_mean).unsqueeze(-1)
-        display(new_states.shape)
-        display(new_states)
-        return torch.cat([torch.unsqueeze(new_states, 0)], dim=0).to(text_model._device)
+class RotatedEncoding(StandardEncoding):
+    class Parallel(StandardEncoding.AdjustingBase):
+        def __init__(self):
+            super().__init__()
+            self.states = None
+
+        def Add(self, enc, states, unweighted_mean):
+            super().Add(enc, unweighted_mean)
+            self.states = enc.AddOrInit(self.states, states)
+
+        def Average(self, chunk_len):
+            super().Average(chunk_len)
+            self.states /= chunk_len
+
+        def ToStates(self, *input, **kwargs):
+            return self.states
+
+    def EncodeText(self, text_model, text: str):
+        chunks = [x.strip() for x in text.split(",")]
+        display(chunks)
+
+        annotations = [StandardEncoding.GetAnnotation(chunk) for chunk in chunks]
+        all_phrases = []
+        all_weights = []
+        all_token_nums = []
+        for phrase, weight, repeat in annotations:
+            num_tokens = text_model.num_tokens(phrase)
+            for i in range(repeat):
+                all_phrases.append(phrase)
+                all_weights.append(weight)
+                all_token_nums.append(num_tokens)
+        display(all_phrases)
+        display(all_weights)
+        display(all_token_nums)
+
+        proc = self.Parallel()
+
+        def run():
+            for i in range(len(all_phrases)):
+                rotated_text = " ".join(all_phrases[i:] + all_phrases[:i])
+                weights = [1.0]
+                for w, n in zip(
+                    all_weights[i:] + all_weights[:i],
+                    all_token_nums[i:] + all_token_nums[:i],
+                ):
+                    weights += [w] * n
+                display([weights, rotated_text])
+                weights += [1.0] * (text_model.max_length() - len(weights))
+                weights = torch.tensor(weights).to(text_model._device)
+                embeddings = text_model.EncodeText(rotated_text, False)
+                unweighted_mean = (
+                    embeddings[0][0].float().mean(axis=[-2, -1]).to(embeddings[0].dtype)
+                )
+                full = embeddings[0][0] * weights.unsqueeze(-1)
+                proc.Add(self, full, unweighted_mean)
+
+        run()
+        all_phrases.reverse()
+        all_weights.reverse()
+        all_token_nums.reverse()
+        run()
+        proc.Average(len(all_phrases) * 2)
+
+        new_states = proc.ToStates(text_model.max_length(), 1)
+        return proc.AdjustMean(new_states, text_model._device)
 
 
 class TextModel:
@@ -615,6 +726,11 @@ class TextModel:
     def max_length(self):
         return self._tokenizer.model_max_length
 
+    def num_tokens(self, text: str):
+        tokens = self._tokenizer(text)
+        display(tokens.input_ids)
+        return len(tokens.input_ids) - 2
+
     def tokenize(self, text: str):
         max_length = self.max_length()
         return self._tokenizer(
@@ -627,7 +743,7 @@ class TextModel:
     def decode_tokens(self, tokens):
         return self._tokenizer.batch_decode(tokens)
 
-    def EncodeText(self, text: str):
+    def EncodeText(self, text: str, fail_on_truncation: bool = True):
         max_length = self.max_length()
         text_inputs = self.tokenize(text)
         text_input_ids = text_inputs.input_ids
@@ -635,10 +751,11 @@ class TextModel:
 
         if text_input_ids.shape[-1] > max_length:
             removed_text = self.decode_tokens(text_input_ids[:, max_length:])
-            print(
-                "The following part of your input was truncated because CLIP can only handle sequences up to"
-                f" {max_length} tokens: {removed_text}"
-            )
+            if fail_on_truncation:
+                raise ValueError(
+                    "The following part of your input was truncated because CLIP can only handle sequences up to"
+                    f" {max_length} tokens: {removed_text}"
+                )
             text_input_ids = text_input_ids[:, :max_length]
         embeddings = self._text_encoder(
             text_input_ids.to(self._device),
