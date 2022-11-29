@@ -13,8 +13,7 @@ To use the library, you should put it in your current directory and then import 
 ```python
 from pipeline_unstable_diffusion import (
     Txt2Img, Img2Img, Inpaint,
-    ByLatents, Randomly,
-    StandardEncoding, EotEncoding, SegmentedEotEncoding, SegmentedEncoding,
+    ByLatents, Randomly, StandardEncoding, ShiftEncoding,
     UnstableDiffusionPipeline, ImageModel,
 )
 ```
@@ -28,8 +27,7 @@ use_xformers = False
 !wget 'https://raw.githubusercontent.com/nanashi161382/unstable_diffusion/main/pipeline_unstable_diffusion.py'
 from pipeline_unstable_diffusion import (
     Txt2Img, Img2Img, Inpaint,
-    ByLatents, Randomly,
-    StandardEncoding, EotEncoding, SegmentedEotEncoding, SegmentedEncoding,
+    ByLatents, Randomly, StandardEncoding, ShiftEncoding,
     UnstableDiffusionPipeline, ImageModel,
 )
 ```
@@ -45,8 +43,7 @@ use_xformers = True
 !wget 'https://raw.githubusercontent.com/nanashi161382/unstable_diffusion/main/pipeline_unstable_diffusion.py'
 from pipeline_unstable_diffusion import (
     Txt2Img, Img2Img, Inpaint,
-    ByLatents, Randomly,
-    StandardEncoding, EotEncoding, SegmentedEotEncoding, SegmentedEncoding,
+    ByLatents, Randomly, StandardEncoding, ShiftEncoding,
     UnstableDiffusionPipeline, ImageModel,
 )
 ```
