@@ -644,7 +644,25 @@ class SegmentedEncoding(StandardEncoding):
         return proc.AdjustMean(new_states, text_model._device)
 
 
-class RotatedEncoding(StandardEncoding):
+class ShiftEncoding(StandardEncoding):
+    def __init__(
+        self,
+        prompt: str,
+        negative_prompt: Optional[str] = None,
+        reverse: bool = True,
+        rotate: bool = True,
+        convolve: Union[bool, List[float]] = False,
+    ):
+        super().__init__(prompt, negative_prompt)
+        self._reverse = reverse
+        self._rotate = rotate
+        if not isinstance(convolve, list):
+            if convolve:
+                convolve = [0.7, 0.23, 0.07]
+            else:
+                convolve = [1.0]
+        self._convolve = np.array(convolve)
+
     class Parallel(StandardEncoding.AdjustingBase):
         def __init__(self):
             super().__init__()
@@ -683,29 +701,49 @@ class RotatedEncoding(StandardEncoding):
 
         def run():
             for i in range(len(all_phrases)):
-                rotated_text = " ".join(all_phrases[i:] + all_phrases[:i])
+                if self._rotate:
+                    shifted_text = " ".join(all_phrases[i:] + all_phrases[:i])
+                    shifted_weights = all_weights[i:] + all_weights[:i]
+                    shifted_token_nums = all_token_nums[i:] + all_token_nums[:i]
+                else:
+                    shifted_text = " ".join(all_phrases[i:])
+                    shifted_weights = all_weights[i:]
+                    shifted_token_nums = all_token_nums[i:]
                 weights = [1.0]
-                for w, n in zip(
-                    all_weights[i:] + all_weights[:i],
-                    all_token_nums[i:] + all_token_nums[:i],
-                ):
+                for w, n in zip(shifted_weights, shifted_token_nums):
                     weights += [w] * n
-                display([weights, rotated_text])
-                weights += [1.0] * (text_model.max_length() - len(weights))
-                weights = torch.tensor(weights).to(text_model._device)
-                embeddings = text_model.EncodeText(rotated_text, False)
+                weights = (
+                    np.convolve(np.array(weights) - 1.0, self._convolve, mode="full")
+                    + 1.0
+                )
+                display([weights, shifted_text])
+                if len(weights) >= text_model.max_length():
+                    weights = weights[: text_model.max_length()]
+                weights = np.concatenate(
+                    [
+                        weights,
+                        np.array([1.0] * (text_model.max_length() - len(weights))),
+                    ]
+                )
+
+                embeddings = text_model.EncodeText(shifted_text, False)
                 unweighted_mean = (
                     embeddings[0][0].float().mean(axis=[-2, -1]).to(embeddings[0].dtype)
                 )
+                weights = torch.tensor(weights).to(
+                    device=text_model._device, dtype=embeddings[0].dtype
+                )
                 full = embeddings[0][0] * weights.unsqueeze(-1)
                 proc.Add(self, full, unweighted_mean)
+            return len(all_phrases)
 
-        run()
-        all_phrases.reverse()
-        all_weights.reverse()
-        all_token_nums.reverse()
-        run()
-        proc.Average(len(all_phrases) * 2)
+        n = run()
+        if self._reverse:
+            all_phrases.reverse()
+            all_weights.reverse()
+            all_token_nums.reverse()
+            n += run()
+        proc.Average(n)
 
         new_states = proc.ToStates(text_model.max_length(), 1)
         return proc.AdjustMean(new_states, text_model._device)
