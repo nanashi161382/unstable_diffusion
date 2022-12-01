@@ -114,7 +114,7 @@ image = pipe(
 display(image)
 ```
 
-Finally, this is the code for inpaint. (note: the inpaint logic is equivalent to StableDiffusionInpaintPipelineLegacy, but not StableDiffusionInpaintPipeline.)
+Finally, this is the code for inpaint. (note: the inpaint logic is equivalent to `StableDiffusionInpaintPipelineLegacy`, but not `StableDiffusionInpaintPipeline`.)
 
 ```python
 prompt = "1girl, 1boy"
@@ -149,3 +149,37 @@ display(image)
 
 They work almost the same as the original stable diffusion pipelines, but there are some differences.
 Please check the description in the [initial commit](https://github.com/nanashi161382/unstable_diffusion/commit/7c94b3c74e7a23375e4158b54b85bbc6630302bf).
+
+## ShiftEncoding
+
+ShiftEncoding is a newly proposed way of processing prompts in Stable Diffusion to enable the following functionalities.
+* Eliminating position bias
+* Dealing with long prompts
+* Emphasizing words/phrases
+
+For the details, please read "[ShiftEncoding to overcome position bias in Stable Diffusion prompts](https://github.com/nanashi161382/unstable_diffusion/wiki/ShiftEncoding-to-overcome-position-bias-in-Stable-Diffusion-prompts)."
+
+To use this, you should simply replace `StandardEncoding` with `ShiftEncoding` in the examples above. Here is an example for text to image.
+
+```python
+prompt = "1girl, 1boy"
+negative_prompt = "1girl"
+guidance_scale = 7.5
+num_steps = 50
+image_size = (512, 512)  # width, height
+symmetric = False
+
+image = pipe(
+    pipeline_type=Txt2Img(
+        initialize=Randomly(symmetric=symmetric),
+        size=image_size,
+    ),
+    text_input=ShiftEncoding(
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+    ),
+    guidance_scale=guidance_scale,
+    num_inference_steps=num_steps,
+  )[0]
+display(image)
+```
