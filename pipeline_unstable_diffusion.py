@@ -12,6 +12,7 @@ import IPython
 from IPython.display import display
 import numpy as np
 import PIL
+import re
 import torch
 from torch import autocast
 from typing import Optional, List, Union, Callable, Tuple
@@ -679,69 +680,129 @@ class ShiftEncoding(StandardEncoding):
         def ToStates(self, *input, **kwargs):
             return self.states
 
+    class ChunkedPrompt:
+        class PhraseInfo:
+            def __init__(self, phrases, weights, token_nums):
+                self.phrases = phrases
+                self.weights = weights
+                self.token_nums = token_nums
+                display(phrases)
+                display(weights)
+                display(token_nums)
+
+            def Len(self):
+                return len(self.phrases)
+
+            def Reverse(self):
+                self.phrases.reverse()
+                self.weights.reverse()
+                self.token_nums.reverse()
+
+        def __init__(self, text_model, text: str):
+            parts = [x.strip() for x in re.split(">>>+", text)]
+            if len(parts) > 2:
+                raise ValueError(
+                    f'">>>" should appear at most once in a prompt, '
+                    f"but appeared {len(parts) - 1} times: {text}"
+                )
+            elif len(parts) == 2:
+                anc, unanc = parts
+            else:
+                anc = ""
+                unanc = text
+            print(f"anchored: {anc}")
+            print(f"unanchored: {unanc}")
+            self.anchored = self.Parse(text_model, anc)
+            self.unanchored = self.Parse(text_model, unanc)
+
+        def Parse(self, text_model, text):
+            if not text:
+                return self.PhraseInfo([], [], [])
+
+            chunks = [x.strip() for x in text.split(",")]
+            annotations = [
+                StandardEncoding.GetAnnotation(chunk) for chunk in chunks if chunk
+            ]
+            phrases = []
+            weights = []
+            token_nums = []
+            for phrase, weight, repeat in annotations:
+                num_tokens = text_model.num_tokens(phrase)
+                for i in range(repeat):
+                    phrases.append(phrase)
+                    weights.append(weight)
+                    token_nums.append(num_tokens)
+            return self.PhraseInfo(phrases, weights, token_nums)
+
+        def ShiftRange(self):
+            i = self.unanchored.Len()
+            return i if i > 0 else 1
+
+        def Shift(self, i: int, rotate: bool):
+            anc = self.anchored
+            unanc = self.unanchored
+            if rotate:
+                return self.PhraseInfo(
+                    anc.phrases + unanc.phrases[i:] + unanc.phrases[:i],
+                    anc.weights + unanc.weights[i:] + unanc.weights[:i],
+                    anc.token_nums + unanc.token_nums[i:] + unanc.token_nums[:i],
+                )
+            else:
+                return self.PhraseInfo(
+                    anc.phrases + unanc.phrases[i:],
+                    anc.weights + unanc.weights[i:],
+                    anc.token_nums + unanc.token_nums[i:],
+                )
+
+        def Reverse(self):
+            self.unanchored.Reverse()
+
+    def GetWeights(self, text_model, shifted):
+        weights = [1.0]
+        for w, n in zip(shifted.weights, shifted.token_nums):
+            weights += [w] * n
+        weights = (
+            np.convolve(np.array(weights) - 1.0, self._convolve, mode="full") + 1.0
+        )
+        display(weights)
+        if len(weights) >= text_model.max_length():
+            weights = weights[: text_model.max_length()]
+        weights = np.concatenate(
+            [
+                weights,
+                np.array([1.0] * (text_model.max_length() - len(weights))),
+            ]
+        )
+        return weights
+
     def EncodeText(self, text_model, text: str):
-        chunks = [x.strip() for x in text.split(",")]
-        display(chunks)
-
-        annotations = [StandardEncoding.GetAnnotation(chunk) for chunk in chunks]
-        all_phrases = []
-        all_weights = []
-        all_token_nums = []
-        for phrase, weight, repeat in annotations:
-            num_tokens = text_model.num_tokens(phrase)
-            for i in range(repeat):
-                all_phrases.append(phrase)
-                all_weights.append(weight)
-                all_token_nums.append(num_tokens)
-        display(all_phrases)
-        display(all_weights)
-        display(all_token_nums)
-
+        chunked = self.ChunkedPrompt(text_model, text)
         proc = self.Parallel()
 
         def run():
-            for i in range(len(all_phrases)):
-                if self._rotate:
-                    shifted_text = " ".join(all_phrases[i:] + all_phrases[:i])
-                    shifted_weights = all_weights[i:] + all_weights[:i]
-                    shifted_token_nums = all_token_nums[i:] + all_token_nums[:i]
-                else:
-                    shifted_text = " ".join(all_phrases[i:])
-                    shifted_weights = all_weights[i:]
-                    shifted_token_nums = all_token_nums[i:]
-                weights = [1.0]
-                for w, n in zip(shifted_weights, shifted_token_nums):
-                    weights += [w] * n
-                weights = (
-                    np.convolve(np.array(weights) - 1.0, self._convolve, mode="full")
-                    + 1.0
-                )
-                display([weights, shifted_text])
-                if len(weights) >= text_model.max_length():
-                    weights = weights[: text_model.max_length()]
-                weights = np.concatenate(
-                    [
-                        weights,
-                        np.array([1.0] * (text_model.max_length() - len(weights))),
-                    ]
-                )
+            shift_range = chunked.ShiftRange()
+            for i in range(shift_range):
+                shifted = chunked.Shift(i, self._rotate)
+                shifted_text = " ".join(shifted.phrases)
+                weights = self.GetWeights(text_model, shifted)
+                print(shifted_text)
 
                 embeddings = text_model.EncodeText(shifted_text, False)
                 unweighted_mean = (
                     embeddings[0][0].float().mean(axis=[-2, -1]).to(embeddings[0].dtype)
                 )
-                weights = torch.tensor(weights).to(
-                    device=text_model._device, dtype=embeddings[0].dtype
+                weights = (
+                    torch.tensor(weights)
+                    .to(device=text_model._device, dtype=embeddings[0].dtype)
+                    .unsqueeze(-1)
                 )
-                full = embeddings[0][0] * weights.unsqueeze(-1)
+                full = embeddings[0][0] * weights
                 proc.Add(self, full, unweighted_mean)
-            return len(all_phrases)
+            return shift_range
 
         n = run()
         if self._reverse:
-            all_phrases.reverse()
-            all_weights.reverse()
-            all_token_nums.reverse()
+            chunked.Reverse()
             n += run()
         proc.Average(n)
 
