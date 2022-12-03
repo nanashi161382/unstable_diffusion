@@ -3,12 +3,9 @@
 # https://github.com/nanashi161382/unstable_diffusion/tree/main
 from diffusers import (
     StableDiffusionInpaintPipelineLegacy,
-    DDIMScheduler,
     DiffusionPipeline,
     DPMSolverMultistepScheduler,
 )
-import inspect
-import IPython
 from IPython.display import display
 import numpy as np
 import PIL
@@ -408,30 +405,6 @@ class StandardEncoding:
             raise ValueError(f"Invalid repeat: {repeat}")
         return " ".join(words), weight, repeat
 
-    class EncodedSegment:
-        def __init__(self, embeddings, weight):
-            self.weight = torch.tensor(weight).to(embeddings[0].dtype)
-            self.unweighted_mean = (
-                embeddings[0][0].float().mean(axis=[-2, -1]).to(embeddings[0].dtype)
-            )
-            self.full = embeddings[0][0] * weight
-            self.sot = self.full[0]
-            self.eot = embeddings[1][0] * weight
-            self.end = self.full[-1]
-            effective_length = embeddings[2]
-            self.words = self.full[1:effective_length]
-
-        @classmethod
-        def Encode(cls, text_model, text, weight, fail_on_truncation: bool = True):
-            embeddings = text_model.EncodeText(text, fail_on_truncation)
-            return cls(embeddings, weight)
-
-        @classmethod
-        def AnnotateAndEncode(cls, text_model, chunk, fail_on_truncation: bool = True):
-            phrase, weight, repeat = StandardEncoding.GetAnnotation(chunk)
-            display([phrase, weight, repeat])
-            return cls.Encode(text_model, phrase, weight, fail_on_truncation), repeat
-
     class AdjustingBase:
         def __init__(self):
             self.unweighted_mean = None
@@ -446,203 +419,7 @@ class StandardEncoding:
         def AdjustMean(self, states, device):
             new_mean = states.float().mean(axis=[-2, -1]).to(states.dtype)
             states *= (self.unweighted_mean / new_mean).unsqueeze(-1)
-            display(states.shape)
-            display(states)
             return torch.cat([torch.unsqueeze(states, 0)], dim=0).to(device)
-
-    class SequentialBase(AdjustingBase):
-        def __init__(self):
-            super().__init__()
-            self.sot_state = None
-            self.eot_state = None
-            self.end_state = None
-            self.word_states = []
-            self.word_states_len = 0
-            self.eot_states = []
-
-        def Add(self, enc, segment):
-            super().Add(enc, segment.unweighted_mean)
-            self.sot_state = enc.AddOrInit(self.sot_state, segment.sot)
-            self.eot_state = enc.AddOrInit(self.eot_state, segment.eot)
-            self.end_state = enc.AddOrInit(self.end_state, segment.end)
-            self.word_states.append(segment.words)
-            self.word_states_len += segment.words.shape[0]
-            self.eot_states.append(segment.eot.unsqueeze(0))
-
-        def Average(self, chunk_len):
-            super().Average(chunk_len)
-            chunk_len = torch.tensor(chunk_len).to(self.unweighted_mean.dtype)
-            self.sot_state /= chunk_len
-            self.eot_state /= chunk_len
-            self.end_state /= chunk_len
-
-    class Parallel(AdjustingBase):
-        def __init__(self):
-            super().__init__()
-            self.states = None
-
-        def Add(self, enc, segment):
-            super().Add(enc, segment.unweighted_mean)
-            self.states = enc.AddOrInit(self.states, segment.full)
-
-        def Average(self, chunk_len):
-            super().Average(chunk_len)
-            self.states /= chunk_len
-
-        def ToStates(self, *input, **kwargs):
-            return self.states
-
-
-class EotEncoding(StandardEncoding):
-    def __init__(
-        self,
-        prompt: str,
-        negative_prompt: Optional[str] = None,
-        repeat: bool = False,
-    ):
-        """
-        Args:
-            prompt (`str`):
-                The prompt or prompts to guide the image generation.
-            negative_prompt (`str`, *optional*):
-                The prompt or prompts not to guide the image generation. Ignored when not using guidance (i.e., ignored if `guidance_scale` is less than `1`).
-        """
-        super().__init__(prompt, negative_prompt)
-        self._repeat = repeat
-
-    def EncodeText(self, text_model, text: str):
-        embeddings = text_model.EncodeText(text)
-        full_states = embeddings[0][0]
-        eot_state = embeddings[1][0]
-        end_state = full_states[-1]
-
-        old_mean = full_states.float().mean(axis=[-2, -1]).to(full_states.dtype)
-        if self._repeat:
-            new_states = torch.cat(
-                (
-                    full_states[0].unsqueeze(0),
-                    eot_state.repeat((len(full_states) - 2), 1),
-                    end_state.unsqueeze(0),
-                ),
-                dim=0,
-            )
-        else:
-            new_states = torch.cat(
-                (
-                    full_states[0].unsqueeze(0),
-                    eot_state.unsqueeze(0),
-                    end_state.repeat((len(full_states) - 2), 1),
-                ),
-                dim=0,
-            )
-        new_mean = new_states.float().mean(axis=[-2, -1]).to(new_states.dtype)
-        new_states *= (old_mean / new_mean).unsqueeze(-1)
-        display(new_states.shape)
-        display(new_states)
-        return torch.cat([torch.unsqueeze(new_states, 0)], dim=0).to(text_model._device)
-
-
-class SegmentedEotEncoding(StandardEncoding):
-    def __init__(
-        self,
-        prompt: str,
-        negative_prompt: Optional[str] = None,
-        repeat: bool = False,
-    ):
-        """
-        Args:
-            prompt (`str`):
-                The prompt or prompts to guide the image generation.
-            negative_prompt (`str`, *optional*):
-                The prompt or prompts not to guide the image generation. Ignored when not using guidance (i.e., ignored if `guidance_scale` is less than `1`).
-        """
-        super().__init__(prompt, negative_prompt)
-        self._repeat = repeat
-
-    class Sequential(StandardEncoding.SequentialBase):
-        def ToStates(self, max_length, repeat):
-            states = (
-                [self.sot_state.unsqueeze(0)]
-                + (self.eot_states * repeat)
-                + [self.eot_state.unsqueeze(0)]
-            )
-            states = torch.cat(
-                states + ([self.end_state.unsqueeze(0)] * (max_length - len(states))),
-                dim=0,
-            )
-            return states
-
-    def EncodeText(self, text_model, text: str):
-        chunks = [x.strip() for x in text.split(",")]
-        display(chunks)
-
-        proc = self.Sequential()
-        chunk_len = 0
-        for chunk in chunks:
-            segment, repeat = self.EncodedSegment.AnnotateAndEncode(text_model, chunk)
-            chunk_len += repeat
-            for i in range(repeat):
-                proc.Add(self, segment)
-        proc.Average(chunk_len)
-
-        eot_repeat = 1
-        if self._repeat:
-            eot_repeat = int((text_model.max_length() - 3) / len(proc.eot_states))
-        new_states = proc.ToStates(text_model.max_length(), eot_repeat)
-        return proc.AdjustMean(new_states, text_model._device)
-
-
-class SegmentedEncoding(StandardEncoding):
-    def __init__(
-        self,
-        prompt: str,
-        negative_prompt: Optional[str] = None,
-        sequential: bool = True,
-    ):
-        """
-        Args:
-            prompt (`str`):
-                The prompt or prompts to guide the image generation.
-            negative_prompt (`str`, *optional*):
-                The prompt or prompts not to guide the image generation. Ignored when not using guidance (i.e., ignored if `guidance_scale` is less than `1`).
-            sequential (`bool`):
-        """
-        super().__init__(prompt, negative_prompt)
-        self._sequential = sequential
-
-    class Sequential(StandardEncoding.SequentialBase):
-        def ToStates(self, max_length):
-            states = (
-                [self.sot_state.unsqueeze(0)]
-                + self.word_states
-                + [self.eot_state.unsqueeze(0)]
-            )
-            states_len = self.word_states_len + 2
-            states = torch.cat(
-                states + ([self.end_state.unsqueeze(0)] * (max_length - states_len)),
-                dim=0,
-            )
-            return states
-
-    def EncodeText(self, text_model, text: str):
-        chunks = [x.strip() for x in text.split(",")]
-        display(chunks)
-
-        if self._sequential:
-            proc = self.Sequential()
-        else:
-            proc = self.Parallel()
-
-        chunk_len = 0
-        for chunk in chunks:
-            segment, repeat = self.EncodedSegment.AnnotateAndEncode(text_model, chunk)
-            chunk_len += repeat
-            for i in range(repeat):
-                proc.Add(self, segment)
-        proc.Average(chunk_len)
-
-        new_states = proc.ToStates(text_model.max_length())
-        return proc.AdjustMean(new_states, text_model._device)
 
 
 class ShiftEncoding(StandardEncoding):
@@ -686,9 +463,6 @@ class ShiftEncoding(StandardEncoding):
                 self.phrases = phrases
                 self.weights = weights
                 self.token_nums = token_nums
-                display(phrases)
-                display(weights)
-                display(token_nums)
 
             def Len(self):
                 return len(self.phrases)
@@ -710,8 +484,6 @@ class ShiftEncoding(StandardEncoding):
             else:
                 anc = ""
                 unanc = text
-            print(f"anchored: {anc}")
-            print(f"unanchored: {unanc}")
             self.anchored = self.Parse(text_model, anc)
             self.unanchored = self.Parse(text_model, unanc)
 
@@ -827,7 +599,6 @@ class TextModel:
 
     def num_tokens(self, text: str):
         tokens = self._tokenizer(text)
-        display(tokens.input_ids)
         return len(tokens.input_ids) - 2
 
     def tokenize(self, text: str):
@@ -955,6 +726,57 @@ class UnstableDiffusionPipeline:
     def progress_bar(self, *input, **kwargs):
         return self._pipe.progress_bar(*input, **kwargs)
 
+    def Generate(
+        self,
+        text_embeddings,
+        do_classifier_free_guidance: bool,
+        pipeline_type: Union[Txt2Img, Img2Img, Inpaint],
+        guidance_scale: float = 7.5,
+        num_inference_steps: int = 50,
+        eta: float = 0.0,
+    ):
+        # set timesteps and initial latents
+        pipeline_type.InitializeGenerator(self)
+        self.scheduler.set_timesteps(num_inference_steps)
+        (latents, timesteps, apply_mask,) = pipeline_type.GetInitialLatentsAndTimesteps(
+            self, text_embeddings.dtype, num_inference_steps
+        )
+
+        # 8. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
+        extra_step_kwargs = self._pipe.prepare_extra_step_kwargs(
+            pipeline_type.GetGenerator(), eta
+        )
+
+        for i, t in enumerate(self.progress_bar(timesteps)):
+            # expand the latents if we are doing classifier free guidance
+            latent_model_input = (
+                torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+            )
+            latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+
+            # predict the noise residual
+            noise_pred = self.unet(
+                latent_model_input, t, encoder_hidden_states=text_embeddings
+            ).sample
+
+            # perform guidance
+            if do_classifier_free_guidance:
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + guidance_scale * (
+                    noise_pred_text - noise_pred_uncond
+                )
+
+            # compute the previous noisy sample x_t -> x_t-1
+            latents = self.scheduler.step(
+                noise_pred, t, latents, **extra_step_kwargs
+            ).prev_sample
+
+            # masking
+            if apply_mask:
+                latents = apply_mask(latents, t)
+
+        return [latents]
+
     @torch.no_grad()
     def __call__(
         self,
@@ -983,8 +805,6 @@ class UnstableDiffusionPipeline:
             generated images
         """
         with autocast(self._devicetype_str):
-            pipeline_type.InitializeGenerator(self)
-
             # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
             # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
             # corresponds to doing no classifier free guidance.
@@ -994,49 +814,13 @@ class UnstableDiffusionPipeline:
                 text_input, do_classifier_free_guidance
             )
 
-            # set timesteps and initial latents
-            self.scheduler.set_timesteps(num_inference_steps)
-            (
-                latents,
-                timesteps,
-                apply_mask,
-            ) = pipeline_type.GetInitialLatentsAndTimesteps(
-                self, text_embeddings.dtype, num_inference_steps
+            latents_ls = self.Generate(
+                text_embeddings,
+                do_classifier_free_guidance,
+                pipeline_type,
+                guidance_scale,
+                num_inference_steps,
+                eta,
             )
 
-            # 8. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
-            extra_step_kwargs = self._pipe.prepare_extra_step_kwargs(
-                pipeline_type.GetGenerator(), eta
-            )
-
-            for i, t in enumerate(self.progress_bar(timesteps)):
-                # expand the latents if we are doing classifier free guidance
-                latent_model_input = (
-                    torch.cat([latents] * 2) if do_classifier_free_guidance else latents
-                )
-                latent_model_input = self.scheduler.scale_model_input(
-                    latent_model_input, t
-                )
-
-                # predict the noise residual
-                noise_pred = self.unet(
-                    latent_model_input, t, encoder_hidden_states=text_embeddings
-                ).sample
-
-                # perform guidance
-                if do_classifier_free_guidance:
-                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                    noise_pred = noise_pred_uncond + guidance_scale * (
-                        noise_pred_text - noise_pred_uncond
-                    )
-
-                # compute the previous noisy sample x_t -> x_t-1
-                latents = self.scheduler.step(
-                    noise_pred, t, latents, **extra_step_kwargs
-                ).prev_sample
-
-                # masking
-                if apply_mask:
-                    latents = apply_mask(latents, t)
-
-            return self.image_model.Decode(latents)
+            return [self.image_model.Decode(latents)[0] for latents in latents_ls]
