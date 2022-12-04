@@ -536,7 +536,8 @@ class ShiftEncoding(StandardEncoding):
         weights = (
             np.convolve(np.array(weights) - 1.0, self._convolve, mode="full") + 1.0
         )
-        display(weights)
+        if text_model.debug:  # Debug output
+            display(weights)
         if len(weights) >= text_model.max_length():
             weights = weights[: text_model.max_length()]
         weights = np.concatenate(
@@ -557,7 +558,8 @@ class ShiftEncoding(StandardEncoding):
                 shifted = chunked.Shift(i, self._rotate)
                 shifted_text = " ".join(shifted.phrases)
                 weights = self.GetWeights(text_model, shifted)
-                print(shifted_text)
+                if text_model.debug:  # Debug output
+                    print(shifted_text)
 
                 embeddings = text_model.EncodeText(shifted_text, False)
                 unweighted_mean = (
@@ -583,16 +585,21 @@ class ShiftEncoding(StandardEncoding):
 
 
 class TextModel:
-    def __init__(self, tokenizer, text_encoder, device):
+    def __init__(self, tokenizer, text_encoder, device, debug):
         """
         Args:
             tokenizer:
             text_encoder:
             device:
+            debug:
         """
         self._tokenizer = tokenizer
         self._text_encoder = text_encoder
         self._device = device
+        self.SetDebug(debug)
+
+    def SetDebug(self, on: bool):
+        self.debug = on
 
     def max_length(self):
         return self._tokenizer.model_max_length
@@ -661,6 +668,10 @@ class TextModel:
 class UnstableDiffusionPipeline:
     def __init__(self, devicetype: str = "cuda"):
         self._devicetype_str = devicetype
+        self.SetDebug()
+
+    def SetDebug(self, on: bool = False):
+        self.debug = on
 
     def GetRevision(self, dataset: str, revision: Optional[str] = None):
         # revision is a git branch name assigned to the model repository.
@@ -719,12 +730,86 @@ class UnstableDiffusionPipeline:
         self.device = self._pipe.device
         self.unet = self._pipe.unet
         self.scheduler = self._pipe.scheduler
-        self.text_model = TextModel(pipe.tokenizer, pipe.text_encoder, pipe.device)
+        self.text_model = TextModel(
+            pipe.tokenizer, pipe.text_encoder, pipe.device, self.debug
+        )
         self.image_model = ImageModel(pipe.vae, pipe.vae_scale_factor, pipe.device)
         return self
 
     def progress_bar(self, *input, **kwargs):
         return self._pipe.progress_bar(*input, **kwargs)
+
+    def ShowDetailedSteps(self, interval: int = 0):
+        """
+        Args:
+            interval (`int`, default to 0):
+                if interval = 0 or less, it won't show detailed steps.
+        """
+        self._detailed_interval = interval
+
+    def InspectLatents(self, model_output, timestep, sample):
+        """
+        This is to inspect the noise (= model output) during image generation.
+        Calling the scheduler to recover latents from noise changing the scheduler's internal state
+        and thus affects the image generation.
+        So this reimplement the function so as not to change the internal state by copying and
+        modifying DPMSolverMultistepScheduler.step() available at
+        https://github.com/huggingface/diffusers/blob/769f0be8fb41daca9f3cbcffcfd0dbf01cc194b8/src/diffusers/schedulers/scheduling_dpmsolver_multistep.py#L428
+        The implementation depends on scheduler, so this function only supports
+        DPMSolverMultistepScheduler.
+        """
+        if not isinstance(self.scheduler, DPMSolverMultistepScheduler):
+            raise ValueError("Unsupported scheduler for inspection.")
+        timestep = timestep.to(self.scheduler.timesteps.device)
+        step_index = (self.scheduler.timesteps == timestep).nonzero()
+        if len(step_index) == 0:
+            step_index = len(self.scheduler.timesteps) - 1
+        else:
+            step_index = step_index.item()
+        prev_timestep = (
+            0
+            if step_index == len(self.scheduler.timesteps) - 1
+            else self.scheduler.timesteps[step_index + 1]
+        )
+        lower_order_final = (
+            (step_index == len(self.scheduler.timesteps) - 1)
+            and self.scheduler.config.lower_order_final
+            and len(self.scheduler.timesteps) < 15
+        )
+        lower_order_second = (
+            (step_index == len(self.scheduler.timesteps) - 2)
+            and self.scheduler.config.lower_order_final
+            and len(self.scheduler.timesteps) < 15
+        )
+        model_output = self.scheduler.convert_model_output(
+            model_output, timestep, sample
+        )
+        if (
+            self.scheduler.config.solver_order == 1
+            or self.scheduler.lower_order_nums < 1
+            or lower_order_final
+        ):
+            return self.scheduler.dpm_solver_first_order_update(
+                model_output, timestep, prev_timestep, sample
+            )
+        elif (
+            self.scheduler.config.solver_order == 2
+            or self.scheduler.lower_order_nums < 2
+            or lower_order_second
+        ):
+            timestep_list = [self.scheduler.timesteps[step_index - 1], timestep]
+            return self.scheduler.multistep_dpm_solver_second_order_update(
+                self.scheduler.model_outputs, timestep_list, prev_timestep, sample
+            )
+        else:
+            timestep_list = [
+                self.scheduler.timesteps[step_index - 2],
+                self.scheduler.timesteps[step_index - 1],
+                timestep,
+            ]
+            return self.scheduler.multistep_dpm_solver_third_order_update(
+                self.scheduler.model_outputs, timestep_list, prev_timestep, sample
+            )
 
     def Generate(
         self,
@@ -747,6 +832,8 @@ class UnstableDiffusionPipeline:
             pipeline_type.GetGenerator(), eta
         )
 
+        # showing initial latent if details are required
+        latents_ls = [latents] if self._detailed_interval else []
         for i, t in enumerate(self.progress_bar(timesteps)):
             # expand the latents if we are doing classifier free guidance
             latent_model_input = (
@@ -766,16 +853,32 @@ class UnstableDiffusionPipeline:
                     noise_pred_text - noise_pred_uncond
                 )
 
+            # showing detailed steps
+            show_detailed_steps = self._detailed_interval and (
+                (i + 1) % self._detailed_interval == 0
+            )
+            if show_detailed_steps:
+                if do_classifier_free_guidance:
+                    latents_ls.append(self.InspectLatents(noise_pred_text, t, latents))
+                    latents_ls.append(
+                        self.InspectLatents(noise_pred_uncond, t, latents)
+                    )
+
             # compute the previous noisy sample x_t -> x_t-1
             latents = self.scheduler.step(
                 noise_pred, t, latents, **extra_step_kwargs
             ).prev_sample
 
+            # showing detailed steps
+            if show_detailed_steps:
+                latents_ls.append(latents)
+
             # masking
             if apply_mask:
                 latents = apply_mask(latents, t)
 
-        return [latents]
+        latents_ls.append(latents)
+        return latents_ls
 
     @torch.no_grad()
     def __call__(
