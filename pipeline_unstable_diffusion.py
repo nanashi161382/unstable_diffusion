@@ -346,7 +346,45 @@ class ImageModel:
         return mask
 
 
-class StandardEncoding:
+class TextEmbeddings:
+    def __init__(self, text_embedding):
+        self._text_embeddings = [text_embedding]
+        self._expiry = [-1]
+        self.dtype = text_embedding.dtype
+
+    def AddNext(self, start, next_embedding):
+        self._expiry[-1] = start
+        self._expiry.append(-1)
+        # TODO: support more than 1 internal embeddings.
+        self._text_embeddings.append(next_embedding._text_embeddings[0])
+
+    def Get(self, i):
+        for k, e in enumerate(self._expiry):
+            if (e == -1) or (i < e):
+                return self._text_embeddings[k]
+        print(f"text embeddings: index out of bounds: {i}")
+        print("returning the last text embeddings.")
+        return self._text_embeddings[-1]
+
+
+class TextEmbeddingsCat:
+    def __init__(self, text_embeddings_ls):
+        self._text_embeddings_ls = text_embeddings_ls
+        self.dtype = text_embeddings_ls[0].dtype
+
+    def Get(self, i):
+        return torch.cat([t.Get(i) for t in self._text_embeddings_ls])
+
+
+class BaseEncoding:
+    def EncodePrompt(self, text_model):
+        raise NotImplementedError()
+
+    def EncodeNegativePrompt(self, text_model):
+        raise NotImplementedError()
+
+
+class StandardEncoding(BaseEncoding):
     def __init__(
         self,
         prompt: str,
@@ -365,7 +403,7 @@ class StandardEncoding:
         self._negative_prompt = negative_prompt
 
     def EncodeText(self, text_model, text: str):
-        return text_model.EncodeText(text)[0]
+        return TextEmbeddings(text_model.EncodeText(text)[0])
 
     def EncodePrompt(self, text_model):
         return self.EncodeText(text_model, self._prompt)
@@ -581,7 +619,36 @@ class ShiftEncoding(StandardEncoding):
         proc.Average(n)
 
         new_states = proc.ToStates(text_model.max_length(), 1)
-        return proc.AdjustMean(new_states, text_model._device)
+        return TextEmbeddings(proc.AdjustMean(new_states, text_model._device))
+
+
+class ListEncoding(StandardEncoding):
+    def __init__(self, encodings: List[Tuple[int, StandardEncoding]]):
+        if not encodings:
+            raise ValueError("ListEncoding requires at least 1 sub-encoding.")
+        if encodings[0][0] != 0:
+            raise ValueError("Initial encoding must start from 0.")
+        self._encodings = encodings
+
+    def EncodePrompt(self, text_model):
+        embeddings = None
+        for start, encoding in self._encodings:
+            emb = encoding.EncodePrompt(text_model)
+            if not embeddings:
+                embeddings = emb
+            else:
+                embeddings.AddNext(start, emb)
+        return embeddings
+
+    def EncodeNegativePrompt(self, text_model):
+        embeddings = None
+        for start, encoding in self._encodings:
+            emb = encoding.EncodeNegativePrompt(text_model)
+            if not embeddings:
+                embeddings = emb
+            else:
+                embeddings.AddNext(start, emb)
+        return embeddings
 
 
 class TextModel:
@@ -660,7 +727,8 @@ class TextModel:
             # For classifier free guidance, we need to do two forward passes.
             # Here we concatenate the unconditional and text embeddings into a single batch
             # to avoid doing two forward passes
-            text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
+            # text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
+            text_embeddings = TextEmbeddingsCat([uncond_embeddings, text_embeddings])
 
         return text_embeddings
 
@@ -843,7 +911,7 @@ class UnstableDiffusionPipeline:
 
             # predict the noise residual
             noise_pred = self.unet(
-                latent_model_input, t, encoder_hidden_states=text_embeddings
+                latent_model_input, t, encoder_hidden_states=text_embeddings.Get(i)
             ).sample
 
             # perform guidance
@@ -884,7 +952,7 @@ class UnstableDiffusionPipeline:
     def __call__(
         self,
         pipeline_type: Union[Txt2Img, Img2Img, Inpaint],
-        text_input: StandardEncoding,
+        text_input: BaseEncoding,
         guidance_scale: float = 7.5,
         num_inference_steps: int = 50,
         eta: float = 0.0,
@@ -895,7 +963,7 @@ class UnstableDiffusionPipeline:
         Args:
             pipeline_type: (`Txt2Img` or `Img2Img` or `Inpaint`):
                 The pipeline execution type.
-            text_input: (`StandardEncoding` and its subclasses):
+            text_input: (`BaseEncoding` and its subclasses):
                 Textual input and how it is encoded
             guidance_scale (`float`, *optional*, defaults to 7.5):
                 Guidance scale as defined in [Classifier-Free Diffusion Guidance](https://arxiv.org/abs/2207.12598).
