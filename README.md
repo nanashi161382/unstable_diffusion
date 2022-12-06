@@ -1,5 +1,7 @@
 # unstable_diffusion
 
+**Note: Please use [release v3.0](https://github.com/nanashi161382/unstable_diffusion/tree/v3.0) for now because the latest codebase is under a big code change and is not compatible with this document.**
+
 This is a library to use the [stable_diffusion pipeline](https://github.com/huggingface/diffusers/tree/main/src/diffusers/pipelines/stable_diffusion) more easily for the interactive use cases. The official pipeline classes are OK for the batch use cases, but a bit cumbersome to use for the interactive use cases especially on Google Colab. Especially if you want to switch different pipeline types such as text-to-image, image-to-image and inpaint. This library works as a wrapper to the library to give better experiences for the purpose.
 
 This library also aims to give additional functionalities for advanced users.
