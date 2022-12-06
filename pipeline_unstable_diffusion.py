@@ -622,7 +622,7 @@ class ShiftEncoding(StandardEncoding):
         return TextEmbeddings(proc.AdjustMean(new_states, text_model._device))
 
 
-class ListEncoding(StandardEncoding):
+class ListEncoding(BaseEncoding):
     def __init__(self, encodings: List[Tuple[int, StandardEncoding]]):
         if not encodings:
             raise ValueError("ListEncoding requires at least 1 sub-encoding.")
