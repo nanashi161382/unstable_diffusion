@@ -33,8 +33,12 @@ def SetDebugLevel(level: int):
     debug_level = level
 
 
+def ShouldDebug(level: int):
+    return level <= debug_level
+
+
 def Debug(level: int, obj):
-    if level <= debug_level:
+    if ShouldDebug(level):
         display(obj)
 
 
@@ -42,6 +46,17 @@ def Debug(level: int, obj):
 # -- Type: Generator --
 #
 Generator = Optional[torch.Generator]
+
+
+def OpenImage(filename):
+    if filename:
+        image = PIL.Image.open(filename).convert("RGB")
+        if ShouldDebug(1):
+            print(filename)
+            display(image.resize((128, 128), resample=PIL.Image.LANCZOS))
+        return image
+    else:
+        return None
 
 
 #
@@ -159,13 +174,20 @@ class ImageModel:
         return 2.0 * image - 1.0
 
     def Encode(
-        self, image: PIL.Image.Image, generator: Generator, target: SharedTarget
+        self,
+        image: PIL.Image.Image,
+        generator: Generator,
+        target: SharedTarget,
+        deterministic: bool = False,
     ):
         image = self.Preprocess(image).to(**target.dict)
 
         # encode the init image into latents and scale the latents
         latent_dist = self._vae.encode(image).latent_dist
-        latents = latent_dist.sample(generator=generator)
+        if deterministic:
+            latents = latent_dist.mode()
+        else:
+            latents = latent_dist.sample(generator=generator)
         latents = 0.18215 * latents
 
         return latents
@@ -525,10 +547,12 @@ class Scheduler:
 
     def ResetGenerator(self, target: SharedTarget, rand_seed: Optional[int]):
         self._rand_seed = rand_seed
+        if not rand_seed:
+            return
+        Debug(1, f"Setting random seed to {self._rand_seed}")
         if rand_seed and (not self._generator):
             self._generator = torch.Generator(device=target.device())
         self._generator.manual_seed(rand_seed)
-        Debug(1, f"Setting random seed to {self._rand_seed}")
 
     def generator(self):
         if not self._rand_seed:
@@ -540,9 +564,7 @@ class Scheduler:
         # than those in training.
         if self.have_max_timesteps and (len(self.scheduler) < num_inference_steps):
             num_inference_steps = len(self.scheduler)
-        self.num_inference_steps = num_inference_steps
         self.scheduler.set_timesteps(num_inference_steps)
-        return num_inference_steps
 
     def PrepareExtraStepKwargs(self, pipe, eta):
         self._extra_step_kwargs = pipe.prepare_extra_step_kwargs(self.generator(), eta)
@@ -630,25 +652,39 @@ class Scheduler:
 # -- Initializer --
 #
 class Initializer:
-    def InitializeWithScheduler(self, scheduler: Scheduler):
-        raise NotImplementedError()
+    def RequestedNumSteps(self, num_steps: int):
+        return num_steps
 
     def GetLatents(
         self,
+        size: Optional[Tuple[int, int]],
         image_model: ImageModel,
         generator: Generator,
         target: SharedTarget,
+        adjust: float,
     ):
         raise NotImplementedError()
 
     def GetTimesteps(self, scheduler: Scheduler, target: SharedTarget):
-        raise NotImplementedError()
+        # dtype should be `int`
+        return scheduler.Get().timesteps.to(device=target.device())
 
     def InitializeLatents(self, scheduler: Scheduler, latents, timesteps):
         raise NotImplementedError()
 
-    def NextLatents(self, scheduler: Scheduler, latents, timesteps, step: int):
-        raise NotImplementedError()
+    def GetOffset(self):
+        return 0.0
+
+    def NextLatents(
+        self,
+        scheduler: Scheduler,
+        latents,
+        timesteps,
+        current_step: int,
+        offset: float = 0.0,
+    ):
+        # do nothing
+        return latents
 
     @classmethod
     def RandForShape(cls, shape, generator: Generator, target: SharedTarget):
@@ -671,8 +707,6 @@ class Initializer:
 class Randomly(Initializer):
     def __init__(
         self,
-        num_steps: int,
-        size: Tuple[int, int],
         symmetric: Optional[bool] = False,
     ):
         """
@@ -680,20 +714,20 @@ class Randomly(Initializer):
             size (`(int, int)`, *optional*, defaults to (512, 512))
                 The (width, height) pair in pixels of the generated image.
         """
-        self._requested_num_steps = num_steps
-        self._size = size
         self._symmetric = symmetric
-
-    def InitializeWithScheduler(self, scheduler: Scheduler):
-        self._actual_num_steps = scheduler.SetTimesteps(self._requested_num_steps)
 
     def GetLatents(
         self,
+        size: Optional[Tuple[int, int]],
         image_model: ImageModel,
         generator: Generator,
         target: SharedTarget,
+        adjust: float,
     ):
-        latents_shape = self.GetLatentsShape(image_model)
+        if not size:
+            raise ValueError("`size` is mandatory to initialize `Randomly`.")
+
+        latents_shape = self.GetLatentsShape(image_model, size)
 
         if not self._symmetric:
             latents = self.RandForShape(latents_shape, generator, target)
@@ -711,23 +745,14 @@ class Randomly(Initializer):
             right = right[:, :, :, extra_width:]
         return torch.cat([left, right], dim=-1)
 
-    def GetTimesteps(self, scheduler: Scheduler, target: SharedTarget):
-        return scheduler.Get().timesteps.to(
-            device=target.device()
-        )  # dtype should be `int`
-
     def InitializeLatents(self, scheduler: Scheduler, latents, timesteps):
         return latents * scheduler.Get().init_noise_sigma
 
-    def NextLatents(self, scheduler: Scheduler, latents, timesteps, step: int):
-        # do nothing
-        return latents
-
-    def GetLatentsShape(self, image_model: ImageModel):
+    def GetLatentsShape(self, image_model: ImageModel, size: Tuple[int, int]):
         batch_size = 1
         num_channels = image_model.num_channels()
         scale_factor = image_model.vae_scale_factor()
-        width, height = self._size
+        width, height = size
         if height % scale_factor != 0 or width % scale_factor != 0:
             Debug(
                 1,
@@ -748,7 +773,6 @@ class Randomly(Initializer):
 class ByLatents(Initializer):
     def __init__(
         self,
-        num_steps: int,
         latents: torch.FloatTensor,
     ):
         """
@@ -756,38 +780,28 @@ class ByLatents(Initializer):
             latents (`torch.FloatTensor`, *optional*):
                 Pre-generated noisy latents, sampled from a Gaussian distribution, to be used as inputs for image generation. Can be used to tweak the same generation with different prompts. If not provided, a latents tensor will ge generated by sampling using the supplied random `generator`.
         """
-        self._requested_num_steps = num_steps
         self._latents = latents
-
-    def InitializeWithScheduler(self, scheduler: Scheduler):
-        self._actual_num_steps = scheduler.SetTimesteps(self._requested_num_steps)
 
     def GetLatents(
         self,
+        size: Optional[Tuple[int, int]],
         image_model: ImageModel,
         generator: Generator,
         target: SharedTarget,
+        adjust: float,
     ):
+        if size:
+            Debug(0, "`size` is ignored when initializing `ByLatents`.")
         return self._latents.to(**target.dict)
-
-    def GetTimesteps(self, scheduler: Scheduler, target: SharedTarget):
-        return scheduler.Get().timesteps.to(
-            device=target.device()
-        )  # dtype should be `int`
 
     def InitializeLatents(self, scheduler: Scheduler, latents, timesteps):
         return latents * scheduler.Get().init_noise_sigma
-
-    def NextLatents(self, scheduler: Scheduler, latents, timesteps, step: int):
-        # do nothing
-        return latents
 
 
 class ByImage(Initializer):
     def __init__(
         self,
-        num_steps: int,
-        image: PIL.Image.Image,
+        image: Union[str, PIL.Image.Image],
         strength: float = 0.8,
         keep_until: float = 0.0,
     ):
@@ -803,56 +817,143 @@ class ByImage(Initializer):
                 1 if we keep the image in the final output
                 Choose between 0 and 1 to keep the image until the middle of the generation.
         """
+        if isinstance(image, str):
+            image = OpenImage(image)
         self._image = image
         if (strength <= 0.0) or (strength > 1.0):
             raise ValueError(f"strength must be between 0 and 1. given {strength}.")
         self._strength = strength
-        self._requested_num_steps = -(-num_steps // strength)  # round up
-        if (fix_until < 0.0) or (fix_until > 1.0):
-            raise ValueError(f"strength must be between 0 and 1. given {strength}.")
+        if (keep_until < 0.0) or (keep_until > 1.0):
+            raise ValueError(f"strength must be between 0 and 1. given {keep_until}.")
         self._keep_until = keep_until
 
-    def InitializeWithScheduler(self, scheduler: Scheduler):
-        self._actual_total_num_steps = scheduler.SetTimesteps(self._requested_num_steps)
-        self._actual_num_steps = int(self._actual_total_num_steps * self._strength)
-        self._steps_to_keep = int(self._actual_num_steps * self._keep_until)
+    def RequestedNumSteps(self, num_steps: int):
+        return int(-(-int(num_steps) // self._strength))  # round up
 
     def GetLatents(
         self,
+        size: Optional[Tuple[int, int]],
         image_model: ImageModel,
         generator: Generator,
         target: SharedTarget,
+        adjust: float,
     ):
-        latents = image_model.Encode(self._image, generator, target)
-        self._initial_latents = latents.clone()
+        image = self._image
+        if size:
+            Debug(1, f"Resize image from {image.size} to {size}.")
+            image = image.resize(size)
+        latents = image_model.Encode(image, generator, target) * adjust
+        self._initial_latents = latents
         self._noise = self.RandForShape(latents.shape, generator, target)
         return latents
 
     def GetTimesteps(self, scheduler: Scheduler, target: SharedTarget):
-        return (
-            scheduler.Get()
-            .timesteps[-self._actual_num_steps :]
-            .to(device=target.device())  # dtype should be `int`
-        )
+        timesteps = super().GetTimesteps(scheduler, target)
+        actual_num_steps = int(len(timesteps) * self._strength)
+        return timesteps[-actual_num_steps:]
 
     def InitializeLatents(self, scheduler: Scheduler, latents, timesteps):
-        initial_timestep = timesteps[:-1]
-        return scheduler.Get().add_noise(
+        initial_timestep = timesteps[:1]
+        latents = scheduler.Get().add_noise(
             self._initial_latents, self._noise, initial_timestep
         )
+        return latents
 
-    def NextLatents(self, scheduler: Scheduler, latents, timesteps, step: int):
-        if step >= self._steps_to_keep:
+    def GetOffset(self):
+        return 1.0 - self._strength
+
+    def NextLatents(
+        self,
+        scheduler: Scheduler,
+        latents,
+        timesteps,
+        current_step: int,
+        offset: float,
+    ):
+        # re-compute keep_until under the condition of the given offset.
+        keep_until = offset + (1.0 - offset) * self._keep_until
+        progress = float(current_step + 1) / len(timesteps)
+        Debug(3, f"progress {progress:.2f}, keep_until {keep_until:.2f}")
+        if progress > keep_until:
             # do nothing
             return latents
         # Return the initial latents if this is the last step.
-        if step >= len(timesteps) - 1:
+        if progress >= 1.0:
+            Debug(3, "Last step with keeping initial image.")
             return self._initial_latents
         # Otherwise add noise to the initial latents.
-        next_timestep = timesteps[step + 1 : step + 2]
+        Debug(3, "Add noise for step {current_step}.")
+        next_timestep = timesteps[current_step + 1 : current_step + 2]
         return scheduler.Get().add_noise(
             self._initial_latents, self._noise, next_timestep
         )
+
+
+class ByBothOf(Initializer):
+    def __init__(
+        self,
+        black: Initializer,
+        white: Initializer,
+        in_mask: Union[int, str, PIL.Image.Image],
+    ):
+        mask = in_mask
+        if mask and isinstance(mask, str):
+            mask = OpenImage(mask)
+        self._both = [black, white]
+        self._mask_image = mask
+
+    def GetLatents(
+        self,
+        size: Optional[Tuple[int, int]],
+        image_model: ImageModel,
+        generator: Generator,
+        target: SharedTarget,
+        adjust: float,
+    ):
+        mask = self._mask_image
+        if isinstance(mask, PIL.Image.Image):
+            if size:
+                Debug(1, f"Resize mask image from {mask.size} to {size}.")
+                mask = mask.resize(size)
+            self._mask = image_model.PreprocessMask(mask, target)
+        else:
+            self._mask = 1.0 - mask  # make the scale same as the mask image.
+        return [
+            g.GetLatents(size, image_model, generator, target, adjust)
+            for g in self._both
+        ]
+
+    def InitializeLatents(self, scheduler: Scheduler, latents, timesteps):
+        latents = [
+            g.InitializeLatents(scheduler, l, timesteps)
+            for g, l in zip(self._both, latents)
+        ]
+        return self._ApplyMask(*latents)
+
+    def NextLatents(
+        self,
+        scheduler: Scheduler,
+        latents,
+        timesteps,
+        current_step: int,
+        offset: float,
+    ):
+        # TODO: take care of offset properly
+        latents = [
+            g.NextLatents(
+                scheduler,
+                latents,
+                timesteps,
+                current_step,
+                # re-compute offset under the condition of the given offset.
+                offset + (1.0 - offset) * g.GetOffset(),
+            )
+            for g in self._both
+        ]
+        return self._ApplyMask(*latents)
+
+    def _ApplyMask(self, black, white):
+        return (black * self._mask) + (white * (1.0 - self._mask))
 
 
 #
@@ -954,48 +1055,71 @@ class BackgroundLayer(BaseLayer):
         prompt_name: Optional[str] = None,
         negative_prompt_name: Optional[str] = None,
         cfg_scale: float = 7.5,
+        adjust: Optional[float] = None,
     ):
         super().__init__(prompt_name, negative_prompt_name, cfg_scale)
         self._initializer = initialize
+        if not adjust:
+            self._adjust = 1.0
+        else:
+            self._adjust = adjust
 
     def Initialize(
         self,
+        num_steps: int,
+        size: Optional[Tuple[int, int]],
         scheduler: Scheduler,
         image_model: ImageModel,
         prompts: Prompts,
         target: SharedTarget,
     ):
         super()._Initialize(prompts, target)
-        self._initializer.InitializeWithScheduler(scheduler)
+        scheduler.SetTimesteps(self._initializer.RequestedNumSteps(num_steps))
         latents = self._initializer.GetLatents(
-            image_model, scheduler.generator(), target
+            size, image_model, scheduler.generator(), target, self._adjust
         )
         timesteps = self._initializer.GetTimesteps(scheduler, target)
-        self._initializer.InitializeLatents(scheduler, latents, timesteps)
+        latents = self._initializer.InitializeLatents(scheduler, latents, timesteps)
         return latents, timesteps
 
-    def NextLatents(self, scheduler: Scheduler, latents, timesteps, step: int):
-        return self._initializer.NextLatents(scheduler, latents, timesteps, step)
+    def NextLatents(self, scheduler: Scheduler, latents, timesteps, current_step: int):
+        return self._initializer.NextLatents(
+            scheduler, latents, timesteps, current_step, offset=0.0
+        )
 
 
 class Layer(BaseLayer):
     def __init__(
         self,
-        mask: PIL.Image.Image,
+        mask: Union[int, str, PIL.Image.Image],
         prompt_name: Optional[str] = None,
         negative_prompt_name: Optional[str] = None,
         cfg_scale: float = 7.5,
     ):
         super().__init__(prompt_name, negative_prompt_name, cfg_scale)
+        if isinstance(mask, str):
+            mask = OpenImage(mask)
         self._mask_image = mask
 
     def Initialize(
-        self, image_model: ImageModel, prompts: Prompts, target: SharedTarget
+        self,
+        size: Optional[Tuple[int, int]],
+        image_model: ImageModel,
+        prompts: Prompts,
+        target: SharedTarget,
     ):
         super()._Initialize(prompts, target)
-        self._mask = image_model.PreprocessMask(self._mask_image, target)
+        mask = self._mask_image
+        if isinstance(mask, PIL.Image.Image):
+            if size:
+                Debug(1, f"Resize mask image from {mask.size} to {size}.")
+                mask = mask.resize(size)
+            self._mask = image_model.PreprocessMask(mask, target)
+        else:
+            self._mask = 1.0 - mask  # make the scale same as the mask image.
 
-    def Merge(self, mine, other):
+    def Merge(self, other, mine):
+        # other = black, mine = white
         return (other * self._mask) + (mine * (1.0 - self._mask))
 
 
@@ -1031,6 +1155,7 @@ class LayeredDiffusionPipeline:
         use_xformers: bool = False,
         device_type: str = "cuda",
     ):
+        self._dataset = dataset
         extra_args = {
             "torch_dtype": torch.float32,  # This may be needed to avoid OOM.
             "revision": self.GetRevision(dataset, revision),
@@ -1056,6 +1181,7 @@ class LayeredDiffusionPipeline:
         return self
 
     def CopyFrom(self, another):
+        self._dataset = another._dataset
         self.scheduler = Scheduler().CopyFrom(another.scheduler)
         self._SetPipeline(another.pipe)
         return self
@@ -1072,15 +1198,20 @@ class LayeredDiffusionPipeline:
     @torch.no_grad()
     def __call__(
         self,
+        num_steps: int,
         prompts: Dict[str, PromptType],
         initialize: Initializer,
+        size: Optional[Tuple[int, int]] = None,
         default_encoding: Optional[StandardEncoding] = None,
         prompt_name: Optional[str] = None,
         negative_prompt_name: Optional[str] = None,
         cfg_scale: float = 7.5,
         layers: Optional[List[Layer]] = None,
         eta: float = 0.0,
+        adjust: Optional[float] = None,
     ):
+        if num_steps <= 0:
+            raise ValueError(f"num_steps must be > 0. actual: {num_steps}")
         if not default_encoding:
             default_encoding = ShiftEncoding()
         if not prompt_name:
@@ -1089,8 +1220,16 @@ class LayeredDiffusionPipeline:
             negative_prompt_name = ""
         if not layers:
             layers = []
+
+        # Anything v3.0's VAE has a degradation problem in its encoder.
+        # Multiplying the adjustment factor of 1.25 to the encoder output mitigates
+        # the problem to a lower level.
+        if not adjust:
+            if self._dataset == "Linaqruf/anything-v3.0":
+                adjust = 1.25
+
         bglayer = BackgroundLayer(
-            initialize, prompt_name, negative_prompt_name, cfg_scale
+            initialize, prompt_name, negative_prompt_name, cfg_scale, adjust
         )
         all_layers = [bglayer] + layers
         prompts = Prompts(prompts, self.text_model, default_encoding)
@@ -1099,31 +1238,39 @@ class LayeredDiffusionPipeline:
         with autocast(target.device_type()):
             if layers:
                 for l in reversed(layers):
-                    l.Initialize(self.image_model, prompts, target)
+                    l.Initialize(size, self.image_model, prompts, target)
             latents, timesteps = bglayer.Initialize(
-                self.scheduler, self.image_model, prompts, target
+                num_steps, size, self.scheduler, self.image_model, prompts, target
             )
             self.scheduler.PrepareExtraStepKwargs(self.pipe, eta)
 
-            for step, ts in enumerate(self.pipe.progress_bar(timesteps)):
-                progress = float(step) / len(timesteps)
+            for i, ts in enumerate(self.pipe.progress_bar(timesteps)):
+                progress = float(i + 1) / len(timesteps)
+                Debug(3, f"progress: {progress} <= {i + 1} / {len(timesteps)}")
                 residuals_for_prompts = prompts.PredictResiduals(
                     self.scheduler, self.unet, latents, ts, progress
                 )
                 residuals_for_layers = [
                     l.GetResidual(residuals_for_prompts) for l in all_layers
                 ]
+
+                # TODO: implement residual inspection
+                # latents_debug = self.scheduler.InspectLatents(
+                #    residuals_for_layers[0], ts, latents
+                # )
+                # Debug(3, self.image_model.Decode(latents_debug)[0])
+
                 latents_for_layers = self.scheduler.Step(
                     residuals_for_layers, ts, latents
                 )
                 next_latents = bglayer.NextLatents(
-                    self.scheduler, latents_for_layers[0], timesteps, step
+                    self.scheduler, latents_for_layers[0], timesteps, i
                 )
                 if layers:
                     for layer, latents in zip(
                         reversed(layers), reversed(latents_for_layers[1:])
                     ):
-                        next_latents = layer.Merge(latents, next_latents)
+                        next_latents = layer.Merge(next_latents, latents)
                 latents = next_latents
 
             return self.image_model.Decode(latents)
