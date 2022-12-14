@@ -219,6 +219,63 @@ class ImageModel:
 
 
 #
+# -- LatentMask --
+#
+class LatentMask:
+    def __init__(self, mask_by: Union[float, str, PIL.Image.Image]):
+        if isinstance(mask_by, str):
+            self._mask_by = OpenImage(mask_by)
+        else:
+            self._mask_by = mask_by
+
+    def Initialize(
+        self,
+        size: Optional[Tuple[int, int]],
+        image_model: ImageModel,
+        target: SharedTarget,
+    ):
+        mask = self._mask_by
+        if isinstance(mask, PIL.Image.Image):
+            if size:
+                Debug(1, f"Resize mask image from {mask.size} to {size}.")
+                mask = mask.resize(size)
+            self._mask = image_model.PreprocessMask(mask, target)
+        else:
+            self._mask = 1.0 - mask  # make the scale same as the mask image.
+
+    def Merge(self, black, white):
+        return (black * self._mask) + (white * (1.0 - self._mask))
+
+
+MaskType = Union[float, str, PIL.Image.Image, LatentMask]
+
+
+class ComboOf(LatentMask):
+    def __init__(
+        self,
+        masks: List[MaskType],
+        # white = 1.0 and black = 0.0 in the arguments of the callable below.
+        transformed_by: Callable[[List[Union[float, torch.Tensor]]], LatentMask],
+    ):
+        self._f = transformed_by
+        self._masks = [m if isinstance(m, LatentMask) else LatentMask(m) for m in masks]
+
+    def Initialize(
+        self,
+        size: Optional[Tuple[int, int]],
+        image_model: ImageModel,
+        target: SharedTarget,
+    ):
+        for m in self._masks:
+            m.Initialize(size, image_model, target)
+        self._mask = 1.0 - self._f([1.0 - m._mask for m in self._masks])
+
+
+def ScaledMask(mask: MaskType, scale: float = 1.0, offset: float = 0.0):
+    return ComboOf([mask], transformed_by=(lambda masks: (masks[0] * scale) + offset))
+
+
+#
 # -- Encoding is a class that defines how to encode a prompt --
 #
 class StandardEncoding:
@@ -661,7 +718,7 @@ class Initializer:
         image_model: ImageModel,
         generator: Generator,
         target: SharedTarget,
-        adjust: float,
+        vae_encoder_adjust: float,
     ):
         raise NotImplementedError()
 
@@ -722,7 +779,7 @@ class Randomly(Initializer):
         image_model: ImageModel,
         generator: Generator,
         target: SharedTarget,
-        adjust: float,
+        vae_encoder_adjust: float,
     ):
         if not size:
             raise ValueError("`size` is mandatory to initialize `Randomly`.")
@@ -788,7 +845,7 @@ class ByLatents(Initializer):
         image_model: ImageModel,
         generator: Generator,
         target: SharedTarget,
-        adjust: float,
+        vae_encoder_adjust: float,
     ):
         if size:
             Debug(0, "`size` is ignored when initializing `ByLatents`.")
@@ -836,13 +893,13 @@ class ByImage(Initializer):
         image_model: ImageModel,
         generator: Generator,
         target: SharedTarget,
-        adjust: float,
+        vae_encoder_adjust: float,
     ):
         image = self._image
         if size:
             Debug(1, f"Resize image from {image.size} to {size}.")
             image = image.resize(size)
-        latents = image_model.Encode(image, generator, target) * adjust
+        latents = image_model.Encode(image, generator, target) * vae_encoder_adjust
         self._initial_latents = latents
         self._noise = self.RandForShape(latents.shape, generator, target)
         return latents
@@ -894,13 +951,13 @@ class ByBothOf(Initializer):
         self,
         black: Initializer,
         white: Initializer,
-        in_mask: Union[int, str, PIL.Image.Image],
+        mask_by: MaskType,
     ):
-        mask = in_mask
-        if mask and isinstance(mask, str):
-            mask = OpenImage(mask)
         self._both = [black, white]
-        self._mask_image = mask
+        if isinstance(mask_by, LatentMask):
+            self._mask = mask_by
+        else:
+            self._mask = LatentMask(mask_by)
 
     def GetLatents(
         self,
@@ -908,18 +965,11 @@ class ByBothOf(Initializer):
         image_model: ImageModel,
         generator: Generator,
         target: SharedTarget,
-        adjust: float,
+        vae_encoder_adjust: float,
     ):
-        mask = self._mask_image
-        if isinstance(mask, PIL.Image.Image):
-            if size:
-                Debug(1, f"Resize mask image from {mask.size} to {size}.")
-                mask = mask.resize(size)
-            self._mask = image_model.PreprocessMask(mask, target)
-        else:
-            self._mask = 1.0 - mask  # make the scale same as the mask image.
+        self._mask.Initialize(size, image_model, target)
         return [
-            g.GetLatents(size, image_model, generator, target, adjust)
+            g.GetLatents(size, image_model, generator, target, vae_encoder_adjust)
             for g in self._both
         ]
 
@@ -928,7 +978,7 @@ class ByBothOf(Initializer):
             g.InitializeLatents(scheduler, l, timesteps)
             for g, l in zip(self._both, latents)
         ]
-        return self._ApplyMask(*latents)
+        return self._mask.Merge(*latents)
 
     def NextLatents(
         self,
@@ -950,10 +1000,7 @@ class ByBothOf(Initializer):
             )
             for g in self._both
         ]
-        return self._ApplyMask(*latents)
-
-    def _ApplyMask(self, black, white):
-        return (black * self._mask) + (white * (1.0 - self._mask))
+        return self._mask.Merge(*latents)
 
 
 #
@@ -1055,14 +1102,14 @@ class BackgroundLayer(BaseLayer):
         prompt_name: Optional[str] = None,
         negative_prompt_name: Optional[str] = None,
         cfg_scale: float = 7.5,
-        adjust: Optional[float] = None,
+        vae_encoder_adjust: Optional[float] = None,
     ):
         super().__init__(prompt_name, negative_prompt_name, cfg_scale)
         self._initializer = initialize
-        if not adjust:
-            self._adjust = 1.0
+        if not vae_encoder_adjust:
+            self._vae_encoder_adjust = 1.0
         else:
-            self._adjust = adjust
+            self._vae_encoder_adjust = vae_encoder_adjust
 
     def Initialize(
         self,
@@ -1076,7 +1123,7 @@ class BackgroundLayer(BaseLayer):
         super()._Initialize(prompts, target)
         scheduler.SetTimesteps(self._initializer.RequestedNumSteps(num_steps))
         latents = self._initializer.GetLatents(
-            size, image_model, scheduler.generator(), target, self._adjust
+            size, image_model, scheduler.generator(), target, self._vae_encoder_adjust
         )
         timesteps = self._initializer.GetTimesteps(scheduler, target)
         latents = self._initializer.InitializeLatents(scheduler, latents, timesteps)
@@ -1091,15 +1138,16 @@ class BackgroundLayer(BaseLayer):
 class Layer(BaseLayer):
     def __init__(
         self,
-        mask: Union[int, str, PIL.Image.Image],
+        mask_by: MaskType,
         prompt_name: Optional[str] = None,
         negative_prompt_name: Optional[str] = None,
         cfg_scale: float = 7.5,
     ):
         super().__init__(prompt_name, negative_prompt_name, cfg_scale)
-        if isinstance(mask, str):
-            mask = OpenImage(mask)
-        self._mask_image = mask
+        if isinstance(mask_by, LatentMask):
+            self._mask = mask_by
+        else:
+            self._mask = LatentMask(mask_by)
 
     def Initialize(
         self,
@@ -1109,18 +1157,11 @@ class Layer(BaseLayer):
         target: SharedTarget,
     ):
         super()._Initialize(prompts, target)
-        mask = self._mask_image
-        if isinstance(mask, PIL.Image.Image):
-            if size:
-                Debug(1, f"Resize mask image from {mask.size} to {size}.")
-                mask = mask.resize(size)
-            self._mask = image_model.PreprocessMask(mask, target)
-        else:
-            self._mask = 1.0 - mask  # make the scale same as the mask image.
+        self._mask.Initialize(size, image_model, target)
 
     def Merge(self, other, mine):
         # other = black, mine = white
-        return (other * self._mask) + (mine * (1.0 - self._mask))
+        return self._mask.Merge(other, mine)
 
 
 #
@@ -1208,7 +1249,7 @@ class LayeredDiffusionPipeline:
         cfg_scale: float = 7.5,
         layers: Optional[List[Layer]] = None,
         eta: float = 0.0,
-        adjust: Optional[float] = None,
+        vae_encoder_adjust: Optional[float] = None,
     ):
         if num_steps <= 0:
             raise ValueError(f"num_steps must be > 0. actual: {num_steps}")
@@ -1224,12 +1265,12 @@ class LayeredDiffusionPipeline:
         # Anything v3.0's VAE has a degradation problem in its encoder.
         # Multiplying the adjustment factor of 1.25 to the encoder output mitigates
         # the problem to a lower level.
-        if not adjust:
+        if not vae_encoder_adjust:
             if self._dataset == "Linaqruf/anything-v3.0":
-                adjust = 1.25
+                vae_encoder_adjust = 1.25
 
         bglayer = BackgroundLayer(
-            initialize, prompt_name, negative_prompt_name, cfg_scale, adjust
+            initialize, prompt_name, negative_prompt_name, cfg_scale, vae_encoder_adjust
         )
         all_layers = [bglayer] + layers
         prompts = Prompts(prompts, self.text_model, default_encoding)
