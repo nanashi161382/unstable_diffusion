@@ -9,6 +9,7 @@ from diffusers import (
 from IPython.display import display
 import numpy as np
 import PIL
+import random
 import re
 import torch
 from torch import autocast
@@ -1233,8 +1234,14 @@ class LayeredDiffusionPipeline:
         self.text_model = TextModel(pipe.tokenizer, pipe.text_encoder, pipe.device)
         self.image_model = ImageModel(pipe.vae, pipe.vae_scale_factor)
 
-    def ResetGenerator(self, rand_seed: Optional[int] = None):
+    def _ResetGenerator(self, rand_seed: Optional[int] = None):
+        if not rand_seed:
+            rand_seed = random.SystemRandom().randint(1, 4294967295)
+        self._rand_seed = rand_seed
         self.scheduler.ResetGenerator(self.text_model.target, rand_seed)
+
+    def GetRandSeed(self):
+        return self._rand_seed
 
     @torch.no_grad()
     def __call__(
@@ -1248,9 +1255,12 @@ class LayeredDiffusionPipeline:
         negative_prompt_name: Optional[str] = None,
         cfg_scale: float = 7.5,
         layers: Optional[List[Layer]] = None,
+        rand_seed: Optional[int] = None,
         eta: float = 0.0,
         vae_encoder_adjust: Optional[float] = None,
     ):
+        self._ResetGenerator(rand_seed)
+
         if num_steps <= 0:
             raise ValueError(f"num_steps must be > 0. actual: {num_steps}")
         if not default_encoding:
