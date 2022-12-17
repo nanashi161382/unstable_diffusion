@@ -732,7 +732,7 @@ class Initializer:
         timesteps,
         current_step: int,
         remaining: float,
-        before_merge: bool,
+        force_overwrite: bool,
     ):
         # do nothing
         return latents, False
@@ -854,7 +854,6 @@ class ByImage(Initializer):
         self,
         image: Union[str, PIL.Image.Image],
         strength: float = 0.8,
-        bg_strength: float = 1.0,
     ):
         """
         Args:
@@ -863,19 +862,11 @@ class ByImage(Initializer):
             strength (`float`, *optional*, defaults to 0.8):
                 Conceptually, indicates how much to transform the reference `image`. Must be between 0 and 1.
                 `image` will be used as a starting point, adding more noise to it the larger the `strength`. The number of denoising steps depends on the amount of noise initially added. When `strength` is 1, added noise will be maximum and the denoising process will run for the full number of iterations specified in `num_inference_steps`. A value of 1, therefore, essentially ignores `image`.
-            bg_strength (`float`, *optional, defaults to 1.0):
-                Conceptually, indicates how much the background image is transformed. Must be between 0 and 1.
-                0 means the background image is the same as the initial image.
-                1 means the initial image is completely ignored in the background image.
-                If bg_strength > strength, the parameter is virtually ignored.
         """
         self._image = image
         if (strength <= 0.0) or (strength > 1.0):
             raise ValueError(f"strength must be between 0 and 1. given {strength}.")
         self._strength = strength
-        if (bg_strength < 0.0) or (bg_strength > 1.0):
-            raise ValueError(f"strength must be between 0 and 1. given {bg_strength}.")
-        self._bg_strength = bg_strength
 
     def GetStrength(self):
         return self._strength
@@ -913,21 +904,10 @@ class ByImage(Initializer):
         timesteps,
         current_step: int,
         remaining: float,
-        before_merge: bool,
+        force_overwrite: bool,
     ):
-        if before_merge:  # overwrite only the background layer
-            if remaining >= self._strength:
-                # skip overwriting because latents will be overwritten later again.
-                Debug(3, f"skip overwriting for background")
-                return latents, False
-            strength = self._bg_strength
-        else:  # overwrite all layers
-            strength = self._strength
-        Debug(
-            3,
-            f"remaining {remaining:.2f}, strength {strength:.2f}, before_merge {before_merge}",
-        )
-        if remaining < strength:
+        Debug(3, f"remaining {remaining:.2f}, strength {self._strength:.2f}")
+        if (not force_overwrite) and (remaining < self._strength):
             # do nothing if no need to keep the initial latents
             return latents, False
 
@@ -944,14 +924,6 @@ class ByImage(Initializer):
             ),
             True,
         )
-
-
-def ForImg2Img(image: Union[str, PIL.Image.Image], strength: float = 0.8):
-    return ByImage(image, strength, bg_strength=1.0)
-
-
-def ForInpaint(image: Union[str, PIL.Image.Image], strength: float = 0.8):
-    return ByImage(image, strength, bg_strength=0.0)
 
 
 class ByBothOf(Initializer):
@@ -998,12 +970,17 @@ class ByBothOf(Initializer):
         timesteps,
         current_step: int,
         remaining: float,
-        before_merge: bool,
+        force_overwrite: bool,
     ):
         new_latents, changed = zip(
             *[
                 g.OverwriteLatents(
-                    scheduler, latents, timesteps, current_step, remaining, before_merge
+                    scheduler,
+                    latents,
+                    timesteps,
+                    current_step,
+                    remaining,
+                    force_overwrite,
                 )
                 for g in self._both
             ]
@@ -1111,12 +1088,10 @@ class BackgroundLayer(BaseLayer):
     def __init__(
         self,
         initialize: Initializer,
-        prompt_name: Optional[str] = None,
-        negative_prompt_name: Optional[str] = None,
-        cfg_scale: float = 7.5,
         vae_encoder_adjust: Optional[float] = None,
     ):
-        super().__init__(prompt_name, negative_prompt_name, cfg_scale)
+        # The default image generation = no prompts, cfg_scale = 1.0
+        super().__init__(cfg_scale=1.0)
         self._initializer = initialize
         if not vae_encoder_adjust:
             self._vae_encoder_adjust = 1.0
@@ -1165,27 +1140,31 @@ class BackgroundLayer(BaseLayer):
         latents,
         timesteps,
         current_step: int,
-        before_merge: bool,
+        force_overwrite: bool = False,
     ):
         remaining = float(len(timesteps) - current_step - 1) / self._total_num_steps
         return self._initializer.OverwriteLatents(
-            scheduler, latents, timesteps, current_step, remaining, before_merge
+            scheduler, latents, timesteps, current_step, remaining, force_overwrite
         )[0]
 
 
 class Layer(BaseLayer):
     def __init__(
         self,
-        mask_by: MaskType,
         prompt_name: Optional[str] = None,
         negative_prompt_name: Optional[str] = None,
         cfg_scale: float = 7.5,
+        mask_by: MaskType = 1.0,
+        skip_until: float = 0.0,
     ):
         super().__init__(prompt_name, negative_prompt_name, cfg_scale)
         if isinstance(mask_by, LatentMask):
             self._mask = mask_by
         else:
             self._mask = LatentMask(mask_by)
+        if (skip_until < 0.0) or (1.0 < skip_until):
+            raise ValueError(f"skip_until must be between 0 and 1. actual {skip_until}")
+        self._skip_until = skip_until
 
     def Initialize(
         self,
@@ -1197,7 +1176,9 @@ class Layer(BaseLayer):
         super()._Initialize(prompts, target)
         self._mask.Initialize(size, image_model, target)
 
-    def Merge(self, other, mine):
+    def Merge(self, other, mine, progress):
+        if progress <= self._skip_until:
+            return other
         # other = black, mine = white
         return self._mask.Merge(other, mine)
 
@@ -1286,12 +1267,9 @@ class LayeredDiffusionPipeline:
         num_steps: int,
         prompts: Dict[str, PromptType],
         initialize: Initializer,
+        layers: List[Layer],
         size: Optional[Tuple[int, int]] = None,
         default_encoding: Optional[StandardEncoding] = None,
-        prompt_name: Optional[str] = None,
-        negative_prompt_name: Optional[str] = None,
-        cfg_scale: float = 7.5,
-        layers: Optional[List[Layer]] = None,
         rand_seed: Optional[int] = None,
         eta: float = 0.0,
         vae_encoder_adjust: Optional[float] = None,
@@ -1302,12 +1280,8 @@ class LayeredDiffusionPipeline:
             raise ValueError(f"num_steps must be > 0. actual: {num_steps}")
         if not default_encoding:
             default_encoding = ShiftEncoding()
-        if not prompt_name:
-            prompt_name = ""
-        if not negative_prompt_name:
-            negative_prompt_name = ""
         if not layers:
-            layers = []
+            raise ValueError("layers should contain at least 1 layer.")
 
         # Anything v3.0's VAE has a degradation problem in its encoder.
         # Multiplying the adjustment factor of 1.25 to the encoder output mitigates
@@ -1316,9 +1290,7 @@ class LayeredDiffusionPipeline:
             if self._dataset == "Linaqruf/anything-v3.0":
                 vae_encoder_adjust = 1.25
 
-        bglayer = BackgroundLayer(
-            initialize, prompt_name, negative_prompt_name, cfg_scale, vae_encoder_adjust
-        )
+        bglayer = BackgroundLayer(initialize, vae_encoder_adjust)
         all_layers = [bglayer] + layers
         prompts = Prompts(prompts, self.text_model, default_encoding)
 
@@ -1352,16 +1324,14 @@ class LayeredDiffusionPipeline:
                     residuals_for_layers, ts, latents
                 )
                 next_latents = latents_for_layers[0]
-                next_latents = bglayer.OverwriteLatents(  # for bg_strength
-                    self.scheduler, next_latents, timesteps, i, before_merge=True
+                next_latents = bglayer.OverwriteLatents(  # unconditionally
+                    self.scheduler, next_latents, timesteps, i, force_overwrite=True
                 )
                 if layers:
-                    for layer, latents in zip(
-                        reversed(layers), reversed(latents_for_layers[1:])
-                    ):
-                        next_latents = layer.Merge(next_latents, latents)
-                next_latents = bglayer.OverwriteLatents(  # for strength
-                    self.scheduler, next_latents, timesteps, i, before_merge=False
+                    for layer, latents in zip(layers, latents_for_layers[1:]):
+                        next_latents = layer.Merge(next_latents, latents, progress)
+                next_latents = bglayer.OverwriteLatents(  # conditioned by strength
+                    self.scheduler, next_latents, timesteps, i
                 )
                 latents = next_latents
 
