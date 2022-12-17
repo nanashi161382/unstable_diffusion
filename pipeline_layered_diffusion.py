@@ -946,6 +946,14 @@ class ByImage(Initializer):
         )
 
 
+def ForImg2Img(image: Union[str, PIL.Image.Image], strength: float = 0.8):
+    return ByImage(image, strength, bg_strength=1.0)
+
+
+def ForInpaint(image: Union[str, PIL.Image.Image], strength: float = 0.8):
+    return ByImage(image, strength, bg_strength=0.0)
+
+
 class ByBothOf(Initializer):
     def __init__(
         self,
@@ -1309,11 +1317,7 @@ class LayeredDiffusionPipeline:
                 vae_encoder_adjust = 1.25
 
         bglayer = BackgroundLayer(
-            initialize,
-            prompt_name,
-            negative_prompt_name,
-            cfg_scale,
-            vae_encoder_adjust,
+            initialize, prompt_name, negative_prompt_name, cfg_scale, vae_encoder_adjust
         )
         all_layers = [bglayer] + layers
         prompts = Prompts(prompts, self.text_model, default_encoding)
