@@ -1267,7 +1267,7 @@ class LayeredDiffusionPipeline:
         num_steps: int,
         prompts: Dict[str, PromptType],
         initialize: Initializer,
-        layers: List[Layer],
+        layers: Union[Layer, List[Layer]],
         size: Optional[Tuple[int, int]] = None,
         default_encoding: Optional[StandardEncoding] = None,
         rand_seed: Optional[int] = None,
@@ -1282,6 +1282,8 @@ class LayeredDiffusionPipeline:
             default_encoding = ShiftEncoding()
         if not layers:
             raise ValueError("layers should contain at least 1 layer.")
+        elif not isinstance(layers, list):
+            layers = [layers]
 
         # Anything v3.0's VAE has a degradation problem in its encoder.
         # Multiplying the adjustment factor of 1.25 to the encoder output mitigates
