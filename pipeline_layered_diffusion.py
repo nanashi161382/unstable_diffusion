@@ -53,7 +53,7 @@ def OpenImage(filename):
     if filename:
         image = PIL.Image.open(filename).convert("RGB")
         if ShouldDebug(1):
-            print(filename)
+            print(f"{image.size} - {filename}")
             display(image.resize((128, 128), resample=PIL.Image.LANCZOS))
         return image
     else:
@@ -224,10 +224,7 @@ class ImageModel:
 #
 class LatentMask:
     def __init__(self, mask_by: Union[float, str, PIL.Image.Image]):
-        if isinstance(mask_by, str):
-            self._mask_by = OpenImage(mask_by)
-        else:
-            self._mask_by = mask_by
+        self._mask_by = mask_by
 
     def Initialize(
         self,
@@ -236,8 +233,10 @@ class LatentMask:
         target: SharedTarget,
     ):
         mask = self._mask_by
+        if isinstance(mask, str):
+            mask = OpenImage(mask)
         if isinstance(mask, PIL.Image.Image):
-            if size:
+            if size and (mask.size != size):
                 Debug(1, f"Resize mask image from {mask.size} to {size}.")
                 mask = mask.resize(size)
             self._mask = image_model.PreprocessMask(mask, target)
@@ -710,8 +709,8 @@ class Scheduler:
 # -- Initializer --
 #
 class Initializer:
-    def RequestedNumSteps(self, num_steps: int):
-        return num_steps
+    def GetStrength(self):
+        return 1.0
 
     def GetLatents(
         self,
@@ -723,26 +722,20 @@ class Initializer:
     ):
         raise NotImplementedError()
 
-    def GetTimesteps(self, scheduler: Scheduler, target: SharedTarget):
-        # dtype should be `int`
-        return scheduler.Get().timesteps.to(device=target.device())
-
     def InitializeLatents(self, scheduler: Scheduler, latents, timesteps):
         raise NotImplementedError()
 
-    def GetOffset(self):
-        return 0.0
-
-    def NextLatents(
+    def OverwriteLatents(
         self,
         scheduler: Scheduler,
         latents,
         timesteps,
         current_step: int,
-        offset: float = 0.0,
+        remaining: float,
+        before_merge: bool,
     ):
         # do nothing
-        return latents
+        return latents, False
 
     @classmethod
     def RandForShape(cls, shape, generator: Generator, target: SharedTarget):
@@ -861,7 +854,7 @@ class ByImage(Initializer):
         self,
         image: Union[str, PIL.Image.Image],
         strength: float = 0.8,
-        keep_until: float = 0.0,
+        bg_strength: float = 1.0,
     ):
         """
         Args:
@@ -870,23 +863,22 @@ class ByImage(Initializer):
             strength (`float`, *optional*, defaults to 0.8):
                 Conceptually, indicates how much to transform the reference `image`. Must be between 0 and 1.
                 `image` will be used as a starting point, adding more noise to it the larger the `strength`. The number of denoising steps depends on the amount of noise initially added. When `strength` is 1, added noise will be maximum and the denoising process will run for the full number of iterations specified in `num_inference_steps`. A value of 1, therefore, essentially ignores `image`.
-            keep_until (`float`, *optional*, defaults to 0.0):
-                0 if we use the image only initially.
-                1 if we keep the image in the final output
-                Choose between 0 and 1 to keep the image until the middle of the generation.
+            bg_strength (`float`, *optional, defaults to 1.0):
+                Conceptually, indicates how much the background image is transformed. Must be between 0 and 1.
+                0 means the background image is the same as the initial image.
+                1 means the initial image is completely ignored in the background image.
+                If bg_strength > strength, the parameter is virtually ignored.
         """
-        if isinstance(image, str):
-            image = OpenImage(image)
         self._image = image
         if (strength <= 0.0) or (strength > 1.0):
             raise ValueError(f"strength must be between 0 and 1. given {strength}.")
         self._strength = strength
-        if (keep_until < 0.0) or (keep_until > 1.0):
-            raise ValueError(f"strength must be between 0 and 1. given {keep_until}.")
-        self._keep_until = keep_until
+        if (bg_strength < 0.0) or (bg_strength > 1.0):
+            raise ValueError(f"strength must be between 0 and 1. given {bg_strength}.")
+        self._bg_strength = bg_strength
 
-    def RequestedNumSteps(self, num_steps: int):
-        return int(-(-int(num_steps) // self._strength))  # round up
+    def GetStrength(self):
+        return self._strength
 
     def GetLatents(
         self,
@@ -897,18 +889,15 @@ class ByImage(Initializer):
         vae_encoder_adjust: float,
     ):
         image = self._image
-        if size:
+        if isinstance(image, str):
+            image = OpenImage(image)
+        if size and (image.size != size):
             Debug(1, f"Resize image from {image.size} to {size}.")
-            image = image.resize(size)
+            image = image.resize(size, resample=PIL.Image.LANCZOS)
         latents = image_model.Encode(image, generator, target) * vae_encoder_adjust
         self._initial_latents = latents
         self._noise = self.RandForShape(latents.shape, generator, target)
         return latents
-
-    def GetTimesteps(self, scheduler: Scheduler, target: SharedTarget):
-        timesteps = super().GetTimesteps(scheduler, target)
-        actual_num_steps = int(len(timesteps) * self._strength)
-        return timesteps[-actual_num_steps:]
 
     def InitializeLatents(self, scheduler: Scheduler, latents, timesteps):
         initial_timestep = timesteps[:1]
@@ -917,33 +906,43 @@ class ByImage(Initializer):
         )
         return latents
 
-    def GetOffset(self):
-        return 1.0 - self._strength
-
-    def NextLatents(
+    def OverwriteLatents(
         self,
         scheduler: Scheduler,
         latents,
         timesteps,
         current_step: int,
-        offset: float,
+        remaining: float,
+        before_merge: bool,
     ):
-        # re-compute keep_until under the condition of the given offset.
-        keep_until = offset + (1.0 - offset) * self._keep_until
-        progress = float(current_step + 1) / len(timesteps)
-        Debug(3, f"progress {progress:.2f}, keep_until {keep_until:.2f}")
-        if progress > keep_until:
-            # do nothing
-            return latents
-        # Return the initial latents if this is the last step.
-        if progress >= 1.0:
+        if before_merge:  # overwrite only the background layer
+            if remaining >= self._strength:
+                # skip overwriting because latents will be overwritten later again.
+                Debug(3, f"skip overwriting for background")
+                return latents, False
+            strength = self._bg_strength
+        else:  # overwrite all layers
+            strength = self._strength
+        Debug(
+            3,
+            f"remaining {remaining:.2f}, strength {strength:.2f}, before_merge {before_merge}",
+        )
+        if remaining < strength:
+            # do nothing if no need to keep the initial latents
+            return latents, False
+
+        # Return the initial latents without noise if this is the last step.
+        if remaining <= 0.0:
             Debug(3, "Last step with keeping initial image.")
-            return self._initial_latents
+            return self._initial_latents, True
         # Otherwise add noise to the initial latents.
-        Debug(3, "Add noise for step {current_step}.")
+        Debug(3, f"Add noise for step {current_step}.")
         next_timestep = timesteps[current_step + 1 : current_step + 2]
-        return scheduler.Get().add_noise(
-            self._initial_latents, self._noise, next_timestep
+        return (
+            scheduler.Get().add_noise(
+                self._initial_latents, self._noise, next_timestep
+            ),
+            True,
         )
 
 
@@ -959,6 +958,9 @@ class ByBothOf(Initializer):
             self._mask = mask_by
         else:
             self._mask = LatentMask(mask_by)
+
+    def GetStrength(self):
+        return max(g.GetStrength() for g in self._both)
 
     def GetLatents(
         self,
@@ -981,27 +983,28 @@ class ByBothOf(Initializer):
         ]
         return self._mask.Merge(*latents)
 
-    def NextLatents(
+    def OverwriteLatents(
         self,
         scheduler: Scheduler,
         latents,
         timesteps,
         current_step: int,
-        offset: float,
+        remaining: float,
+        before_merge: bool,
     ):
-        # TODO: take care of offset properly
-        latents = [
-            g.NextLatents(
-                scheduler,
-                latents,
-                timesteps,
-                current_step,
-                # re-compute offset under the condition of the given offset.
-                offset + (1.0 - offset) * g.GetOffset(),
-            )
-            for g in self._both
-        ]
-        return self._mask.Merge(*latents)
+        new_latents, changed = zip(
+            *[
+                g.OverwriteLatents(
+                    scheduler, latents, timesteps, current_step, remaining, before_merge
+                )
+                for g in self._both
+            ]
+        )
+        if any(changed):
+            return self._mask.Merge(*new_latents), True
+        else:
+            # Return the original latents if nothing chnaged.
+            return latents, False
 
 
 #
@@ -1122,18 +1125,44 @@ class BackgroundLayer(BaseLayer):
         target: SharedTarget,
     ):
         super()._Initialize(prompts, target)
-        scheduler.SetTimesteps(self._initializer.RequestedNumSteps(num_steps))
+        max_strength = self._initializer.GetStrength()
+        # compute num_steps_to_request to match the effective number of iterations with num_steps.
+        num_steps_to_request = int(-(-int(num_steps) // max_strength))  # round up
+        scheduler.SetTimesteps(num_steps_to_request)
         latents = self._initializer.GetLatents(
             size, image_model, scheduler.generator(), target, self._vae_encoder_adjust
         )
-        timesteps = self._initializer.GetTimesteps(scheduler, target)
+        timesteps, total_num_steps = self.GetTimesteps(scheduler, max_strength, target)
+        Debug(
+            3, f"total_num_steps: {total_num_steps}, actual num_steps: {len(timesteps)}"
+        )
+        self._total_num_steps = total_num_steps
         latents = self._initializer.InitializeLatents(scheduler, latents, timesteps)
         return latents, timesteps
 
-    def NextLatents(self, scheduler: Scheduler, latents, timesteps, current_step: int):
-        return self._initializer.NextLatents(
-            scheduler, latents, timesteps, current_step, offset=0.0
-        )
+    def GetTimesteps(self, scheduler: Scheduler, strength: float, target: SharedTarget):
+        # dtype should be `int`
+        timesteps = scheduler.Get().timesteps.to(device=target.device())
+        total_num_steps = len(timesteps)
+        if strength > 1.0:
+            raise ValueError(f"invalid strength: {strength}")
+        if strength == 1.0:
+            return timesteps, total_num_steps
+        actual_num_steps = int(total_num_steps * strength)
+        return timesteps[-actual_num_steps:], total_num_steps
+
+    def OverwriteLatents(
+        self,
+        scheduler: Scheduler,
+        latents,
+        timesteps,
+        current_step: int,
+        before_merge: bool,
+    ):
+        remaining = float(len(timesteps) - current_step - 1) / self._total_num_steps
+        return self._initializer.OverwriteLatents(
+            scheduler, latents, timesteps, current_step, remaining, before_merge
+        )[0]
 
 
 class Layer(BaseLayer):
@@ -1280,7 +1309,11 @@ class LayeredDiffusionPipeline:
                 vae_encoder_adjust = 1.25
 
         bglayer = BackgroundLayer(
-            initialize, prompt_name, negative_prompt_name, cfg_scale, vae_encoder_adjust
+            initialize,
+            prompt_name,
+            negative_prompt_name,
+            cfg_scale,
+            vae_encoder_adjust,
         )
         all_layers = [bglayer] + layers
         prompts = Prompts(prompts, self.text_model, default_encoding)
@@ -1314,14 +1347,18 @@ class LayeredDiffusionPipeline:
                 latents_for_layers = self.scheduler.Step(
                     residuals_for_layers, ts, latents
                 )
-                next_latents = bglayer.NextLatents(
-                    self.scheduler, latents_for_layers[0], timesteps, i
+                next_latents = latents_for_layers[0]
+                next_latents = bglayer.OverwriteLatents(  # for bg_strength
+                    self.scheduler, next_latents, timesteps, i, before_merge=True
                 )
                 if layers:
                     for layer, latents in zip(
                         reversed(layers), reversed(latents_for_layers[1:])
                     ):
                         next_latents = layer.Merge(next_latents, latents)
+                next_latents = bglayer.OverwriteLatents(  # for strength
+                    self.scheduler, next_latents, timesteps, i, before_merge=False
+                )
                 latents = next_latents
 
             return self.image_model.Decode(latents)
