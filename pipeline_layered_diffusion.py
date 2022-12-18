@@ -1005,6 +1005,9 @@ class Prompts:
         self._default_encoding = default_encoding
         self._prompts = []
 
+    def __len__(self):
+        return len(self._prompts)
+
     def Add(self, prompt: PromptType) -> int:
         Debug(3, "Add prompt.")
         index = len(self._prompts)
@@ -1014,7 +1017,7 @@ class Prompts:
         return index
 
     def PredictResiduals(self, scheduler, unet, latents, timestep, progress: float):
-        model_input = torch.cat([latents] * len(self._prompts))
+        model_input = torch.cat(latents)
         model_input = scheduler.Get().scale_model_input(model_input, timestep)
         text_embeddings = torch.cat([te.Get(progress) for te in self._prompts])
         residuals = unet(
@@ -1045,11 +1048,24 @@ class BaseLayer:
         self._cfg_scale = cfg_scale
         self._do_cfg = cfg_scale > 1.0
 
-    def _Initialize(self, prompts: Prompts):
+    def _Initialize(
+        self, prompts: Prompts, exclude: Optional[LatentMask], exclude_weight: float
+    ):
         self._prompts = prompts
         self._indices = [prompts.Add(self._prompt)]
         if self._do_cfg:
             self._indices.append(prompts.Add(self._negative_prompt))
+        self._exclude = exclude
+        self._exclude_weight = exclude_weight
+
+    def FillLatents(self, latents_for_prompts, latents):
+        if self._exclude and (self._exclude_weight > 0.0):
+            # black = latents, white = dwarfed latents
+            latents = self._exclude.Merge(
+                latents, latents * (1.0 - self._exclude_weight)
+            )
+        for i in self._indices:
+            latents_for_prompts[i] = latents
 
     def GetResidual(self, residuals):
         residual_cond = residuals[self._indices[0]]
@@ -1083,7 +1099,7 @@ class BackgroundLayer(BaseLayer):
         prompts: Prompts,
         target: SharedTarget,
     ):
-        super()._Initialize(prompts)
+        super()._Initialize(prompts, None, 0.0)
         max_strength = self._initializer.GetStrength()
         # compute num_steps_to_request to match the effective number of iterations with num_steps.
         num_steps_to_request = int(-(-int(num_steps) // max_strength))  # round up
@@ -1131,6 +1147,8 @@ class Layer(BaseLayer):
         negative_prompt: Optional[PromptType] = None,
         cfg_scale: float = 7.5,
         mask_by: MaskType = 1.0,
+        exclude_by: Optional[MaskType] = None,
+        exclude_weight: float = 1.0,  # 0.0 means no exclude. 1.0 means complete exclude.
         skip_until: float = 0.0,
         disabled: bool = False,
     ):
@@ -1139,6 +1157,17 @@ class Layer(BaseLayer):
             self._mask = mask_by
         else:
             self._mask = LatentMask(mask_by)
+        if not exclude_by:
+            self._exclude = None
+        elif isinstance(exclude_by, LatentMask):
+            self._exclude = exclude_by
+        else:
+            self._exclude = LatentMask(exclude_by)
+        if (exclude_weight < 0.0) or (1.0 < exclude_weight):
+            raise ValueError(
+                f"exclude_weight must be between 0 and 1. actual {exclude_weight}"
+            )
+        self._exclude_weight = exclude_weight
         if (skip_until < 0.0) or (1.0 < skip_until):
             raise ValueError(f"skip_until must be between 0 and 1. actual {skip_until}")
         self._skip_until = skip_until
@@ -1151,8 +1180,10 @@ class Layer(BaseLayer):
         prompts: Prompts,
         target: SharedTarget,
     ):
-        super()._Initialize(prompts)
         self._mask.Initialize(size, image_model, target)
+        if self._exclude:
+            self._exclude.Initialize(size, image_model, target)
+        super()._Initialize(prompts, self._exclude, self._exclude_weight)
 
     def Merge(self, other, mine, progress):
         if progress <= self._skip_until:
@@ -1289,8 +1320,18 @@ class LayeredDiffusionPipeline:
             for i, ts in enumerate(self.pipe.progress_bar(timesteps)):
                 progress = float(i + 1) / len(timesteps)
                 Debug(3, f"progress: {progress} <= {i + 1} / {len(timesteps)}")
+
+                latents_for_prompts = [None] * len(prompts)
+                for layer in all_layers:
+                    layer.FillLatents(latents_for_prompts, latents)
+                for k, l in enumerate(latents_for_prompts):
+                    if l == None:
+                        raise ValueError(
+                            f"unexpected error: missing latents for index {k}"
+                        )
+
                 residuals_for_prompts = prompts.PredictResiduals(
-                    self.scheduler, self.unet, latents, ts, progress
+                    self.scheduler, self.unet, latents_for_prompts, ts, progress
                 )
                 residuals_for_layers = [
                     l.GetResidual(residuals_for_prompts) for l in all_layers
