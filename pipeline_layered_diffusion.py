@@ -998,43 +998,20 @@ class ByBothOf(Initializer):
 class Prompts:
     def __init__(
         self,
-        prompt_dict: Dict[str, PromptType],
         text_model: TextModel,
         default_encoding: StandardEncoding,
     ):
-        if not prompt_dict:
-            raise ValueError("`prompt_dict` must not be empty.")
-        self._prompt_dict = prompt_dict
         self._text_model = text_model
         self._default_encoding = default_encoding
-        self._key_index = {}
         self._prompts = []
 
-    def Check(self, key: str):
-        if key in self._key_index:
-            # Already checked
-            return
-        elif key in self._prompt_dict:
-            Debug(3, f"Checked prompt: {key}")
-            self._key_index[key] = len(self._prompts)
-            self._prompts.append(
-                TextEmbeddings.Create(
-                    self._prompt_dict[key], self._text_model, self._default_encoding
-                )
-            )
-            return
-        elif key == "":
-            Debug(3, f"Checked null prompt")
-            self._key_index[key] = len(self._prompts)
-            self._prompts.append(
-                TextEmbeddings.Create("", self._text_model, self._default_encoding)
-            )
-            return
-        else:
-            raise ValueError(f"Prompt key is not found: {key}")
-
-    def GetFromList(self, key: str, lst: List[Any]):
-        return lst[self._key_index[key]]
+    def Add(self, prompt: PromptType) -> int:
+        Debug(3, "Add prompt.")
+        index = len(self._prompts)
+        self._prompts.append(
+            TextEmbeddings.Create(prompt, self._text_model, self._default_encoding)
+        )
+        return index
 
     def PredictResiduals(self, scheduler, unet, latents, timestep, progress: float):
         model_input = torch.cat([latents] * len(self._prompts))
@@ -1052,34 +1029,33 @@ class Prompts:
 class BaseLayer:
     def __init__(
         self,
-        prompt_name: Optional[str] = None,
-        negative_prompt_name: Optional[str] = None,
-        cfg_scale: float = 7.5,
+        prompt: Optional[PromptType] = None,
+        negative_prompt: Optional[PromptType] = None,
+        cfg_scale: float = 1.0,
     ):
-        if not prompt_name:
-            prompt_name = ""
-        self._prompt_name = prompt_name
-        if not negative_prompt_name:
-            negative_prompt_name = ""
-        self._negative_prompt_name = negative_prompt_name
+        # The default image generation = no prompts, no cfg
+        if not prompt:
+            prompt = ""
+        self._prompt = prompt
+        if not negative_prompt:
+            negative_prompt = ""
+        self._negative_prompt = negative_prompt
         if cfg_scale < 1.0:
             raise ValueError(f"cfg_scale must be 1.0 or bigger: {cfg_scale}")
         self._cfg_scale = cfg_scale
         self._do_cfg = cfg_scale > 1.0
 
-    def _Initialize(self, prompts: Prompts, target: SharedTarget):
+    def _Initialize(self, prompts: Prompts):
         self._prompts = prompts
-        prompts.Check(self._prompt_name)
+        self._indices = [prompts.Add(self._prompt)]
         if self._do_cfg:
-            prompts.Check(self._negative_prompt_name)
+            self._indices.append(prompts.Add(self._negative_prompt))
 
     def GetResidual(self, residuals):
-        residual_cond = self._prompts.GetFromList(self._prompt_name, residuals)
+        residual_cond = residuals[self._indices[0]]
         if not self._do_cfg:
             return residual_cond
-        residual_uncond = self._prompts.GetFromList(
-            self._negative_prompt_name, residuals
-        )
+        residual_uncond = residuals[self._indices[1]]
         residual = residual_uncond + self._cfg_scale * (residual_cond - residual_uncond)
         return residual
 
@@ -1090,8 +1066,8 @@ class BackgroundLayer(BaseLayer):
         initialize: Initializer,
         vae_encoder_adjust: Optional[float] = None,
     ):
-        # The default image generation = no prompts, cfg_scale = 1.0
-        super().__init__(cfg_scale=1.0)
+        # The default image generation = no prompts, no cfg
+        super().__init__()
         self._initializer = initialize
         if not vae_encoder_adjust:
             self._vae_encoder_adjust = 1.0
@@ -1107,7 +1083,7 @@ class BackgroundLayer(BaseLayer):
         prompts: Prompts,
         target: SharedTarget,
     ):
-        super()._Initialize(prompts, target)
+        super()._Initialize(prompts)
         max_strength = self._initializer.GetStrength()
         # compute num_steps_to_request to match the effective number of iterations with num_steps.
         num_steps_to_request = int(-(-int(num_steps) // max_strength))  # round up
@@ -1151,13 +1127,14 @@ class BackgroundLayer(BaseLayer):
 class Layer(BaseLayer):
     def __init__(
         self,
-        prompt_name: Optional[str] = None,
-        negative_prompt_name: Optional[str] = None,
+        prompt: Optional[PromptType] = None,
+        negative_prompt: Optional[PromptType] = None,
         cfg_scale: float = 7.5,
         mask_by: MaskType = 1.0,
         skip_until: float = 0.0,
+        disabled: bool = False,
     ):
-        super().__init__(prompt_name, negative_prompt_name, cfg_scale)
+        super().__init__(prompt, negative_prompt, cfg_scale)
         if isinstance(mask_by, LatentMask):
             self._mask = mask_by
         else:
@@ -1165,6 +1142,7 @@ class Layer(BaseLayer):
         if (skip_until < 0.0) or (1.0 < skip_until):
             raise ValueError(f"skip_until must be between 0 and 1. actual {skip_until}")
         self._skip_until = skip_until
+        self.disabled = disabled
 
     def Initialize(
         self,
@@ -1173,7 +1151,7 @@ class Layer(BaseLayer):
         prompts: Prompts,
         target: SharedTarget,
     ):
-        super()._Initialize(prompts, target)
+        super()._Initialize(prompts)
         self._mask.Initialize(size, image_model, target)
 
     def Merge(self, other, mine, progress):
@@ -1265,7 +1243,6 @@ class LayeredDiffusionPipeline:
     def __call__(
         self,
         num_steps: int,
-        prompts: Dict[str, PromptType],
         initialize: Initializer,
         layers: Union[Layer, List[Layer]],
         size: Optional[Tuple[int, int]] = None,
@@ -1284,6 +1261,9 @@ class LayeredDiffusionPipeline:
             raise ValueError("layers should contain at least 1 layer.")
         elif not isinstance(layers, list):
             layers = [layers]
+        layers = [l for l in layers if not l.disabled]
+        if not layers:
+            raise ValueError("layers should contain at least 1 enabled layer.")
 
         # Anything v3.0's VAE has a degradation problem in its encoder.
         # Multiplying the adjustment factor of 1.25 to the encoder output mitigates
@@ -1294,7 +1274,7 @@ class LayeredDiffusionPipeline:
 
         bglayer = BackgroundLayer(initialize, vae_encoder_adjust)
         all_layers = [bglayer] + layers
-        prompts = Prompts(prompts, self.text_model, default_encoding)
+        prompts = Prompts(self.text_model, default_encoding)
 
         target = self.text_model.target
         with autocast(target.device_type()):
