@@ -24,6 +24,7 @@ from typing import Any, Optional, List, Union, Callable, Tuple, Dict
 #   1: Info  <-  Default
 #   2: Temporary
 #   3: Debug
+#   4: Debug in loop
 #   5: Trace
 #
 # Should raise an exception for Error.
@@ -1068,6 +1069,9 @@ class BaseLayer:
         self._cfg_scale = cfg_scale
         self._do_cfg = cfg_scale > 1.0
 
+    def IsDistinct(self):
+        return False
+
     def _Initialize(self, prompts: Prompts):
         self._prompts = prompts
         self._indices = [prompts.Add(self._prompt)]
@@ -1096,12 +1100,6 @@ class BackgroundLayer(BaseLayer):
             self._vae_encoder_adjust = 1.0
         else:
             self._vae_encoder_adjust = vae_encoder_adjust
-
-    def IsAdditional(self):
-        return False
-
-    def GetLatents(self, latents, core_latents):
-        return latents, self._indices
 
     def Initialize(
         self,
@@ -1160,7 +1158,7 @@ class Layer(BaseLayer):
         negative_prompt: Optional[PromptType] = None,
         cfg_scale: float = 7.5,
         mask_by: MaskType = 1.0,
-        is_additional: bool = False,
+        is_distinct: bool = False,  # False: common layer, True: distinct layer
         skip_until: float = 0.0,
         disabled: bool = False,
     ):
@@ -1169,19 +1167,14 @@ class Layer(BaseLayer):
             self._mask = mask_by
         else:
             self._mask = LatentMask(mask_by)
-        self._is_additional = is_additional
+        self._is_distinct = is_distinct
         if (skip_until < 0.0) or (1.0 < skip_until):
             raise ValueError(f"skip_until must be between 0 and 1. actual {skip_until}")
         self._skip_until = skip_until
         self.disabled = disabled
 
-    def IsAdditional(self):
-        return bool(self._is_additional)
-
-    def GetLatents(self, latents, core_latents):
-        if self._is_additional:
-            latents = self._mask.Merge(black=core_latents, white=latents)
-        return latents, self._indices
+    def IsDistinct(self):
+        return bool(self._is_distinct)
 
     def Initialize(
         self,
@@ -1285,7 +1278,7 @@ class LayeredDiffusionPipeline:
         layers: Union[Layer, List[Layer]],
         size: Optional[Tuple[int, int]] = None,
         default_encoding: Optional[StandardEncoding] = None,
-        use_mll: bool = False,
+        use_rmm: bool = True,  # rmm = Residual Merge Method
         rand_seed: Optional[int] = None,
         eta: float = 0.0,
         vae_encoder_adjust: Optional[float] = None,
@@ -1312,59 +1305,23 @@ class LayeredDiffusionPipeline:
                 vae_encoder_adjust = 1.25
 
         bglayer = BackgroundLayer(initialize, vae_encoder_adjust)
-        all_layers = [bglayer] + layers
         prompts = Prompts(self.text_model, default_encoding)
-        Debug(1, f"number of all layers = {len(all_layers)}")
-
-        # mll = multi-level layer. rename later
-        if use_mll:
-            mll_index = 0
-            mll_layers = []
-            for i, layer in enumerate(all_layers):
-                if layer.IsAdditional():
-                    mll_index += 1
-                    mll_layers.append((layer, i, mll_index))
-                else:
-                    mll_layers.append((layer, i, 0))
-            num_additional_layers = mll_index
-            Debug(1, f"number of additional layers = {num_additional_layers}")
-
         target = self.text_model.target
+
+        if use_rmm:
+            MergeMethod = self.ResidualMergeMethod
+        else:
+            MergeMethod = self.LatentMergeMethod
+        mm = MergeMethod(self.scheduler, self.unet, target, bglayer, layers, prompts)
+
         with autocast(target.device_type()):
-            for l in layers:
-                l.Initialize(size, self.image_model, prompts, target)
-            latents, timesteps = bglayer.Initialize(
-                num_steps, size, self.scheduler, self.image_model, prompts, target
-            )
-            if use_mll:
-                mll_latents = [latents] * (1 + num_additional_layers)
-                Debug(2, f"number of MLL latents = {len(mll_latents)}")
-            self.scheduler.PrepareExtraStepKwargs(self.pipe, eta)
+            mm.Initialize(self.image_model, num_steps, size, self.pipe, eta)
 
-            for i, ts in enumerate(self.pipe.progress_bar(timesteps)):
-                progress = float(i + 1) / len(timesteps)
-                Debug(3, f"progress: {progress:.2f} <= {i + 1} / {len(timesteps)}")
+            for i, ts in enumerate(self.pipe.progress_bar(mm.timesteps)):
+                progress = float(i + 1) / len(mm.timesteps)
+                Debug(3, f"progress: {progress:.2f} <= {i + 1} / {len(mm.timesteps)}")
 
-                if use_mll:
-                    latents_for_prompts = [None] * len(prompts)
-                    for layer, k, mll_index in mll_layers:
-                        l = mll_latents[mll_index]
-                        for m in layer._indices:
-                            latents_for_prompts[m] = l
-                    for k, l in enumerate(latents_for_prompts):
-                        if l == None:
-                            raise ValueError(
-                                f"unexpected error: missing latents for index {k}"
-                            )
-                else:
-                    latents_for_prompts = [latents] * len(prompts)
-
-                residuals_for_prompts = prompts.PredictResiduals(
-                    self.scheduler, self.unet, latents_for_prompts, ts, progress
-                )
-                residuals_for_layers = [
-                    l.GetResidual(residuals_for_prompts) for l in all_layers
-                ]
+                mm.Step(i, ts, progress)
 
                 # TODO: implement residual inspection
                 # latents_debug = self.scheduler.InspectLatents(
@@ -1372,104 +1329,157 @@ class LayeredDiffusionPipeline:
                 # )
                 # Debug(3, self.image_model.Decode(latents_debug)[0])
 
-                if use_mll:
-                    residuals_for_bg = residuals_for_layers[0]
-                    residuals_for_mll = [residuals_for_bg] * len(mll_latents)
-                    residuals_for_all = residuals_for_bg
-                    for layer, k, mll_index in mll_layers[1:]:
-                        residuals_for_all = layer.Merge(
-                            residuals_for_all,
+            return self.image_model.Decode(mm.Result())
+
+    class LatentMergeMethod:
+        def __init__(self, scheduler, unet, target, bglayer, layers, prompts):
+            self.scheduler = scheduler
+            self.unet = unet
+            self.target = target
+            self.bglayer = bglayer
+            self.layers = layers
+            self.all_layers = [bglayer] + layers
+            self.prompts = prompts
+            Debug(1, f"number of all layers = {len(self.all_layers)}")
+
+        def Initialize(self, image_model, num_steps, size, pipe, eta):
+            for l in self.layers:
+                l.Initialize(size, image_model, self.prompts, self.target)
+            latents, timesteps = self.bglayer.Initialize(
+                num_steps, size, self.scheduler, image_model, self.prompts, self.target
+            )
+            self.latents = latents
+            self.scheduler.PrepareExtraStepKwargs(pipe, eta)
+            self.timesteps = timesteps
+
+        def Step(self, i, ts, progress):
+            latents_for_prompts = [self.latents] * len(self.prompts)
+
+            residuals_for_layers = self.UNet(latents_for_prompts, ts, progress)
+
+            latents_for_layers = self.scheduler.Step(
+                residuals_for_layers, ts, [self.latents] * len(self.all_layers)
+            )
+            next_latents = latents_for_layers[0]
+            next_latents = self.bglayer.OverwriteLatents(  # unconditionally
+                self.scheduler, next_latents, self.timesteps, i, force_overwrite=True
+            )
+            for layer, latents in zip(self.layers, latents_for_layers[1:]):
+                next_latents = layer.Merge(next_latents, latents, progress)
+            next_latents = self.bglayer.OverwriteLatents(  # conditioned by strength
+                self.scheduler, next_latents, self.timesteps, i
+            )
+            self.latents = next_latents
+
+        def UNet(self, latents_for_prompts, ts, progress):
+            residuals_for_prompts = self.prompts.PredictResiduals(
+                self.scheduler, self.unet, latents_for_prompts, ts, progress
+            )
+            residuals_for_layers = [
+                l.GetResidual(residuals_for_prompts) for l in self.all_layers
+            ]
+            return residuals_for_layers
+
+        def Result(self):
+            return self.latents
+
+    class ResidualMergeMethod(LatentMergeMethod):
+        def __init__(self, scheduler, unet, target, bglayer, layers, prompts):
+            super().__init__(scheduler, unet, target, bglayer, layers, prompts)
+            rmm_index = 0
+            rmm_layers = []
+            for i, layer in enumerate(self.all_layers):
+                if layer.IsDistinct():
+                    rmm_index += 1
+                    rmm_layers.append((layer, i, rmm_index))
+                else:
+                    rmm_layers.append((layer, i, 0))
+            num_rmm_latents = rmm_index + 1
+            Debug(1, f"number of rmm latents = {num_rmm_latents}")
+            self.rmm_layers = rmm_layers
+            self.num_rmm_latents = num_rmm_latents
+
+        def Initialize(self, image_model, num_steps, size, pipe, eta):
+            super().Initialize(image_model, num_steps, size, pipe, eta)
+            self.rmm_latents = [self.latents] * self.num_rmm_latents
+
+        def Step(self, i, ts, progress):
+            latents_for_prompts = [None] * len(self.prompts)
+            for layer, k, rmm_index in self.rmm_layers:
+                l = self.rmm_latents[rmm_index]
+                for m in layer._indices:
+                    latents_for_prompts[m] = l
+            for k, l in enumerate(latents_for_prompts):
+                if l == None:
+                    raise ValueError(f"unexpected error: missing latents for index {k}")
+
+            residuals_for_layers = self.UNet(latents_for_prompts, ts, progress)
+
+            latents, rmm_latents = self.RMM(residuals_for_layers, i, ts, progress)
+            self.latents = latents
+            self.rmm_latents = rmm_latents
+
+        def Result(self):
+            return torch.cat(self.rmm_latents + [self.latents])
+
+        def RMM(self, residuals_for_layers, i, ts, progress):
+            residuals_for_bg = residuals_for_layers[0]
+            residuals_for_rmm = [residuals_for_bg] * self.num_rmm_latents
+            residuals_for_all = residuals_for_bg
+            for layer, k, rmm_index in self.rmm_layers[1:]:
+                residuals_for_all = layer.Merge(
+                    residuals_for_all,
+                    residuals_for_layers[k],
+                    progress,
+                )
+                for m in range(self.num_rmm_latents):
+                    if rmm_index in (0, m):
+                        residuals_for_rmm[m] = layer.Merge(
+                            residuals_for_rmm[m],
                             residuals_for_layers[k],
                             progress,
                         )
-                        for m in range(len(mll_latents)):
-                            # if (m == 0) or (mll_index in (0, m)):
-                            if mll_index in (0, m):
-                                residuals_for_mll[m] = layer.Merge(
-                                    residuals_for_mll[m],
-                                    residuals_for_layers[k],
-                                    progress,
-                                )
-                    latents_for_mll = self.scheduler.Step(
-                        [residuals_for_bg, residuals_for_all] + residuals_for_mll,
-                        ts,
-                        [mll_latents[0], latents] + mll_latents,
-                    )
-                    # all
-                    next_latents = latents_for_mll[0]
-                    next_latents = bglayer.OverwriteLatents(  # unconditionally
-                        self.scheduler,
-                        next_latents,
-                        timesteps,
-                        i,
-                        force_overwrite=True,
-                    )
-                    next_latents = self.UnionLayerMask(
-                        mll_layers,
-                        -1,
-                        progress,
-                        black=next_latents,
-                        white=latents_for_mll[1],
-                    )
-                    next_latents = bglayer.OverwriteLatents(  # conditioned by strength
-                        self.scheduler, next_latents, timesteps, i
-                    )
-                    latents = next_latents
-                    # mll
-                    for m in range(len(mll_latents)):
-                        next_latents = latents_for_mll[0]
-                        next_latents = bglayer.OverwriteLatents(  # unconditionally
-                            self.scheduler,
-                            next_latents,
-                            timesteps,
-                            i,
-                            force_overwrite=True,
-                        )
-                        next_latents = self.UnionLayerMask(
-                            mll_layers,
-                            m,
-                            progress,
-                            black=next_latents,
-                            white=latents_for_mll[m + 2],
-                        )
-                        next_latents = (
-                            bglayer.OverwriteLatents(  # conditioned by strength
-                                self.scheduler, next_latents, timesteps, i
-                            )
-                        )
-                        mll_latents[m] = next_latents
-                else:
-                    latents_for_layers = self.scheduler.Step(
-                        residuals_for_layers, ts, [latents] * len(all_layers)
-                    )
-                    next_latents = latents_for_layers[0]
-                    next_latents = bglayer.OverwriteLatents(  # unconditionally
-                        self.scheduler, next_latents, timesteps, i, force_overwrite=True
-                    )
-                    for layer, latents in zip(layers, latents_for_layers[1:]):
-                        next_latents = layer.Merge(next_latents, latents, progress)
-                    next_latents = bglayer.OverwriteLatents(  # conditioned by strength
-                        self.scheduler, next_latents, timesteps, i
-                    )
-                    latents = next_latents
+            latents_for_rmm = self.scheduler.Step(
+                [residuals_for_bg, residuals_for_all] + residuals_for_rmm,
+                ts,
+                [self.rmm_latents[0], self.latents] + self.rmm_latents,
+            )
+            latents = self.SynthesizeLatents(latents_for_rmm, -1, i, progress)
+            rmm_latents = [
+                self.SynthesizeLatents(latents_for_rmm, m, i, progress)
+                for m in range(self.num_rmm_latents)
+            ]
+            return latents, rmm_latents
 
-            if use_mll:
-                return self.image_model.Decode(torch.cat(mll_latents + [latents]))
-            else:
-                return self.image_model.Decode(latents)
+        def SynthesizeLatents(self, latents_for_rmm, rmm_index, i, progress):
+            next_latents = latents_for_rmm[0]
+            next_latents = self.bglayer.OverwriteLatents(  # unconditionally
+                self.scheduler,
+                next_latents,
+                self.timesteps,
+                i,
+                force_overwrite=True,
+            )
+            next_latents = self.UnionLayerMask(
+                self.rmm_layers,
+                rmm_index,
+                progress,
+                black=next_latents,
+                white=latents_for_rmm[rmm_index + 2],
+            )
+            next_latents = self.bglayer.OverwriteLatents(  # conditioned by strength
+                self.scheduler, next_latents, self.timesteps, i
+            )
+            return next_latents
 
-    # TODO: refactor
-    def UnionLayerMask(self, mll_layers, m, progress, black, white):
-        Debug(2, f"UnionLayerMask: latents {m}, progress {progress:.2f}")
-        mask = 1.0
-        for layer, i, mll_index in mll_layers[1:]:
-            if progress <= layer._skip_until:
-                continue
-            # if (m == 0) or (mll_index in (0, m)):
-            if (m < 0) or (mll_index in (0, m)):
-                Debug(2, f"Add layer mask {i}, mll_index {mll_index}")
-                # display(layer._mask._mask)
-                mask *= layer._mask._mask
-        # Debug(2, f"final mask")
-        # display(mask)
-        return (black * mask) + (white * (1.0 - mask))
+        # TODO: refactor
+        def UnionLayerMask(self, rmm_layers, m, progress, black, white):
+            Debug(4, f"UnionLayerMask: latents {m}, progress {progress:.2f}")
+            mask = 1.0
+            for layer, i, rmm_index in rmm_layers[1:]:
+                if progress <= layer._skip_until:
+                    continue
+                if (m < 0) or (rmm_index in (0, m)):
+                    Debug(4, f"Add layer mask {i}, rmm_index {rmm_index}")
+                    mask *= layer._mask._mask
+            return (black * mask) + (white * (1.0 - mask))
