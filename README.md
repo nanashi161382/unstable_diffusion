@@ -163,4 +163,66 @@ display(image)
 
 ## Layers
 
-TODO
+You can construct more complicated instruction for image generation with layers. Here are some code examples.
+
+### Inpainting of 2+ objects with different prompts
+
+The inpainting function repaints part of the original image with a single set of a prompt and a negative prompt. But there may be cases where you may want to repaint multiple parts of the original image at once. We can use multiple layers in the Layered Diffusion Pipeline to specify each object in each layer. Here is an example.
+
+```python
+image_size = (512, 512)  # width, height
+image = pipe(
+    num_steps=30,
+    initialize=ByImage(
+        image="init_image.png",
+        strength=0.8,
+    ),
+    size=image_size,
+    layers=[
+      Layer(
+        prompt="black dog",
+        negative_prompt="white cat",
+        cfg_scale=7.5,
+        mask_by="mask_image_1.png",
+      ),
+      Layer(
+        prompt="white cat",
+        negative_prompt="black dog",
+        cfg_scale=7.5,
+        mask_by="mask_image_2.png",
+      ),
+    ]
+)[0]
+display(image)
+```
+
+This usually works, but sometimes different layers may affect each other especially when the prompts of the layers are similar. In such cases, we can specify layers as `distinct` to avoid interference. Here is an example.
+
+```python
+image_size = (512, 512)  # width, height
+image = pipe(
+    num_steps=30,
+    initialize=ByImage(
+        image="init_image.png",
+        strength=0.8,
+    ),
+    size=image_size,
+    layers=[
+      Layer(
+        prompt="white cat",
+        negative_prompt="black dog",
+        cfg_scale=7.5,
+        mask_by="mask_image_1.png",
+        is_distinct=True,
+      ),
+      Layer(
+        prompt="white cat",
+        negative_prompt="black dog",
+        cfg_scale=7.5,
+        mask_by="mask_image_2.png",
+        is_distinct=True,
+      ),
+    ]
+)[0]
+display(image)
+```
