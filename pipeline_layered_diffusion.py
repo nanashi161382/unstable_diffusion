@@ -59,6 +59,8 @@ XS_SIZE = 128
 S_SIZE = 256
 M_SIZE = 512
 
+FONTNAME = "LiberationMono-Regular.ttf"  # This font is available on Google Colab
+
 
 def ResizeImage(image, height):
     w, h = image.size
@@ -76,8 +78,7 @@ def ConcatImages(images, titles):
         total_width += w
     output = PIL.Image.new("RGB", (total_width, max_height + 20), "white")
     draw = ImageDraw.Draw(output)
-    fontname = "LiberationMono-Regular.ttf"
-    font = ImageFont.truetype(fontname, size=16)
+    font = ImageFont.truetype(FONTNAME, size=16)
     current_x = 0
     for img, title in zip(images, titles):
         w, h = img.size
