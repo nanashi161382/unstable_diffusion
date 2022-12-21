@@ -167,7 +167,7 @@ You can construct more complicated instruction for image generation with layers.
 
 ### Inpainting of 2+ objects with different prompts
 
-The inpainting function repaints part of the original image with a single set of a prompt and a negative prompt. But there may be cases where you may want to repaint multiple parts of the original image at once. We can use multiple layers in the Layered Diffusion Pipeline to specify each object in each layer. Here is an example.
+The inpainting method repaints part of the original image with a single set of a prompt and a negative prompt. But there may be cases where you may want to repaint multiple parts of the original image at once. We can use multiple layers in the Layered Diffusion Pipeline to specify each object in each layer. Here is an example.
 
 ```python
 image_size = (512, 512)  # width, height
@@ -227,7 +227,7 @@ image = pipe(
 display(image)
 ```
 
-### Text to image with multiple prompts
+### Text to image with multiple different prompts
 
 Layers also enables us to use different prompts for different part of the image, such as background and foreground. This is conceptually similar to inpainting, but instead of using a provided image as a background, it also uses text to image for generating the background image. Here is an example.
 
@@ -255,3 +255,38 @@ display(image)
 ```
 
 Similar to inpainting above, it is also possible to use 2+ layers for the foreground objects, and `is_distinct=True` is available as well. You should apply `is_distinct=True` only to the foreground layers in this case.
+
+### Image to image with multiple different strengths
+
+In image to image method, `strength` defines how much we expect the original image to be changed in the final output. The strength value applies to the entire image. However we may want to apply different strengths to different parts of the image, such as background and foreground. Layers offer the ability for that.
+
+When you want to apply lower strength to the background, you can set up the pipeline as follows.
+
+```python
+image_size = (512, 512)  # width, height
+image = pipe(
+    num_steps=30,
+    initialize=ByImage(
+        image="init_image.png",
+        strength=0.8,
+    ),
+    size=image_size,
+    layers=[
+      Layer(
+        prompt="grass field, blue sky",
+        negative_prompt="tree",
+        cfg_scale=7.5,
+        skip_until=0.3,
+      ),
+      Layer(
+        prompt="white cat",
+        negative_prompt="black dog",
+        cfg_scale=7.5,
+        mask_by="mask_image.png",
+      ),
+    ]
+)[0]
+display(image)
+```
+
+This example applies the strength 0.3 to the background (green field, blue sky) while applying the strength 0.8 to the foreground (white cat).
