@@ -226,3 +226,32 @@ image = pipe(
 )[0]
 display(image)
 ```
+
+### Text to image with multiple prompts
+
+Layers also enables us to use different prompts for different part of the image, such as background and foreground. This is conceptually similar to inpainting, but instead of using a provided image as a background, it also uses text to image for generating the background image. Here is an example.
+
+```python
+image_size = (512, 512)  # width, height
+image = pipe(
+    num_steps=30,
+    initialize=Randomly(),
+    size=image_size,
+    layers=[
+      Layer(
+        prompt="grass field, blue sky",
+        negative_prompt="tree",
+        cfg_scale=7.5,
+      ),
+      Layer(
+        prompt="white cat",
+        negative_prompt="black dog",
+        cfg_scale=7.5,
+        mask_by="mask_image.png",
+      ),
+    ]
+)[0]
+display(image)
+```
+
+Similar to inpainting above, it is also possible to use 2+ layers for the foreground objects, and `is_distinct=True` is available as well. You should apply `is_distinct=True` only to the foreground layers in this case.
