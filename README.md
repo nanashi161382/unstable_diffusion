@@ -83,13 +83,14 @@ image = pipe(
     initialize=Randomly(),
     size=image_size,
     layers=Layer(
-        prompt="black dog",
-        negative_prompt="white cat",
-        cfg_scale=7.5,
+        prompt="photo of orange pomeranian dog running in the park >>> cute face, fluffy",
+        negative_prompt="bad quality, blur",
+        cfg_scale=4.0
     ),
 )[0]
 display(image)
 ```
+![text-to-image example](https://user-images.githubusercontent.com/118838049/209024330-8afee957-527c-4382-bbec-828e3bd1524a.png)
 
 For image to image, here is what you need.
 
@@ -99,17 +100,19 @@ image = pipe(
     num_steps=30,
     initialize=ByImage(
         image="init_image.png",
-        strength=0.8,
+        strength=0.7,
     ),
     size=image_size,
     layers=Layer(
-        prompt="black dog",
-        negative_prompt="white cat",
-        cfg_scale=7.5,
+        prompt="photo of orange pomeranian dog running in the park >>> cute face, fluffy",
+        negative_prompt="bad quality, blur",
+        cfg_scale=4.0
     ),
 )[0]
 display(image)
 ```
+
+![image-to-image example](https://user-images.githubusercontent.com/118838049/209024412-2f787efa-b878-4269-a31f-6554d04c00f9.png)
 
 Finally, this is the code for legacy inpainting.
 
@@ -123,9 +126,9 @@ image = pipe(
     ),
     size=image_size,
     layers=Layer(
-        prompt="black dog",
-        negative_prompt="white cat",
-        cfg_scale=7.5,
+        prompt="photo of orange pomeranian dog running in the park >>> cute face, fluffy",
+        negative_prompt="bad quality, blur",
+        cfg_scale=4.0
         mask_by="mask_image.png",
     ),
 )[0]
@@ -161,7 +164,7 @@ image = pipe(
 display(image)
 ```
 
-## Layers
+## Examples with layers
 
 You can construct more complicated instruction for image generation with layers. Here are some code examples.
 
