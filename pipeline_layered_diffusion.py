@@ -9,6 +9,7 @@ from diffusers import (
 from IPython.display import display
 import numpy as np
 import PIL
+from PIL import ImageDraw, ImageFont
 import random
 import re
 import torch
@@ -40,9 +41,12 @@ def ShouldDebug(level: int):
     return level <= debug_level
 
 
-def Debug(level: int, obj):
+def Debug(level: int, title: str, obj=None):
     if ShouldDebug(level):
-        display(obj)
+        if title:
+            print(title)
+        if obj:
+            display(obj)
 
 
 #
@@ -50,13 +54,43 @@ def Debug(level: int, obj):
 #
 Generator = Optional[torch.Generator]
 
+XXS_SIZE = 96
+XS_SIZE = 128
+S_SIZE = 256
+M_SIZE = 512
+
+
+def ResizeImage(image, height):
+    w, h = image.size
+    ratio = float(height) / h
+    width = round(ratio * w)
+    return image.resize((width, height), resample=PIL.Image.LANCZOS)
+
+
+def ConcatImages(images, titles):
+    max_height = 0
+    total_width = 0
+    for img in images:
+        w, h = img.size
+        max_height = max(h, max_height)
+        total_width += w
+    output = PIL.Image.new("RGB", (total_width, max_height + 20), "white")
+    draw = ImageDraw.Draw(output)
+    fontname = "LiberationMono-Regular.ttf"
+    font = ImageFont.truetype(fontname, size=16)
+    current_x = 0
+    for img, title in zip(images, titles):
+        w, h = img.size
+        draw.text((current_x, 0), title, "black", font=font)
+        output.paste(img, (current_x, 20))
+        current_x += w
+    return output
+
 
 def OpenImage(filename):
     if filename:
         image = PIL.Image.open(filename).convert("RGB")
-        if ShouldDebug(1):
-            print(f"{image.size} - {filename}")
-            display(image.resize((128, 128), resample=PIL.Image.LANCZOS))
+        Debug(1, f"{image.size} - {filename}", ResizeImage(image, XXS_SIZE))
         return image
     else:
         return None
@@ -484,7 +518,7 @@ class ShiftEncoding(StandardEncoding):
         weights = (
             np.convolve(np.array(weights) - 1.0, self._convolve, mode="full") + 1.0
         )
-        Debug(3, weights)
+        Debug(3, "", weights)
         if len(weights) >= text_model.max_length():
             weights = weights[: text_model.max_length()]
         weights = np.concatenate(
@@ -1327,9 +1361,9 @@ class LayeredDiffusionPipeline:
                 # latents_debug = self.scheduler.InspectLatents(
                 #    residuals_for_layers[0], ts, latents
                 # )
-                # Debug(3, self.image_model.Decode(latents_debug)[0])
+                # Debug(3, "", self.image_model.Decode(latents_debug)[0])
 
-            return self.image_model.Decode(mm.Result())
+            return mm.Result(self.image_model)
 
     class LatentMergeMethod:
         def __init__(self, scheduler, unet, target, bglayer, layers, prompts):
@@ -1380,8 +1414,8 @@ class LayeredDiffusionPipeline:
             ]
             return residuals_for_layers
 
-        def Result(self):
-            return self.latents
+        def Result(self, image_model):
+            return image_model.Decode(self.latents)[0], None
 
     class ResidualMergeMethod(LatentMergeMethod):
         def __init__(self, scheduler, unet, target, bglayer, layers, prompts):
@@ -1419,8 +1453,21 @@ class LayeredDiffusionPipeline:
             self.latents = latents
             self.rmm_latents = rmm_latents
 
-        def Result(self):
-            return torch.cat(self.rmm_latents + [self.latents])
+        def Result(self, image_model):
+            # Decode images one by one to avoid OOM
+            return (
+                image_model.Decode(self.latents)[0],
+                ConcatImages(
+                    [
+                        ResizeImage(image_model.Decode(ex)[0], S_SIZE)
+                        for ex in self.rmm_latents
+                    ],
+                    [
+                        "RMM Image: common" if i == 0 else f"distinct #{i}"
+                        for i in range(self.num_rmm_latents)
+                    ],
+                ),
+            )
 
         def RMM(self, residuals_for_layers, i, ts, progress):
             residuals_for_bg = residuals_for_layers[0]
