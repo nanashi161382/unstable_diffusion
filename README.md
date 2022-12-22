@@ -283,21 +283,24 @@ image = pipe(
     ),
     size=image_size,
     layers=[
-      Layer(
-        prompt="grass field, blue sky",
-        negative_prompt="tree",
-        cfg_scale=7.5,
-        skip_until=0.3,
-      ),
-      Layer(
-        prompt="white cat",
-        negative_prompt="black dog",
-        cfg_scale=7.5,
-        mask_by="mask_image.png",
-      ),
+        Layer(
+            prompt="green grass, blue sky",
+            negative_prompt="bad quality, brown dirt, white cloud, red surface",
+            cfg_scale=8.0,
+            skip_until=0.6
+        ),
+        Layer(
+            prompt="white persian cat >>> round face, blue eyes, full body",
+            negative_prompt="bad quality, malformed",
+            cfg_scale=4.0,
+            mask_by="mask_rect.png",
+        ),
     ]
 )[0]
 display(image)
 ```
 
-This example applies the strength 0.3 to the background (green field, blue sky) while applying the strength 0.8 to the foreground (white cat).
+This example applies the strength 0.4 (= 1.0 - `skip_until`) to the background (green field, blue sky) while applying the strength 0.8 to the foreground (white persian cat).
+
+![two strengths example](https://user-images.githubusercontent.com/118838049/209080889-95835dde-2227-4a1a-b3f1-31f4eb6d9339.png)
+
