@@ -123,11 +123,11 @@ image = pipe(
     num_steps=30,
     initialize=ByImage(
         image="init_image.png",
-        strength=0.8,
+        strength=0.95,
     ),
     size=image_size,
     layers=Layer(
-        prompt="photo of orange pomeranian dog running in the park >>> cute face, fluffy",
+        prompt="photo of orange tabby norwegian forest cat >>> cute face, fluffy",
         negative_prompt="bad quality, blur",
         cfg_scale=4.0
         mask_by="mask_image.png",
@@ -135,6 +135,9 @@ image = pipe(
 )[0]
 display(image)
 ```
+
+![inpainting example](https://user-images.githubusercontent.com/118838049/209058798-6898bfd7-a906-4079-89fd-ad8f5c5e3ffa.png)
+
 
 ## ShiftEncoding
 
