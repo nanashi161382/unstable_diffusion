@@ -267,11 +267,11 @@ Similar to inpainting above, it is also allowed to use 2+ layers for the foregro
 
 ![txt2img 2 distinctt layers example](https://user-images.githubusercontent.com/118838049/209060714-54fb6cae-5587-4e67-bcb7-1a38008d0507.png)
 
-### Image to image with multiple different strengths
+### Image to image with multiple different prompts and strengths
 
 In image to image method, `strength` defines how much we expect the original image to be changed in the final output. The strength value applies to the entire image. However we may want to apply different strengths to different parts of the image, such as background and foreground. Layers offer the ability for that.
 
-When you want to apply lower strength to the background, you can set up the pipeline as follows.
+When you want to apply lower strength to the background with a different prompt, you can set up the pipeline as follows.
 
 ```python
 image_size = (512, 512)  # width, height
