@@ -182,26 +182,28 @@ image = pipe(
     num_steps=30,
     initialize=ByImage(
         image="init_image.png",
-        strength=0.8,
+        strength=0.9,
     ),
     size=image_size,
     layers=[
       Layer(
-        prompt="black dog",
-        negative_prompt="white cat",
-        cfg_scale=7.5,
-        mask_by="mask_image_1.png",
+        prompt="orange puppy sitting on sofa",
+        negative_prompt="bad quality",
+        cfg_scale=4.0,
+        mask_by="mask_image_left.png",
       ),
       Layer(
-        prompt="white cat",
-        negative_prompt="black dog",
-        cfg_scale=7.5,
-        mask_by="mask_image_2.png",
+        prompt="red tulip flower in brown planter",
+        negative_prompt="bad quality",
+        cfg_scale=4.0,
+        mask_by="mask_image_right.png",
       ),
     ]
 )[0]
 display(image)
 ```
+
+![inpaint_with two_prompts example](https://user-images.githubusercontent.com/118838049/209110018-2bfd3abe-bc0c-44a7-9f06-7ff9f237294d.png)
 
 This usually works, but sometimes different layers may affect each other especially when the prompts of the layers are similar. In such cases, we can specify layers as `distinct` to avoid interference. Here is an example.
 
@@ -211,28 +213,30 @@ image = pipe(
     num_steps=30,
     initialize=ByImage(
         image="init_image.png",
-        strength=0.8,
+        strength=0.9,
     ),
     size=image_size,
     layers=[
       Layer(
-        prompt="white cat",
-        negative_prompt="black dog",
-        cfg_scale=7.5,
-        mask_by="mask_image_1.png",
+        prompt="orange puppy sitting on sofa",
+        negative_prompt="bad quality",
+        cfg_scale=4.0,
+        mask_by="mask_image_left.png",
         is_distinct=True,
       ),
       Layer(
-        prompt="white cat",
-        negative_prompt="black dog",
-        cfg_scale=7.5,
-        mask_by="mask_image_2.png",
+        prompt="orange puppy sitting on sofa",
+        negative_prompt="bad quality",
+        cfg_scale=4.0,
+        mask_by="mask_image_right.png",
         is_distinct=True,
       ),
     ]
 )[0]
 display(image)
 ```
+
+![inpaint with 2 prompts by distinct layers example](https://user-images.githubusercontent.com/118838049/209110111-c9733f24-47cb-4249-a3b0-c6d7d17fc77f.png)
 
 ### Text to image with multiple different prompts
 
