@@ -112,7 +112,8 @@ image = pipe(
 display(image)
 ```
 
-![image-to-image example](https://user-images.githubusercontent.com/118838049/209024412-2f787efa-b878-4269-a31f-6554d04c00f9.png)
+![image-to-image example](https://user-images.githubusercontent.com/118838049/209033208-bf3b7e1f-4f4d-4fad-ab4f-49b542e1d89e.png)
+
 
 Finally, this is the code for legacy inpainting.
 
