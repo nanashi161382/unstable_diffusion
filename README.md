@@ -246,22 +246,26 @@ image = pipe(
     size=image_size,
     layers=[
       Layer(
-        prompt="grass field, blue sky",
-        negative_prompt="tree",
-        cfg_scale=7.5,
+        prompt="photo of >>> green grass field, blue sky, mountain on horizon",
+        negative_prompt="blur",
+        cfg_scale=4.0,
       ),
       Layer(
-        prompt="white cat",
-        negative_prompt="black dog",
-        cfg_scale=7.5,
-        mask_by="mask_image.png",
+        prompt="white persian cat >>> round face, blue eyes",
+        negative_prompt="bad quality, malformed",
+        cfg_scale=4.0,
+        mask_by="mask_rect.png",
       ),
     ]
 )[0]
 display(image)
 ```
 
-Similar to inpainting above, it is also possible to use 2+ layers for the foreground objects, and `is_distinct=True` is available as well. You should apply `is_distinct=True` only to the foreground layers in this case.
+![txt2img 2 layers example](https://user-images.githubusercontent.com/118838049/209060625-5e1dfda5-6557-41a7-89e9-2d83cd5e399f.png)
+
+Similar to inpainting above, it is also allowed to use 2+ layers for the foreground objects, and `is_distinct=True` is available as well. You should apply `is_distinct=True` only to the foreground layers. Here is an example with `is_distinct=True`. It makes each layer clearer but sometimes less integrated.
+
+![txt2img 2 distinctt layers example](https://user-images.githubusercontent.com/118838049/209060714-54fb6cae-5587-4e67-bcb7-1a38008d0507.png)
 
 ### Image to image with multiple different strengths
 
