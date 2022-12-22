@@ -302,5 +302,4 @@ display(image)
 
 This example applies the strength 0.4 (= 1.0 - `skip_until`) to the background (green field, blue sky) while applying the strength 0.8 to the foreground (white persian cat).
 
-![two strengths example](https://user-images.githubusercontent.com/118838049/209080889-95835dde-2227-4a1a-b3f1-31f4eb6d9339.png)
-
+![two strengths example](https://user-images.githubusercontent.com/118838049/209082049-651265f2-b94c-4fd2-8ed8-7f8814b9d730.png)
