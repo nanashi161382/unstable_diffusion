@@ -88,13 +88,59 @@ def ConcatImages(images, titles):
     return output
 
 
+def CreateMaskImage(image):
+    sz = image.size
+    bg = PIL.Image.new("RGB", sz, "black")
+    fg = PIL.Image.new("RGB", sz, "white")
+    bg.paste(fg, (0, 0), image)
+    return bg.convert("L")
+
+
+def CreateRgbImage(image, background="white"):
+    sz = image.size
+    bg = PIL.Image.new("RGB", sz, background)
+    bg.paste(image, (0, 0))
+    return bg
+
+
 def OpenImage(filename):
     if filename:
-        image = PIL.Image.open(filename).convert("RGB")
-        Debug(1, f"{image.size} - {filename}", ResizeImage(image, XXS_SIZE))
+        image = PIL.Image.open(filename)
+        if any(a in image.mode for a in "Aa"):
+            # image with alpha
+            mask = CreateMaskImage(image)
+            image = CreateRgbImage(image)
+            Debug(
+                1,
+                f"{image.size} - {filename}",
+                ConcatImages(
+                    [ResizeImage(image, XXS_SIZE), ResizeImage(mask, XXS_SIZE)],
+                    ["image", "mask"],
+                ),
+            )
+            return image, mask
+        else:
+            Debug(1, f"{image.size} - {filename}", ResizeImage(image, XXS_SIZE))
+            return image.convert("RGB"), None
+    else:
+        return None, None
+
+
+def MaskImage(image, mask, background="white"):
+    sz = image.size
+    bg = PIL.Image.new("RGB", sz, background)
+    bg.paste(image, (0, 0), mask)
+    return bg
+
+
+def OpenImageWithBackground(filename, background="white"):
+    image, mask = OpenImage(filename)
+    if not image:
+        return None
+    elif not mask:
         return image
     else:
-        return None
+        return MaskImage(image, mask, background)
 
 
 #
@@ -260,6 +306,13 @@ class ImageModel:
 # -- LatentMask --
 #
 class LatentMask:
+    @classmethod
+    def CreateIfNeeded(cls, mask_by):
+        if isinstance(mask_by, cls):
+            return mask_by
+        else:
+            return cls(mask_by)
+
     def __init__(self, mask_by: Union[float, str, PIL.Image.Image]):
         self._mask_by = mask_by
 
@@ -271,7 +324,8 @@ class LatentMask:
     ):
         mask = self._mask_by
         if isinstance(mask, str):
-            mask = OpenImage(mask)
+            # TODO: use alpha if it has alpha
+            mask = OpenImageWithBackground(mask, background="black")
         if isinstance(mask, PIL.Image.Image):
             if size and (mask.size != size):
                 Debug(1, f"Resize mask image from {mask.size} to {size}.")
@@ -280,8 +334,23 @@ class LatentMask:
         else:
             self._mask = 1.0 - mask  # make the scale same as the mask image.
 
-    def Merge(self, black, white):
-        return (black * self._mask) + (white * (1.0 - self._mask))
+    def Merge(self, black, white, level: float = 1.0):
+        inverted_mask = 1.0 - self._mask  # make white = 1.0 & black = 0.0
+        inverted_mask *= level
+        return self.ApplyInvertedMask(inverted_mask, black=black, white=white)
+
+    def Union(self, other, level: float = 1.0):
+        my_inverted_mask = level * (1.0 - self._mask)  # white = 1.0 & black = 0.0
+        union_mask = other * (1.0 - my_inverted_mask)  # white = 0.0 & black = 1.0
+        return union_mask
+
+    @classmethod
+    def ApplyMask(cls, mask, black, white):
+        return (black * mask) + (white * (1.0 - mask))
+
+    @classmethod
+    def ApplyInvertedMask(cls, inverted_mask, black, white):
+        return cls.ApplyMask(inverted_mask, black=white, white=black)
 
 
 MaskType = Union[float, str, PIL.Image.Image, LatentMask]
@@ -334,6 +403,110 @@ def IntersectMask(masks: List[MaskType]):
         return masks
 
     return ComboOf(masks, transformed_by=transform)
+
+
+#
+# -- StrengthList --
+#
+# StrengthList is a list of strength with LatentMask levels.
+# The `strength` should be formatted one of following example patterns:
+#  * strength = None
+#  * strength = 0.9
+#  * strength = strg(0.9, level=0.5)
+#  * strength = [0.9, 0.7]
+#  * strength = [strg(0.9, level=0.8), strg(0.7, level=0.4)]
+# If `level` is not specified, the list of strengths are interpreted
+# as a decreasing manner for initializers and as an increasing manner for layers.
+
+
+class Strength:
+    def __init__(self, strength: float, level: float):
+        self.strength = strength
+        self.level = level
+
+    def __str__(self):
+        return f"{self.strength:.2f} (level={self.level:.2f})"
+
+
+def strg(strength: float, level: float) -> Strength:
+    return Strength(strength, level)
+
+
+StrengthType = Optional[
+    Union[
+        float,  # strength
+        Strength,  # Strength(strength, mask level)
+        List[float],  # list of strength
+        List[Strength],  # list of Strength(strength, mask level)
+    ]
+]
+
+
+class StrengthList:
+    def GetLevel(self, raw_level: float):
+        # raw_level starts from 0.0 to 1.0.
+        if self.is_increasing:
+            return raw_level
+        else:
+            return 1.0 - raw_level
+
+    def __init__(self, strengths: StrengthType, is_increasing: bool):
+        self.is_increasing = is_increasing
+        if strengths is None:
+            self.strengths = [Strength(1.0, level=self.GetLevel(0.0))]
+            Debug(3, "StrengthList:", self.strengths)
+            return
+        elif isinstance(strengths, list):
+            if not strengths:
+                self.strengths = [Strength(1.0, level=self.GetLevel(0.0))]
+                Debug(3, "StrengthList:", self.strengths)
+                return
+        else:
+            strengths = [strengths]
+
+        is_with_level = [isinstance(s, Strength) for s in strengths]
+        if any(a ^ b for a, b in zip(is_with_level, is_with_level[1:])):
+            raise ValueError(
+                f"Elements of strengths must be all with level or all without level."
+            )
+        if not is_with_level[0]:
+            strg_len = float(len(strengths))
+            strengths = [
+                Strength(s, level=self.GetLevel(i / strg_len))
+                for i, s in enumerate(strengths)
+            ]
+        if any(a.strength <= b.strength for a, b in zip(strengths, strengths[1:])):
+            raise ValueError(f"Strengths must be sorted in the decreasing order.")
+        if (strengths[0].strength > 1.0) or (strengths[-1].strength < 0.0):
+            Debug(
+                0,
+                f"Strength is effective between 0.0 and 1.0. "
+                f"actual: from {strengths[0].strength} to {strengths[-1].strength}",
+            )
+        if any((a.level < 0.0) or (a.level > 1.0) for a in strengths):
+            raise ValueError(f"Strength's level must be between 0.0 and 1.0.")
+        Debug(3, "StrengthList:", strengths)
+        self.strengths = strengths
+
+    def Merge(self, mask: LatentMask, other, mine, remaining: float):
+        level = self.GetCurrentLevel(remaining)
+        return mask.Merge(black=other, white=mine, level=level)
+
+    def UnionMask(self, other_mask, my_mask, remaining: float):
+        level = self.GetCurrentLevel(remaining)
+        return my_mask.Union(other_mask, level=level)
+
+    def GetCurrentLevel(self, remaining: float) -> float:
+        for s in self.strengths:
+            if remaining > s.strength:
+                Debug(4, f"remaining {remaining:.2f}, strength {s}")
+                return s.level
+        level = self.GetLevel(1.0)
+        Debug(4, f"remaining {remaining:.2f}, level={level}")
+        return level
+
+    def First(self):
+        return self.strengths[0]
 
 
 #
@@ -542,7 +715,7 @@ class ShiftEncoding(StandardEncoding):
                 chunks = prompt.Shift(i, self._rotate)
                 shifted_text = " ".join(chunks.texts)
                 weights = self.GetWeights(text_model, chunks)
-                Debug(3, shifted_text)
+                Debug(4, shifted_text)
 
                 embeddings = text_model.EncodeText(shifted_text, False)
                 unweighted_mean = (
@@ -569,7 +742,7 @@ class ShiftEncoding(StandardEncoding):
 # A prompt can be
 #  * str  --  a prompt text
 #  * (str, Encoding)  --  a prompt text & its encoding method
-#  * [(int, str) or (int, str, Encoding)]  --  a list of prompt texts & their encoding methods
+#  * [(float, str) or (float, str, Encoding)]  --  a list of prompt texts & their encoding methods
 #    combined with the ratio of the starting position against the total steps.
 PromptType = Union[
     str,
@@ -765,33 +938,42 @@ class Scheduler:
 # -- Initializer --
 #
 class Initializer:
-    def GetStrength(self):
-        return 1.0
+    def __init__(self, mask_by: MaskType, strength: StrengthType):
+        self.mask = LatentMask.CreateIfNeeded(mask_by)
+        self.strength = StrengthList(strength, is_increasing=False)
+        self.is_whole_image = mask_by == 1.0
 
-    def GetLatents(
+    def IsWholeImage(self):
+        return self.is_whole_image
+
+    def GetStrength(self):
+        return self.strength
+
+    def InitializeMask(
         self,
         size: Optional[Tuple[int, int]],
         image_model: ImageModel,
-        generator: Generator,
         target: SharedTarget,
-        vae_encoder_adjust: float,
     ):
-        raise NotImplementedError()
-
-    def InitializeLatents(self, scheduler: Scheduler, latents, timesteps):
-        raise NotImplementedError()
+        self.mask.Initialize(size, image_model, target)
 
     def OverwriteLatents(
         self,
         scheduler: Scheduler,
         latents,
         timesteps,
-        current_step: int,
-        remaining: float,
-        force_overwrite: bool,
+        step_index: int,
     ):
         # do nothing
         return latents, False
+
+    def Merge(self, other, mine, remaining, force_overwrite: bool):
+        if force_overwrite:
+            return self.mask.Merge(black=other, white=mine, level=1.0)
+        else:
+            return self.strength.Merge(
+                mask=self.mask, other=other, mine=mine, remaining=remaining
+            )
 
     @classmethod
     def RandForShape(cls, shape, generator: Generator, target: SharedTarget):
@@ -815,15 +997,33 @@ class Randomly(Initializer):
     def __init__(
         self,
         symmetric: Optional[bool] = False,
+        mask_by: MaskType = 1.0,
+        strength: StrengthType = None,
     ):
         """
         Args:
             size (`(int, int)`, *optional*, defaults to (512, 512))
                 The (width, height) pair in pixels of the generated image.
         """
+        super().__init__(mask_by, strength)
         self._symmetric = symmetric
 
-    def GetLatents(
+    def InitializeLatents(
+        self,
+        size: Optional[Tuple[int, int]],
+        image_model: ImageModel,
+        target: SharedTarget,
+        vae_encoder_adjust: float,
+        scheduler: Scheduler,
+        timesteps,
+    ):
+        self.InitializeMask(size, image_model, target)
+        latents = self._GetLatents(
+            size, image_model, scheduler.generator(), target, vae_encoder_adjust
+        )
+        return latents * scheduler.Get().init_noise_sigma
+
+    def _GetLatents(
         self,
         size: Optional[Tuple[int, int]],
         image_model: ImageModel,
@@ -834,7 +1034,7 @@ class Randomly(Initializer):
         if not size:
             raise ValueError("`size` is mandatory to initialize `Randomly`.")
 
-        latents_shape = self.GetLatentsShape(image_model, size)
+        latents_shape = self._GetLatentsShape(image_model, size)
 
         if not self._symmetric:
             latents = self.RandForShape(latents_shape, generator, target)
@@ -852,10 +1052,7 @@ class Randomly(Initializer):
             right = right[:, :, :, extra_width:]
         return torch.cat([left, right], dim=-1)
 
-    def InitializeLatents(self, scheduler: Scheduler, latents, timesteps):
-        return latents * scheduler.Get().init_noise_sigma
-
-    def GetLatentsShape(self, image_model: ImageModel, size: Tuple[int, int]):
+    def _GetLatentsShape(self, image_model: ImageModel, size: Tuple[int, int]):
         batch_size = 1
         num_channels = image_model.num_channels()
         scale_factor = image_model.vae_scale_factor()
@@ -881,27 +1078,28 @@ class ByLatents(Initializer):
     def __init__(
         self,
         latents: torch.FloatTensor,
+        mask_by: MaskType = 1.0,
+        strength: StrengthType = None,
     ):
         """
         Args:
             latents (`torch.FloatTensor`, *optional*):
                 Pre-generated noisy latents, sampled from a Gaussian distribution, to be used as inputs for image generation. Can be used to tweak the same generation with different prompts. If not provided, a latents tensor will ge generated by sampling using the supplied random `generator`.
         """
+        super().__init__(mask_by, strength)
         self._latents = latents
 
-    def GetLatents(
+    def InitializeLatents(
         self,
         size: Optional[Tuple[int, int]],
         image_model: ImageModel,
-        generator: Generator,
         target: SharedTarget,
         vae_encoder_adjust: float,
+        scheduler: Scheduler,
+        timesteps,
     ):
-        if size:
-            Debug(0, "`size` is ignored when initializing `ByLatents`.")
-        return self._latents.to(**target.dict)
-
-    def InitializeLatents(self, scheduler: Scheduler, latents, timesteps):
+        self.InitializeMask(size, image_model, target)
+        latents = self._latents.to(**target.dict)
         return latents * scheduler.Get().init_noise_sigma
 
 
@@ -909,71 +1107,64 @@ class ByImage(Initializer):
     def __init__(
         self,
         image: Union[str, PIL.Image.Image],
-        strength: float = 0.8,
+        mask_by: MaskType = 1.0,
+        strength: StrengthType = 0.8,
     ):
         """
         Args:
             image `PIL.Image.Image`:
                 `Image`, or tensor representing an image batch, that will be used as the starting point for the process.
-            strength (`float`, *optional*, defaults to 0.8):
+            strength (`StrengthType`, *optional*, defaults to 0.8):
+                TODO: update the description below.
                 Conceptually, indicates how much to transform the reference `image`. Must be between 0 and 1.
                 `image` will be used as a starting point, adding more noise to it the larger the `strength`. The number of denoising steps depends on the amount of noise initially added. When `strength` is 1, added noise will be maximum and the denoising process will run for the full number of iterations specified in `num_inference_steps`. A value of 1, therefore, essentially ignores `image`.
         """
+        super().__init__(mask_by, strength)
         self._image = image
-        if (strength <= 0.0) or (strength > 1.0):
-            raise ValueError(f"strength must be between 0 and 1. given {strength}.")
-        self._strength = strength
 
-    def GetStrength(self):
-        return self._strength
-
-    def GetLatents(
+    def InitializeLatents(
         self,
         size: Optional[Tuple[int, int]],
         image_model: ImageModel,
-        generator: Generator,
         target: SharedTarget,
         vae_encoder_adjust: float,
+        scheduler: Scheduler,
+        timesteps,
     ):
+        self.InitializeMask(size, image_model, target)
+
+        initial_timestep = timesteps[:1]
+        generator = scheduler.generator()
+
         image = self._image
         if isinstance(image, str):
-            image = OpenImage(image)
+            image = OpenImageWithBackground(image, "white")  # TODO: enable alpha mask
         if size and (image.size != size):
             Debug(1, f"Resize image from {image.size} to {size}.")
             image = image.resize(size, resample=PIL.Image.LANCZOS)
+
         latents = image_model.Encode(image, generator, target) * vae_encoder_adjust
         self._initial_latents = latents
         self._noise = self.RandForShape(latents.shape, generator, target)
-        return latents
 
-    def InitializeLatents(self, scheduler: Scheduler, latents, timesteps):
-        initial_timestep = timesteps[:1]
-        latents = scheduler.Get().add_noise(
+        return scheduler.Get().add_noise(
             self._initial_latents, self._noise, initial_timestep
         )
-        return latents
 
     def OverwriteLatents(
         self,
         scheduler: Scheduler,
         latents,
         timesteps,
-        current_step: int,
-        remaining: float,
-        force_overwrite: bool,
+        step_index: int,
     ):
-        Debug(3, f"remaining {remaining:.2f}, strength {self._strength:.2f}")
-        if (not force_overwrite) and (remaining < self._strength):
-            # do nothing if no need to keep the initial latents
-            return latents, False
-
         # Return the initial latents without noise if this is the last step.
-        if remaining <= 0.0:
-            Debug(3, "Last step with keeping initial image.")
+        if step_index + 1 >= len(timesteps):
+            Debug(4, "Last step with keeping initial image.")
             return self._initial_latents, True
         # Otherwise add noise to the initial latents.
-        Debug(3, f"Add noise for step {current_step}.")
-        next_timestep = timesteps[current_step + 1 : current_step + 2]
+        Debug(4, f"Add noise for step {step_index}.")
+        next_timestep = timesteps[step_index + 1 : step_index + 2]
         return (
             scheduler.Get().add_noise(
                 self._initial_latents, self._noise, next_timestep
@@ -982,70 +1173,91 @@ class ByImage(Initializer):
         )
 
 
-class ByBothOf(Initializer):
-    def __init__(
-        self,
-        black: Initializer,
-        white: Initializer,
-        mask_by: MaskType,
-    ):
-        self._both = [black, white]
-        if isinstance(mask_by, LatentMask):
-            self._mask = mask_by
+class InitializerList:
+    def __init__(self, initializers: Optional[Union[Initializer, List[Initializer]]]):
+        if not initializers:
+            initializers = []
+        elif not isinstance(initializers, list):
+            initializers = [initializers]
+
+        max_strength = 0.0
+        its_level = 0.0
+        reverse_index = -1
+        for i, init in enumerate(reversed(initializers)):
+            strg = init.GetStrength().First()
+            if init.IsWholeImage() and strg.strength > max_strength:
+                max_strength = strg.strength
+                its_level = strg.level
+                reverse_index = i
+        if (reverse_index < 0) or (its_level < 1.0):
+            # no initializers, or none of them cover the whole image.
+            # or it needs another preceding initializer.
+            Debug(1, f"Insert the random initializer to the head.")
+            initializers = [Randomly()] + initializers
+            max_strength = 1.0
         else:
-            self._mask = LatentMask(mask_by)
+            Debug(1, f"Take only last {reverse_index + 1} initializers.")
+            initializers = initializers[-(reverse_index + 1) :]
+        self.initializers = initializers
+        self.max_strength = max_strength
 
-    def GetStrength(self):
-        return max(g.GetStrength() for g in self._both)
+    def GetMaxStrength(self):
+        return self.max_strength
 
-    def GetLatents(
+    def InitializeLatents(
         self,
         size: Optional[Tuple[int, int]],
         image_model: ImageModel,
-        generator: Generator,
         target: SharedTarget,
         vae_encoder_adjust: float,
+        scheduler: Scheduler,
+        timesteps,
     ):
-        self._mask.Initialize(size, image_model, target)
-        return [
-            g.GetLatents(size, image_model, generator, target, vae_encoder_adjust)
-            for g in self._both
+        latents_list = [
+            (
+                init.InitializeLatents(
+                    size,
+                    image_model,
+                    target,
+                    vae_encoder_adjust,
+                    scheduler,
+                    timesteps,
+                ),
+                init,
+            )
+            for init in self.initializers
         ]
-
-    def InitializeLatents(self, scheduler: Scheduler, latents, timesteps):
-        latents = [
-            g.InitializeLatents(scheduler, l, timesteps)
-            for g, l in zip(self._both, latents)
-        ]
-        return self._mask.Merge(*latents)
+        init_latents = latents_list[0][0]
+        for latents, init in latents_list[1:]:
+            init_latents = init.Merge(
+                other=init_latents, mine=latents, remaining=1.0, force_overwrite=True
+            )
+        return init_latents
 
     def OverwriteLatents(
         self,
         scheduler: Scheduler,
         latents,
         timesteps,
-        current_step: int,
+        step_index: int,
         remaining: float,
         force_overwrite: bool,
     ):
-        new_latents, changed = zip(
-            *[
-                g.OverwriteLatents(
-                    scheduler,
-                    latents,
-                    timesteps,
-                    current_step,
-                    remaining,
-                    force_overwrite,
+        for init in self.initializers:
+            new_latents, changed = init.OverwriteLatents(
+                scheduler,
+                latents,
+                timesteps,
+                step_index,
+            )
+            if changed:
+                latents = init.Merge(
+                    other=latents,
+                    mine=new_latents,
+                    remaining=remaining,
+                    force_overwrite=force_overwrite,
                 )
-                for g in self._both
-            ]
-        )
-        if any(changed):
-            return self._mask.Merge(*new_latents), True
-        else:
-            # Return the original latents if nothing chnaged.
-            return latents, False
+        return latents
 
 
 #
@@ -1125,12 +1337,12 @@ class BaseLayer:
 class BackgroundLayer(BaseLayer):
     def __init__(
         self,
-        initialize: Initializer,
+        initializers: Optional[Union[Initializer, List[Initializer]]],
         vae_encoder_adjust: Optional[float] = None,
     ):
         # The default image generation = no prompts, no cfg
         super().__init__()
-        self._initializer = initialize
+        self._initializers = InitializerList(initializers)
         if not vae_encoder_adjust:
             self._vae_encoder_adjust = 1.0
         else:
@@ -1146,22 +1358,28 @@ class BackgroundLayer(BaseLayer):
         target: SharedTarget,
     ):
         super()._Initialize(prompts)
-        max_strength = self._initializer.GetStrength()
+        max_strength = self._initializers.GetMaxStrength()
         # compute num_steps_to_request to match the effective number of iterations with num_steps.
         num_steps_to_request = int(-(-int(num_steps) // max_strength))  # round up
         scheduler.SetTimesteps(num_steps_to_request)
-        latents = self._initializer.GetLatents(
-            size, image_model, scheduler.generator(), target, self._vae_encoder_adjust
-        )
         timesteps, total_num_steps = self.GetTimesteps(scheduler, max_strength, target)
         Debug(
             3, f"total_num_steps: {total_num_steps}, actual num_steps: {len(timesteps)}"
         )
         self._total_num_steps = total_num_steps
-        latents = self._initializer.InitializeLatents(scheduler, latents, timesteps)
+        latents = self._initializers.InitializeLatents(
+            size,
+            image_model,
+            target,
+            self._vae_encoder_adjust,
+            scheduler,
+            timesteps,
+        )
         return latents, timesteps
 
-    def GetTimesteps(self, scheduler: Scheduler, strength: float, target: SharedTarget):
+    # TODO: move to scheduler
+    @classmethod
+    def GetTimesteps(cls, scheduler: Scheduler, strength: float, target: SharedTarget):
         # dtype should be `int`
         timesteps = scheduler.Get().timesteps.to(device=target.device())
         total_num_steps = len(timesteps)
@@ -1172,18 +1390,22 @@ class BackgroundLayer(BaseLayer):
         actual_num_steps = int(total_num_steps * strength)
         return timesteps[-actual_num_steps:], total_num_steps
 
+    # TODO: move to scheduler
+    def GetRemaining(self, timesteps, step_index):
+        return float(len(timesteps) - step_index - 1) / self._total_num_steps
+
     def OverwriteLatents(
         self,
         scheduler: Scheduler,
         latents,
         timesteps,
-        current_step: int,
+        step_index: int,
         force_overwrite: bool = False,
     ):
-        remaining = float(len(timesteps) - current_step - 1) / self._total_num_steps
-        return self._initializer.OverwriteLatents(
-            scheduler, latents, timesteps, current_step, remaining, force_overwrite
-        )[0]
+        remaining = self.GetRemaining(timesteps, step_index)
+        return self._initializers.OverwriteLatents(
+            scheduler, latents, timesteps, step_index, remaining, force_overwrite
+        )
 
 
 class Layer(BaseLayer):
@@ -1191,21 +1413,16 @@ class Layer(BaseLayer):
         self,
         prompt: Optional[PromptType] = None,
         negative_prompt: Optional[PromptType] = None,
-        cfg_scale: float = 7.5,
+        cfg_scale: float = 4.0,  # follows https://huggingface.co/stabilityai/stable-diffusion-2
         mask_by: MaskType = 1.0,
+        strength: StrengthType = None,
         is_distinct: bool = False,  # False: common layer, True: distinct layer
-        skip_until: float = 0.0,
         disabled: bool = False,
     ):
         super().__init__(prompt, negative_prompt, cfg_scale)
-        if isinstance(mask_by, LatentMask):
-            self._mask = mask_by
-        else:
-            self._mask = LatentMask(mask_by)
+        self._mask = LatentMask.CreateIfNeeded(mask_by)
+        self._strength = StrengthList(strength, is_increasing=True)
         self._is_distinct = is_distinct
-        if (skip_until < 0.0) or (1.0 < skip_until):
-            raise ValueError(f"skip_until must be between 0 and 1. actual {skip_until}")
-        self._skip_until = skip_until
         self.disabled = disabled
 
     def IsDistinct(self):
@@ -1221,10 +1438,15 @@ class Layer(BaseLayer):
         super()._Initialize(prompts)
         self._mask.Initialize(size, image_model, target)
 
-    def Merge(self, other, mine, progress):
-        if progress <= self._skip_until:
-            return other
-        return self._mask.Merge(black=other, white=mine)
+    def Merge(self, other, mine, remaining: float):
+        return self._strength.Merge(
+            mask=self._mask, other=other, mine=mine, remaining=remaining
+        )
+
+    def UnionMask(self, other_mask, remaining: float):
+        return self._strength.UnionMask(
+            other_mask=other_mask, my_mask=self._mask, remaining=remaining
+        )
 
 
 #
@@ -1309,8 +1531,8 @@ class LayeredDiffusionPipeline:
     def __call__(
         self,
         num_steps: int,
-        initialize: Initializer,
-        layers: Union[Layer, List[Layer]],
+        initialize: Optional[Union[Initializer, List[Initializer]]],
+        iterate: Union[Layer, List[Layer]],
         size: Optional[Tuple[int, int]] = None,
         default_encoding: Optional[StandardEncoding] = None,
         use_rmm: bool = True,  # rmm = Residual Merge Method
@@ -1321,16 +1543,18 @@ class LayeredDiffusionPipeline:
         self._ResetGenerator(rand_seed)
 
         if num_steps <= 0:
-            raise ValueError(f"num_steps must be > 0. actual: {num_steps}")
+            raise ValueError(f"`num_steps` must be > 0. actual: {num_steps}")
         if not default_encoding:
             default_encoding = ShiftEncoding()
-        if not layers:
-            raise ValueError("layers should contain at least 1 layer.")
-        elif not isinstance(layers, list):
-            layers = [layers]
+        if not iterate:
+            raise ValueError("`iterate` should contain at least 1 layer.")
+        elif not isinstance(iterate, list):
+            layers = [iterate]
+        else:
+            layers = iterate
         layers = [l for l in layers if not l.disabled]
         if not layers:
-            raise ValueError("layers should contain at least 1 enabled layer.")
+            raise ValueError("`iterate` should contain at least 1 enabled layer.")
 
         # Anything v3.0's VAE has a degradation problem in its encoder.
         # Multiplying the adjustment factor of 1.25 to the encoder output mitigates
@@ -1353,10 +1577,12 @@ class LayeredDiffusionPipeline:
             mm.Initialize(self.image_model, num_steps, size, self.pipe, eta)
 
             for i, ts in enumerate(self.pipe.progress_bar(mm.timesteps)):
+                # TODO: deprecate `progress`
                 progress = float(i + 1) / len(mm.timesteps)
-                Debug(3, f"progress: {progress:.2f} <= {i + 1} / {len(mm.timesteps)}")
+                remaining = bglayer.GetRemaining(mm.timesteps, i)
+                Debug(4, f"progress: {progress:.2f} <= {i + 1} / {len(mm.timesteps)}")
 
-                mm.Step(i, ts, progress)
+                mm.Step(i, ts, progress, remaining)
 
                 # TODO: implement residual inspection
                 # latents_debug = self.scheduler.InspectLatents(
@@ -1387,7 +1613,7 @@ class LayeredDiffusionPipeline:
             self.scheduler.PrepareExtraStepKwargs(pipe, eta)
             self.timesteps = timesteps
 
-        def Step(self, i, ts, progress):
+        def Step(self, i, ts, progress, remaining):
             latents_for_prompts = [self.latents] * len(self.prompts)
 
             residuals_for_layers = self.UNet(latents_for_prompts, ts, progress)
@@ -1400,7 +1626,7 @@ class LayeredDiffusionPipeline:
                 self.scheduler, next_latents, self.timesteps, i, force_overwrite=True
             )
             for layer, latents in zip(self.layers, latents_for_layers[1:]):
-                next_latents = layer.Merge(next_latents, latents, progress)
+                next_latents = layer.Merge(next_latents, latents, remaining)
             next_latents = self.bglayer.OverwriteLatents(  # conditioned by strength
                 self.scheduler, next_latents, self.timesteps, i
             )
@@ -1438,19 +1664,19 @@ class LayeredDiffusionPipeline:
             super().Initialize(image_model, num_steps, size, pipe, eta)
             self.rmm_latents = [self.latents] * self.num_rmm_latents
 
-        def Step(self, i, ts, progress):
+        def Step(self, i, ts, progress, remaining):
             latents_for_prompts = [None] * len(self.prompts)
             for layer, k, rmm_index in self.rmm_layers:
                 l = self.rmm_latents[rmm_index]
                 for m in layer._indices:
                     latents_for_prompts[m] = l
             for k, l in enumerate(latents_for_prompts):
-                if l == None:
+                if l is None:
                     raise ValueError(f"unexpected error: missing latents for index {k}")
 
             residuals_for_layers = self.UNet(latents_for_prompts, ts, progress)
 
-            latents, rmm_latents = self.RMM(residuals_for_layers, i, ts, progress)
+            latents, rmm_latents = self.RMM(residuals_for_layers, i, ts, remaining)
             self.latents = latents
             self.rmm_latents = rmm_latents
 
@@ -1470,7 +1696,7 @@ class LayeredDiffusionPipeline:
                 ),
             )
 
-        def RMM(self, residuals_for_layers, i, ts, progress):
+        def RMM(self, residuals_for_layers, i, ts, remaining):
             residuals_for_bg = residuals_for_layers[0]
             residuals_for_rmm = [residuals_for_bg] * self.num_rmm_latents
             residuals_for_all = residuals_for_bg
@@ -1478,28 +1704,28 @@ class LayeredDiffusionPipeline:
                 residuals_for_all = layer.Merge(
                     residuals_for_all,
                     residuals_for_layers[k],
-                    progress,
+                    remaining,
                 )
                 for m in range(self.num_rmm_latents):
                     if rmm_index in (0, m):
                         residuals_for_rmm[m] = layer.Merge(
                             residuals_for_rmm[m],
                             residuals_for_layers[k],
-                            progress,
+                            remaining,
                         )
             latents_for_rmm = self.scheduler.Step(
                 [residuals_for_bg, residuals_for_all] + residuals_for_rmm,
                 ts,
                 [self.rmm_latents[0], self.latents] + self.rmm_latents,
             )
-            latents = self.SynthesizeLatents(latents_for_rmm, -1, i, progress)
+            latents = self.SynthesizeLatents(latents_for_rmm, -1, i, remaining)
             rmm_latents = [
-                self.SynthesizeLatents(latents_for_rmm, m, i, progress)
+                self.SynthesizeLatents(latents_for_rmm, m, i, remaining)
                 for m in range(self.num_rmm_latents)
             ]
             return latents, rmm_latents
 
-        def SynthesizeLatents(self, latents_for_rmm, rmm_index, i, progress):
+        def SynthesizeLatents(self, latents_for_rmm, rmm_index, i, remaining):
             next_latents = latents_for_rmm[0]
             next_latents = self.bglayer.OverwriteLatents(  # unconditionally
                 self.scheduler,
@@ -1511,7 +1737,7 @@ class LayeredDiffusionPipeline:
             next_latents = self.UnionLayerMask(
                 self.rmm_layers,
                 rmm_index,
-                progress,
+                remaining,
                 black=next_latents,
                 white=latents_for_rmm[rmm_index + 2],
             )
@@ -1520,14 +1746,11 @@ class LayeredDiffusionPipeline:
             )
             return next_latents
 
-        # TODO: refactor
-        def UnionLayerMask(self, rmm_layers, m, progress, black, white):
-            Debug(4, f"UnionLayerMask: latents {m}, progress {progress:.2f}")
+        def UnionLayerMask(self, rmm_layers, m, remaining, black, white):
+            Debug(4, f"UnionLayerMask: latents {m}, remaining {remaining:.2f}")
             mask = 1.0
             for layer, i, rmm_index in rmm_layers[1:]:
-                if progress <= layer._skip_until:
-                    continue
                 if (m < 0) or (rmm_index in (0, m)):
                     Debug(4, f"Add layer mask {i}, rmm_index {rmm_index}")
-                    mask *= layer._mask._mask
-            return (black * mask) + (white * (1.0 - mask))
+                    mask = layer.UnionMask(other_mask=mask, remaining=remaining)
+            return LatentMask.ApplyMask(mask, black=black, white=white)
