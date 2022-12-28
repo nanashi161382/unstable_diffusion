@@ -17,14 +17,7 @@ The Layered Diffusion Pipeline can perform the same tasks as the original Stable
 First, to use the library, you should put the python file in your current directory and then import like this.
 
 ```python
-from pipeline_layered_diffusion import (
-    StandardEncoding, ShiftEncoding,
-    Randomly, ByLatents, ByImage, ByBothOf,
-    ComboOf, ScaledMask, UnionMask, IntersectMask,
-    SetDebugLevel, OpenImage,
-    Layer, LayeredDiffusionPipeline,
-    ImageModel, TextModel, SharedTarget,
-)
+from pipeline_layered_diffusion import *
 ```
 
 You can import the library in Google Colab like this.
@@ -34,14 +27,7 @@ You can import the library in Google Colab like this.
 use_xformers = False
 # Original code: https://github.com/nanashi161382/unstable_diffusion/blob/main/pipeline_layered_diffusion.py
 !wget 'https://raw.githubusercontent.com/nanashi161382/unstable_diffusion/main/pipeline_layered_diffusion.py'
-from pipeline_layered_diffusion import (
-    StandardEncoding, ShiftEncoding,
-    Randomly, ByLatents, ByImage, ByBothOf,
-    ComboOf, ScaledMask, UnionMask, IntersectMask,
-    SetDebugLevel, OpenImage,
-    Layer, LayeredDiffusionPipeline,
-    ImageModel, TextModel, SharedTarget,
-)
+from pipeline_layered_diffusion import *
 ```
 
 If you want to enable xformers memory efficient attention, you can run this instead.
@@ -54,14 +40,7 @@ If you want to enable xformers memory efficient attention, you can run this inst
 use_xformers = True
 # Original code: https://github.com/nanashi161382/unstable_diffusion/blob/main/pipeline_layered_diffusion.py
 !wget 'https://raw.githubusercontent.com/nanashi161382/unstable_diffusion/main/pipeline_layered_diffusion.py'
-from pipeline_layered_diffusion import (
-    StandardEncoding, ShiftEncoding,
-    Randomly, ByLatents, ByImage, ByBothOf,
-    ComboOf, ScaledMask, UnionMask, IntersectMask,
-    SetDebugLevel, OpenImage,
-    Layer, LayeredDiffusionPipeline,
-    ImageModel, TextModel, SharedTarget,
-)
+from pipeline_layered_diffusion import *
 ```
 
 Then initialize the pipeline as follows.
@@ -80,9 +59,9 @@ For text to image, you can go like this.
 image_size = (512, 512)  # width, height
 image = pipe(
     num_steps=30,
-    initialize=Randomly(),
     size=image_size,
-    layers=Layer(
+    initialize=Randomly(),
+    iterate=Layer(
         prompt="photo of orange pomeranian dog running in the park >>> cute face, fluffy",
         negative_prompt="bad quality, blur",
         cfg_scale=4.0
@@ -98,12 +77,12 @@ For image to image, here is what you need.
 image_size = (512, 512)  # width, height
 image = pipe(
     num_steps=30,
+    size=image_size,
     initialize=ByImage(
         image="init_image.png",
         strength=0.7,
     ),
-    size=image_size,
-    layers=Layer(
+    iterate=Layer(
         prompt="photo of orange pomeranian dog running in the park >>> cute face, fluffy",
         negative_prompt="bad quality, blur",
         cfg_scale=4.0
@@ -121,12 +100,12 @@ Finally, this is the code for legacy inpainting.
 image_size = (512, 512)  # width, height
 image = pipe(
     num_steps=30,
+    size=image_size,
     initialize=ByImage(
         image="init_image.png",
         strength=0.95,
     ),
-    size=image_size,
-    layers=Layer(
+    iterate=Layer(
         prompt="photo of orange tabby norwegian forest cat >>> cute face, fluffy",
         negative_prompt="bad quality, blur",
         cfg_scale=4.0
@@ -156,10 +135,10 @@ To make it work as the original stable diffusion pipeline, you should just add `
 image_size = (512, 512)  # width, height
 image = pipe(
     num_steps=30,
-    initialize=Randomly(),
     size=image_size,
     default_encoding=StandardEncoding(),
-    layers=Layer(
+    initialize=Randomly(),
+    iterate=Layer(
         prompt="black dog",
         negative_prompt="white cat",
         cfg_scale=7.5,
@@ -180,12 +159,12 @@ The inpainting method repaints part of the original image with a single set of a
 image_size = (512, 512)  # width, height
 image = pipe(
     num_steps=30,
+    size=image_size,
     initialize=ByImage(
         image="init_image.png",
         strength=0.9,
     ),
-    size=image_size,
-    layers=[
+    iterate=[
       Layer(
         prompt="orange puppy sitting on sofa",
         negative_prompt="bad quality",
@@ -211,12 +190,12 @@ This usually works, but sometimes different layers may affect each other especia
 image_size = (512, 512)  # width, height
 image = pipe(
     num_steps=30,
+    size=image_size,
     initialize=ByImage(
         image="init_image.png",
         strength=0.9,
     ),
-    size=image_size,
-    layers=[
+    iterate=[
       Layer(
         prompt="orange puppy sitting on sofa",
         negative_prompt="bad quality",
@@ -246,9 +225,9 @@ Layers also enables us to use different prompts for different part of the image,
 image_size = (512, 512)  # width, height
 image = pipe(
     num_steps=30,
-    initialize=Randomly(),
     size=image_size,
-    layers=[
+    initialize=Randomly(),
+    iterate=[
       Layer(
         prompt="photo of >>> green grass field, blue sky, mountain on horizon",
         negative_prompt="blur",
@@ -281,12 +260,12 @@ When you want to apply lower strength to the background with a different prompt,
 image_size = (512, 512)  # width, height
 image = pipe(
     num_steps=30,
+    size=image_size,
     initialize=ByImage(
         image="init_image.png",
         strength=0.8,
     ),
-    size=image_size,
-    layers=[
+    iterate=[
         Layer(
             prompt="green grass, blue sky",
             negative_prompt="bad quality, brown dirt, white cloud, red surface",
