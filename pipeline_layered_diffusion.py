@@ -45,7 +45,7 @@ def Debug(level: int, title: str, obj=None):
     if ShouldDebug(level):
         if title:
             print(title)
-        if obj:
+        if obj is not None:
             display(obj)
 
 
@@ -339,7 +339,8 @@ class LatentMask:
         inverted_mask *= level
         return self.ApplyInvertedMask(inverted_mask, black=black, white=white)
 
-    def Union(self, other, level: float = 1.0):
+    # TODO: consider integrating with UnionMask() below.
+    def UnionWithLevel(self, other, level: float = 1.0):
         my_inverted_mask = level * (1.0 - self._mask)  # white = 1.0 & black = 0.0
         union_mask = other * (1.0 - my_inverted_mask)  # white = 0.0 & black = 1.0
         return union_mask
@@ -390,7 +391,7 @@ def UnionMask(masks: List[MaskType]):
         mask = 1.0
         for m in masks:
             mask *= 1.0 - m
-        return 1.0 - masks
+        return 1.0 - mask
 
     return ComboOf(masks, transformed_by=transform)
 
@@ -400,7 +401,7 @@ def IntersectMask(masks: List[MaskType]):
         mask = 1.0
         for m in masks:
             mask *= m
-        return masks
+        return mask
 
     return ComboOf(masks, transformed_by=transform)
 
@@ -494,7 +495,7 @@ class StrengthList:
 
     def UnionMask(self, other_mask, my_mask, remaining: float):
         level = self.GetCurrentLevel(remaining)
-        return my_mask.Union(other_mask, level=level)
+        return my_mask.UnionWithLevel(other_mask, level=level)
 
     def GetCurrentLevel(self, remaining: float) -> float:
         for s in self.strengths:
@@ -1119,8 +1120,14 @@ class ByImage(Initializer):
                 Conceptually, indicates how much to transform the reference `image`. Must be between 0 and 1.
                 `image` will be used as a starting point, adding more noise to it the larger the `strength`. The number of denoising steps depends on the amount of noise initially added. When `strength` is 1, added noise will be maximum and the denoising process will run for the full number of iterations specified in `num_inference_steps`. A value of 1, therefore, essentially ignores `image`.
         """
-        super().__init__(mask_by, strength)
+        if isinstance(image, str):
+            image, mask = OpenImage(image)
+            if not image:
+                raise ValueError(f"image must not be empty.")
+            if mask:
+                mask_by = IntersectMask([mask_by, mask])
         self._image = image
+        super().__init__(mask_by, strength)
 
     def InitializeLatents(
         self,
@@ -1137,8 +1144,6 @@ class ByImage(Initializer):
         generator = scheduler.generator()
 
         image = self._image
-        if isinstance(image, str):
-            image = OpenImageWithBackground(image, "white")  # TODO: enable alpha mask
         if size and (image.size != size):
             Debug(1, f"Resize image from {image.size} to {size}.")
             image = image.resize(size, resample=PIL.Image.LANCZOS)
