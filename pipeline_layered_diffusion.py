@@ -421,24 +421,24 @@ def IntersectMask(masks: List[MaskType]):
 
 
 class Strength:
-    def __init__(self, strength: float, level: float):
-        self.strength = strength
+    def __init__(self, remaining: float, level: float):
+        self.remaining = remaining
         self.level = level
 
     def __str__(self):
-        return f"{self.strength:.2f} (level={self.level:.2f})"
+        return f"{self.remaining:.2f} (level={self.level:.2f})"
 
 
-def strg(strength: float, level: float) -> Strength:
-    return Strength(strength, level)
+def strg(remaining: float, level: float) -> Strength:
+    return Strength(remaining, level)
 
 
 StrengthType = Optional[
     Union[
         float,  # strength
-        Strength,  # Strength(strength, mask level)
+        Strength,  # Strength(remaining, level)
         List[float],  # list of strength
-        List[Strength],  # list of Strength(strength, mask level)
+        List[Strength],  # list of Strength(remaining, level)
     ]
 ]
 
@@ -476,13 +476,13 @@ class StrengthList:
                 Strength(s, level=self.GetLevel(i / strg_len))
                 for i, s in enumerate(strengths)
             ]
-        if any(a.strength <= b.strength for a, b in zip(strengths, strengths[1:])):
+        if any(a.remaining <= b.remaining for a, b in zip(strengths, strengths[1:])):
             raise ValueError(f"Strengths must be sorted in the decreasing order.")
-        if (strengths[0].strength > 1.0) or (strengths[-1].strength < 0.0):
+        if (strengths[0].remaining > 1.0) or (strengths[-1].remaining < 0.0):
             Debug(
                 0,
                 f"Strength is effective between 0.0 and 1.0. "
-                f"actual: from {strengths[0].strength} to {strengths[-1].strength}",
+                f"actual: from {strengths[0].remaining} to {strengths[-1].remaining}",
             )
         if any((a.level < 0.0) or (a.level > 1.0) for a in strengths):
             raise ValueError(f"Strength's level must be between 0.0 and 1.0.")
@@ -499,7 +499,7 @@ class StrengthList:
 
     def GetCurrentLevel(self, remaining: float) -> float:
         for s in self.strengths:
-            if remaining > s.strength:
+            if remaining > s.remaining:
                 Debug(4, f"remaining {remaining:.2f}, strength {s}")
                 return s.level
         level = self.GetLevel(1.0)
@@ -1190,8 +1190,8 @@ class InitializerList:
         reverse_index = -1
         for i, init in enumerate(reversed(initializers)):
             strg = init.GetStrength().First()
-            if init.IsWholeImage() and strg.strength > max_strength:
-                max_strength = strg.strength
+            if init.IsWholeImage() and strg.remaining > max_strength:
+                max_strength = strg.remaining
                 its_level = strg.level
                 reverse_index = i
         if (reverse_index < 0) or (its_level < 1.0):
