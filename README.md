@@ -270,7 +270,7 @@ image = pipe(
             prompt="green grass, blue sky",
             negative_prompt="bad quality, brown dirt, white cloud, red surface",
             cfg_scale=8.0,
-            skip_until=0.6
+            strength=0.32
         ),
         Layer(
             prompt="white persian cat >>> round face, blue eyes, full body",
@@ -283,6 +283,6 @@ image = pipe(
 display(image)
 ```
 
-This example applies the strength 0.32 (= 0.8 * (1.0 - `skip_until`)) to the background (green field, blue sky) while applying the strength 0.8 to the foreground (white persian cat).
+This example applies the strength 0.32 to the background (green field, blue sky) while applying the strength 0.8 to the foreground (white persian cat).
 
 ![two strengths example](https://user-images.githubusercontent.com/118838049/209082049-651265f2-b94c-4fd2-8ed8-7f8814b9d730.png)
