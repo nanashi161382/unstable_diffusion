@@ -1430,7 +1430,6 @@ class DecomposedResidual:
         remaining: float,
         for_cond: bool,
     ):
-        Debug(2, f"AddEither(for_cond={for_cond}, remaining={remaining}) is called.")
         if mine.with_uncond:
             raise ValueError(
                 f"AddEither() works only for DecomposedResidual without uncond."
@@ -1444,9 +1443,7 @@ class DecomposedResidual:
                 remaining=remaining,
             )
 
-        Debug(2, "mine.cond", mine.cond)
-
-        dr = DecomposedResidual(
+        return DecomposedResidual(
             cond=_add(
                 self.cond,
                 (mine.cond if for_cond else self.cond / self.cond_scale),
@@ -1459,11 +1456,6 @@ class DecomposedResidual:
             uncond_scale=_add(self.uncond_scale, 1.0),
             with_uncond=self.with_uncond,
         )
-
-        Debug(2, "dr.cond", dr.cond)
-        Debug(2, "dr.uncond", dr.uncond)
-
-        return dr
 
     def MergeEither(
         self,
