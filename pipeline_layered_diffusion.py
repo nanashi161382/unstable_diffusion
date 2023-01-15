@@ -144,6 +144,160 @@ def OpenImageWithBackground(filename, background="white"):
 
 
 #
+# -- RangeMap --
+#
+class RangeMap:
+    """
+    RangeMap is a class that assigns a value to each consecutive time segment.
+    The value can be anything including a number and a string.
+    The time segment is a range of the number between 1.0 and 0.0 in the decreasing order.
+    This class is used for `strength`, `cfg_scale`, `prompt` and `negative_prompt`.
+    Examples:
+      * strength = using(0.0, until=0.8).then(0.6, until=0.5).lastly(1.0)
+      * strength = using(0.6, after=0.8, until=0.5)
+      * strength = 0.8
+      * prompt = using("1girl", until=0.8).then("1girl, lowres")
+      * prompt = using(("lowres", StandardEncoding), after=0.8)
+      * prompt = "1girl"
+    """
+
+    def __init__(self, value, until):
+        self._start = None
+        self._end = None
+        if (value is None) and (until is None):
+            self._segments = []
+        else:
+            self._segments = [(value, until)]
+
+    def then(self, value, until=None):
+        if value is None:
+            raise ValueError(f"value must not be None.")
+        self._segments.append((value, until))
+        return self
+
+    def lastly(self, value):
+        return self.then(value)
+
+    def Finalize(self, start, end, value_finalizer=None):
+        if (start is None) or (end is None):
+            raise ValueError(f"Finalize requires non-null `start` and `end` arguments.")
+        self._start = start
+        self._end = end
+        if value_finalizer:
+            self._segments = [
+                (None if value is None else value_finalizer(value), until)
+                for value, until in self._segments
+            ]
+        return self
+
+    def Get(self, remaining, debug_label):
+        for k, (value, until) in enumerate(self._segments):
+            if (until is None) or (remaining > until):
+                if value is None:
+                    Debug(
+                        4,
+                        f"RangeMap at {remaining:.2f} for {debug_label}: start",
+                        self._start if ShouldDebug(5) else None,
+                    )
+                    return self._start
+                else:
+                    Debug(
+                        4,
+                        f"RangeMap at {remaining:.2f} for {debug_label}: {k}",
+                        value if ShouldDebug(5) else None,
+                    )
+                    return value
+        Debug(
+            4,
+            f"RangeMap at {remaining:.2f} for {debug_label}: end",
+            self._end if ShouldDebug(5) else None,
+        )
+        return self._end
+
+    def GetFirst(self):
+        if len(self._segments) == 0:
+            if self._end == self._start:
+                return self._end, 0.0
+            else:
+                return self._end, 1.0
+        value, until = self._segments[0]
+        if (value is None) or (value == self._start):
+            if len(self._segments) == 1:
+                return self._end, until
+            else:
+                return self._segments[1][0], until
+        else:
+            return value, 1.0
+
+    def IsConstant(self):
+        if len(self._segments) == 0:
+            return True, self._end
+        if len(self._segments) > 1:
+            return False, None
+        value, until = self._segments[0]
+        if (until is None) or (until < 0.0):
+            return True, self._start if value is None else value
+        elif until >= 1.0:
+            return True, self._end
+        return False, None
+
+    def IsFinalized(self):
+        return self._start is not None
+
+    def __str__(self):
+        if self.IsFinalized():
+            return f"RangeMap: start = {self._start}, end = {self._end}, segments = {str(self._segments)}"
+        else:
+            return f"RangeMap: not finalized, segments = {str(self._segments)}"
+
+    def _repr_pretty_(self, p, cycle):
+        p.text(str(self))
+
+    @classmethod
+    def CreateFromSegments(cls, segments):
+        if not segments:
+            return cls(None, None)
+
+        rm = cls(*segments[0])
+        for s in segments[1:]:
+            rm.then(*s)
+        return rm
+
+    @classmethod
+    def CreateWithUntil(cls, until):
+        return cls(None, until=float(until))
+
+    @classmethod
+    def CreateWithValue(cls, value):
+        return cls(value, until=None)
+
+    @classmethod
+    def CreateAndFinalize(cls, arg, is_value, start, end, value_finalizer=None):
+        if arg is None:
+            rm = cls(None, None)
+        elif isinstance(arg, list):
+            rm = cls.CreateFromSegments(arg)
+        elif isinstance(arg, cls):
+            rm = arg
+        elif is_value:
+            rm = cls.CreateWithValue(arg)
+        else:
+            rm = cls.CreateWithUntil(arg)
+        Debug(3, "Finalize RangeMap for input:", arg)
+        rm.Finalize(start, end, value_finalizer)
+        return rm
+
+
+def using(value, after=None, until=None):
+    if value is None:
+        raise ValueError(f"value must not be None.")
+    elif after is None:
+        return RangeMap(value, until=until)
+    else:
+        return RangeMap(None, until=after).then(value, until=until)
+
+
+#
 # -- Share the computation target throughout the pipeline. --
 #
 class SharedTarget:
@@ -407,107 +561,41 @@ def IntersectMask(masks: List[MaskType]):
 
 
 #
-# -- StrengthList --
+# -- GeneralizedStrength --
 #
-# StrengthList is a list of strength with LatentMask levels.
-# The `strength` should be formatted one of following example patterns:
-#  * strength = None
-#  * strength = 0.9
-#  * strength = strg(0.9, level=0.5)
-#  * strength = [0.9, 0.7]
-#  * strength = [strg(0.9, level=0.8), strg(0.7, level=0.4)]
-# If `level` is not specified, the list of strengths are interpreted
-# as a decreasing manner for initializers and as an increasing manner for layers.
 
 
-class Strength:
-    def __init__(self, remaining: float, level: float):
-        self.remaining = remaining
-        self.level = level
-
-    def __str__(self):
-        return f"{self.remaining:.2f} (level={self.level:.2f})"
+StrengthType = Optional[Union[float, RangeMap]]
 
 
-def strg(remaining: float, level: float) -> Strength:
-    return Strength(remaining, level)
-
-
-StrengthType = Optional[
-    Union[
-        float,  # strength
-        Strength,  # Strength(remaining, level)
-        List[float],  # list of strength
-        List[Strength],  # list of Strength(remaining, level)
-    ]
-]
-
-
-class StrengthList:
-    def GetLevel(self, raw_level: float):
-        # raw_level starts from 0.0 to 1.0.
-        if self.is_increasing:
-            return raw_level
-        else:
-            return 1.0 - raw_level
-
-    def __init__(self, strengths: StrengthType, is_increasing: bool):
+class GeneralizedStrength:
+    def __init__(self, strength: StrengthType, is_increasing: bool, debug_label: str):
         self.is_increasing = is_increasing
-        if strengths is None:
-            self.strengths = [Strength(1.0, level=self.GetLevel(0.0))]
-            Debug(3, "StrengthList:", self.strengths)
-            return
-        elif isinstance(strengths, list):
-            if not strengths:
-                self.strengths = [Strength(1.0, level=self.GetLevel(0.0))]
-                Debug(3, "StrengthList:", self.strengths)
-                return
+        if is_increasing:
+            start, end = 0.0, 1.0
         else:
-            strengths = [strengths]
-
-        is_with_level = [isinstance(s, Strength) for s in strengths]
-        if any(a ^ b for a, b in zip(is_with_level, is_with_level[1:])):
-            raise ValueError(
-                f"Elements of strengths must be all with level or all without level."
-            )
-        if not is_with_level[0]:
-            strg_len = float(len(strengths))
-            strengths = [
-                Strength(s, level=self.GetLevel(i / strg_len))
-                for i, s in enumerate(strengths)
-            ]
-        if any(a.remaining <= b.remaining for a, b in zip(strengths, strengths[1:])):
-            raise ValueError(f"Strengths must be sorted in the decreasing order.")
-        if (strengths[0].remaining > 1.0) or (strengths[-1].remaining < 0.0):
-            Debug(
-                0,
-                f"Strength is effective between 0.0 and 1.0. "
-                f"actual: from {strengths[0].remaining} to {strengths[-1].remaining}",
-            )
-        if any((a.level < 0.0) or (a.level > 1.0) for a in strengths):
-            raise ValueError(f"Strength's level must be between 0.0 and 1.0.")
-        Debug(3, "StrengthList:", strengths)
-        self.strengths = strengths
+            start, end = 1.0, 0.0
+        self._strength = RangeMap.CreateAndFinalize(strength, False, start, end)
+        self._debug_label = f"GeneralizedStrength[{debug_label}]"
+        Debug(3, f"{self._debug_label}: {str(self._strength)}")
 
     def Merge(self, mask: LatentMask, other, mine, remaining: float):
         level = self.GetCurrentLevel(remaining)
         return mask.Merge(black=other, white=mine, level=level)
+
+    def Add(self, mask: LatentMask, other, mine, remaining: float):
+        level = self.GetCurrentLevel(remaining)
+        return other + mask.Merge(black=0.0, white=mine, level=level)
 
     def UnionMask(self, other_mask, my_mask, remaining: float):
         level = self.GetCurrentLevel(remaining)
         return my_mask.UnionWithLevel(other_mask, level=level)
 
     def GetCurrentLevel(self, remaining: float) -> float:
-        for s in self.strengths:
-            if remaining > s.remaining:
-                Debug(4, f"remaining {remaining:.2f}, strength {s}")
-                return s.level
-        level = self.GetLevel(1.0)
-        Debug(4, f"remaining {remaining:.2f}, level={level}")
-        return level
+        return self._strength.Get(remaining, debug_label=self._debug_label)
 
     def First(self):
-        return self.strengths[0]
+        return self._strength.GetFirst()
 
 
 #
@@ -693,7 +781,7 @@ class ShiftEncoding(StandardEncoding):
         weights = (
             np.convolve(np.array(weights) - 1.0, self._convolve, mode="full") + 1.0
         )
-        Debug(3, "", weights)
+        Debug(3, "weights:", weights)
         if len(weights) >= text_model.max_length():
             weights = weights[: text_model.max_length()]
         weights = np.concatenate(
@@ -716,7 +804,7 @@ class ShiftEncoding(StandardEncoding):
                 chunks = prompt.Shift(i, self._rotate)
                 shifted_text = " ".join(chunks.texts)
                 weights = self.GetWeights(text_model, chunks)
-                Debug(4, shifted_text)
+                Debug(4, f"shifted_text:", shifted_text)
 
                 embeddings = text_model.EncodeText(shifted_text, False)
                 unweighted_mean = (
@@ -743,12 +831,13 @@ class ShiftEncoding(StandardEncoding):
 # A prompt can be
 #  * str  --  a prompt text
 #  * (str, Encoding)  --  a prompt text & its encoding method
-#  * [(float, str) or (float, str, Encoding)]  --  a list of prompt texts & their encoding methods
-#    combined with the ratio of the starting position against the total steps.
-PromptType = Union[
-    str,
-    Tuple[str, StandardEncoding],
-    List[Union[Tuple[float, str], Tuple[float, str, StandardEncoding]]],
+#  * following the RangeMap format.
+PromptType = Optional[
+    Union[
+        str,
+        Tuple[str, StandardEncoding],
+        RangeMap,
+    ]
 ]
 
 
@@ -756,24 +845,11 @@ PromptType = Union[
 # -- Text embedding utility to combine multiple embeddings --
 #
 class TextEmbeddings:
-    def __init__(self, text_embedding):
-        self._text_embeddings = [text_embedding]
-        self._expiry = [100]
+    def __init__(self, text_embeddings: RangeMap):
+        self._text_embeddings = text_embeddings
 
-    def AddNext(self, start: float, next_embedding):
-        if (start <= 0.0) or (start > 1.0):
-            raise ValueError(f"`start` must be between 0 and 1.")
-        self._expiry[-1] = start
-        self._expiry.append(100)
-        self._text_embeddings.append(next_embedding)
-
-    def Get(self, progress: float):
-        for k, e in enumerate(self._expiry):
-            if progress < e:
-                return self._text_embeddings[k]
-        Debug(0, f"TextEmbeddings: unexpected progress: {progress:.2f}")
-        Debug(0, "returning the last text embeddings.")
-        return self._text_embeddings[-1]
+    def GetEmbedding(self, remaining: float):
+        return self._text_embeddings.Get(remaining, debug_label="TextEmbeddings")
 
     @classmethod
     def Create(
@@ -782,36 +858,21 @@ class TextEmbeddings:
         text_model: TextModel,
         default_encoding: StandardEncoding,
     ):
-        if not input:
-            return cls(default_encoding.Encode(text_model, ""))
-        elif isinstance(input, str):
-            return cls(default_encoding.Encode(text_model, input))
-        elif isinstance(input, tuple):
-            return cls(input[1].Encode(text_model, input[0]))
-        elif not isinstance(input, list):
-            raise ValueError(
-                "input should be `str`, `(str, encoding)`, or a list of `(int, str)` and/or "
-                "`(int, str, encoding)`."
-            )
-        embeddings = None
-        for p in input:
-            if len(p) < 2:
-                raise ValueError("input should contain at least `start` and `prompt`.")
-            start = p[0]
-            prompt = p[1]
-            if len(p) > 2:
-                encoding = input[2]
+        def finalizer(arg):
+            if isinstance(arg, str):
+                return default_encoding.Encode(text_model, arg)
+            elif isinstance(arg, tuple):
+                return arg[1].Encode(text_model, arg[0])
             else:
-                encoding = default_encoding
-            if embeddings:
-                embeddings.AddNext(start, encoding.Encode(text_model, prompt))
-            else:
-                if start > 0.0:
-                    embeddings = cls(encoding.Encode(text_model, ""))
-                    embeddings.AddNext(start, encoding.Encode(text_model, prompt))
-                else:
-                    embeddings = cls(encoding.Encode(text_model, prompt))
-        return embeddings
+                return arg
+
+        default_embedding = default_encoding.Encode(text_model, "")
+        if input == "":
+            input = None
+        embeddings = RangeMap.CreateAndFinalize(
+            input, True, default_embedding, default_embedding, finalizer
+        )
+        return cls(embeddings)
 
 
 #
@@ -941,7 +1002,9 @@ class Scheduler:
 class Initializer:
     def __init__(self, mask_by: MaskType, strength: StrengthType):
         self.mask = LatentMask.CreateIfNeeded(mask_by)
-        self.strength = StrengthList(strength, is_increasing=False)
+        self.strength = GeneralizedStrength(
+            strength, is_increasing=False, debug_label="Initializer"
+        )
         self.is_whole_image = mask_by == 1.0
 
     def IsWholeImage(self):
@@ -1168,7 +1231,7 @@ class ByImage(Initializer):
             Debug(4, "Last step with keeping initial image.")
             return self._initial_latents, True
         # Otherwise add noise to the initial latents.
-        Debug(4, f"Add noise for step {step_index}.")
+        Debug(4, f"Add noise for step {step_index + 1}.")
         next_timestep = timesteps[step_index + 1 : step_index + 2]
         return (
             scheduler.Get().add_noise(
@@ -1189,10 +1252,10 @@ class InitializerList:
         its_level = 0.0
         reverse_index = -1
         for i, init in enumerate(reversed(initializers)):
-            strg = init.GetStrength().First()
-            if init.IsWholeImage() and strg.remaining > max_strength:
-                max_strength = strg.remaining
-                its_level = strg.level
+            value, until = init.GetStrength().First()
+            if init.IsWholeImage() and until > max_strength:
+                max_strength = until
+                its_level = value
                 reverse_index = i
         if (reverse_index < 0) or (its_level < 1.0):
             # no initializers, or none of them cover the whole image.
@@ -1282,17 +1345,19 @@ class Prompts:
         return len(self._prompts)
 
     def Add(self, prompt: PromptType) -> int:
-        Debug(3, "Add prompt.")
+        Debug(3, "Add prompt:", prompt)
         index = len(self._prompts)
         self._prompts.append(
             TextEmbeddings.Create(prompt, self._text_model, self._default_encoding)
         )
         return index
 
-    def PredictResiduals(self, scheduler, unet, latents, timestep, progress: float):
+    def PredictResiduals(self, scheduler, unet, latents, timestep, remaining: float):
         model_input = torch.cat(latents)
         model_input = scheduler.Get().scale_model_input(model_input, timestep)
-        text_embeddings = torch.cat([te.Get(progress) for te in self._prompts])
+        text_embeddings = torch.cat(
+            [te.GetEmbedding(remaining) for te in self._prompts]
+        )
         residuals = unet(
             model_input, timestep, encoder_hidden_states=text_embeddings
         ).sample
@@ -1302,27 +1367,193 @@ class Prompts:
 #
 # -- Layer --
 #
+class DecomposedResidual:
+    def __init__(self, cond, cond_scale, uncond, uncond_scale, with_uncond):
+        self.cond = cond
+        self.cond_scale = cond_scale
+        self.uncond = uncond
+        self.uncond_scale = uncond_scale
+        self.with_uncond = with_uncond
+
+    @classmethod
+    def Create(cls, cond, uncond, scale, is_zero_sum):
+        if is_zero_sum:
+            return DecomposedResidual(
+                cond * scale,
+                scale,
+                uncond * scale,
+                scale,
+                with_uncond=True,
+            )
+        else:
+            return DecomposedResidual(
+                cond * scale,
+                scale,
+                uncond * (scale - 1.0),
+                scale - 1.0,
+                with_uncond=True,
+            )
+
+    @classmethod
+    def CreateWithoutUncond(cls, cond):
+        return DecomposedResidual(cond, 1.0, 0.0, 0.0, with_uncond=False)
+
+    def Add(self, mine, strength: GeneralizedStrength, mask, remaining: float):
+        def _add(a, b):
+            return strength.Add(mask=mask, other=a, mine=b, remaining=remaining)
+
+        return DecomposedResidual(
+            cond=_add(self.cond, mine.cond),
+            cond_scale=_add(self.cond_scale, mine.cond_scale),
+            uncond=_add(self.uncond, mine.uncond),
+            uncond_scale=_add(self.uncond_scale, mine.uncond_scale),
+            with_uncond=self.with_uncond or mine.with_uncond,
+        )
+
+    def Merge(self, mine, strength: GeneralizedStrength, mask, remaining: float):
+        def _merge(a, b):
+            return strength.Merge(mask=mask, other=a, mine=b, remaining=remaining)
+
+        return DecomposedResidual(
+            cond=_merge(self.cond, mine.cond),
+            cond_scale=_merge(self.cond_scale, mine.cond_scale),
+            uncond=_merge(self.uncond, mine.uncond),
+            uncond_scale=_merge(self.uncond_scale, mine.uncond_scale),
+            with_uncond=self.with_uncond or mine.with_uncond,
+        )
+
+    def AddEither(
+        self,
+        mine,
+        strength: GeneralizedStrength,
+        mask,
+        remaining: float,
+        for_cond: bool,
+    ):
+        Debug(2, f"AddEither(for_cond={for_cond}, remaining={remaining}) is called.")
+        if mine.with_uncond:
+            raise ValueError(
+                f"AddEither() works only for DecomposedResidual without uncond."
+            )
+
+        def _add(other, my_cond):
+            return strength.Add(
+                mask=mask,
+                other=other,
+                mine=my_cond * self.cond_scale,
+                remaining=remaining,
+            )
+
+        Debug(2, "mine.cond", mine.cond)
+
+        dr = DecomposedResidual(
+            cond=_add(
+                self.cond,
+                (mine.cond if for_cond else self.cond / self.cond_scale),
+            ),
+            cond_scale=_add(self.cond_scale, 1.0),
+            uncond=_add(
+                self.uncond,
+                (self.uncond / self.uncond_scale if for_cond else mine.uncond),
+            ),
+            uncond_scale=_add(self.uncond_scale, 1.0),
+            with_uncond=self.with_uncond,
+        )
+
+        Debug(2, "dr.cond", dr.cond)
+        Debug(2, "dr.uncond", dr.uncond)
+
+        return dr
+
+    def MergeEither(
+        self,
+        mine,
+        strength: GeneralizedStrength,
+        mask,
+        remaining: float,
+        for_cond: bool,
+    ):
+        if mine.with_uncond:
+            raise ValueError(
+                f"MergeEither() works only for DecomposedResidual without uncond."
+            )
+
+        def _merge(other, scale):
+            return strength.Merge(
+                mask=mask,
+                other=other,
+                mine=mine.cond * scale,
+                remaining=remaining,
+            )
+
+        return DecomposedResidual(
+            cond=_merge(self.cond, self.cond_scale) if for_cond else self.cond,
+            cond_scale=self.cond_scale,
+            uncond=self.uncond if for_cond else _merge(self.uncond, self.uncond_scale),
+            uncond_scale=self.uncond_scale,
+            with_uncond=self.with_uncond,
+        )
+
+    def Compose(self):
+        if not self.with_uncond:
+            return self.cond
+        return self.cond - self.uncond
+
+
 class BaseLayer:
     def __init__(
         self,
         prompt: Optional[PromptType] = None,
         negative_prompt: Optional[PromptType] = None,
-        cfg_scale: float = 1.0,
+        cfg_scale: Union[float, RangeMap] = 1.0,
+        is_zero_sum: bool = False,
+        default_cfg_scale: float = 1.0,
     ):
         # The default image generation = no prompts, no cfg
-        if not prompt:
-            prompt = ""
         self._prompt = prompt
-        if not negative_prompt:
-            negative_prompt = ""
         self._negative_prompt = negative_prompt
-        if cfg_scale < 1.0:
-            raise ValueError(f"cfg_scale must be 1.0 or bigger: {cfg_scale}")
+        self._is_zero_sum = is_zero_sum
+
+        cfg_scale = RangeMap.CreateAndFinalize(
+            cfg_scale, True, default_cfg_scale, default_cfg_scale
+        )
         self._cfg_scale = cfg_scale
-        self._do_cfg = cfg_scale > 1.0
+
+        if is_zero_sum:
+            self._do_cfg = True
+            Debug(3, "CFG is disabled for a zero sum layer.")
+        else:
+            cfg_is_const, const_cfg_scale = cfg_scale.IsConstant()
+            cfg_scale_is_always_one = cfg_is_const and (const_cfg_scale == 1.0)
+            self._do_cfg = not cfg_scale_is_always_one
+            if not self._do_cfg:
+                Debug(3, "CFG is disabled for a layer whose cfg_scale is always one.")
+
+    def GetCfgScale(self, remaining):
+        cfg_scale = self._cfg_scale.Get(remaining, debug_label="CFG Scale")
+
+        if self.IsZeroSum():
+            if cfg_scale < 0.0:
+                raise ValueError(
+                    f"cfg_scale must be 0.0 or bigger for a zero sum layer: {cfg_scale}"
+                )
+            elif cfg_scale == 0.0:
+                Debug(4, f"Effectively ignore a zero sum layer if cfg_scale = 0.")
+        else:
+            if cfg_scale < 1.0:
+                raise ValueError(
+                    f"cfg_scale must be 1.0 or bigger for a normal layer: {cfg_scale}"
+                )
+            elif cfg_scale == 1.0:
+                Debug(4, f"Effectively ignore a normal layer if cfg_scale = 1.")
+
+        return cfg_scale
 
     def IsDistinct(self):
         return False
+
+    def IsZeroSum(self):
+        return self._is_zero_sum
 
     def _Initialize(self, prompts: Prompts):
         self._prompts = prompts
@@ -1330,12 +1561,26 @@ class BaseLayer:
         if self._do_cfg:
             self._indices.append(prompts.Add(self._negative_prompt))
 
-    def GetResidual(self, residuals):
+    def GetResidual(self, residuals, remaining, decomposed):
         residual_cond = residuals[self._indices[0]]
         if not self._do_cfg:
-            return residual_cond
+            if decomposed:
+                return DecomposedResidual.CreateWithoutUncond(residual_cond)
+            else:
+                return residual_cond
+
         residual_uncond = residuals[self._indices[1]]
-        residual = residual_uncond + self._cfg_scale * (residual_cond - residual_uncond)
+        if decomposed:
+            return DecomposedResidual.Create(
+                cond=residual_cond,
+                uncond=residual_uncond,
+                scale=self.GetCfgScale(remaining),
+                is_zero_sum=self.IsZeroSum(),
+            )
+
+        residual = self.GetCfgScale(remaining) * (residual_cond - residual_uncond)
+        if not self.IsZeroSum():
+            residual = residual_uncond + residual
         return residual
 
 
@@ -1362,6 +1607,7 @@ class BackgroundLayer(BaseLayer):
         prompts: Prompts,
         target: SharedTarget,
     ):
+        Debug(3, "Initialize BackgroundLayer.")
         super()._Initialize(prompts)
         max_strength = self._initializers.GetMaxStrength()
         # compute num_steps_to_request to match the effective number of iterations with num_steps.
@@ -1418,20 +1664,27 @@ class Layer(BaseLayer):
         self,
         prompt: Optional[PromptType] = None,
         negative_prompt: Optional[PromptType] = None,
-        cfg_scale: float = 4.0,  # follows https://huggingface.co/stabilityai/stable-diffusion-2
+        cfg_scale: Union[
+            float, RangeMap
+        ] = 4.0,  # follows https://huggingface.co/stabilityai/stable-diffusion-2
         mask_by: MaskType = 1.0,
         strength: StrengthType = None,
         is_distinct: bool = False,  # False: common layer, True: distinct layer
         disabled: bool = False,
+        is_zero_sum: bool = False,  # False: normal layer, True: zero sum layer
     ):
-        super().__init__(prompt, negative_prompt, cfg_scale)
+        super().__init__(
+            prompt, negative_prompt, cfg_scale, is_zero_sum, default_cfg_scale=4.0
+        )
         self._mask = LatentMask.CreateIfNeeded(mask_by)
-        self._strength = StrengthList(strength, is_increasing=True)
+        self._strength = GeneralizedStrength(
+            strength, is_increasing=True, debug_label="Layer"
+        )
         self._is_distinct = is_distinct
         self.disabled = disabled
 
     def IsDistinct(self):
-        return bool(self._is_distinct)
+        return self._is_distinct
 
     def Initialize(
         self,
@@ -1440,13 +1693,81 @@ class Layer(BaseLayer):
         prompts: Prompts,
         target: SharedTarget,
     ):
+        Debug(3, "Initialize Layer.")
         super()._Initialize(prompts)
         self._mask.Initialize(size, image_model, target)
 
-    def Merge(self, other, mine, remaining: float):
-        return self._strength.Merge(
-            mask=self._mask, other=other, mine=mine, remaining=remaining
+    def Merge(self, other, mine, remaining: float, decomposed: bool = False):
+        if decomposed:
+            if self.IsZeroSum():
+                return other.Add(mine, self._strength, self._mask, remaining)
+            else:
+                return other.Merge(mine, self._strength, self._mask, remaining)
+
+        if self.IsZeroSum():
+            return self._strength.Add(
+                mask=self._mask, other=other, mine=mine, remaining=remaining
+            )
+        else:
+            return self._strength.Merge(
+                mask=self._mask, other=other, mine=mine, remaining=remaining
+            )
+
+    def UnionMask(self, other_mask, remaining: float):
+        return self._strength.UnionMask(
+            other_mask=other_mask, my_mask=self._mask, remaining=remaining
         )
+
+
+class SPLayer(BaseLayer):  # Single-Prompt Layer
+    def __init__(
+        self,
+        prompt: Optional[PromptType] = None,
+        mask_by: MaskType = 1.0,
+        strength: StrengthType = None,
+        for_negative: bool = False,
+        for_add: bool = False,
+        disabled: bool = False,
+    ):
+        super().__init__(prompt)
+        self._mask = LatentMask.CreateIfNeeded(mask_by)
+        self._strength = GeneralizedStrength(
+            strength, is_increasing=True, debug_label="SPLayer"
+        )
+        self._for_negative = for_negative
+        self._for_add = for_add
+        self.disabled = disabled
+
+    def Initialize(
+        self,
+        size: Optional[Tuple[int, int]],
+        image_model: ImageModel,
+        prompts: Prompts,
+        target: SharedTarget,
+    ):
+        Debug(3, "Initialize SPLayer.")
+        super()._Initialize(prompts)
+        self._mask.Initialize(size, image_model, target)
+
+    def Merge(self, other, mine, remaining: float, decomposed: bool = False):
+        if not decomposed:
+            raise NotImplementedError(f"SPLayer is only for DecomposedResidual.")
+        if self._for_add:
+            return other.AddEither(
+                mine,
+                self._strength,
+                self._mask,
+                remaining,
+                for_cond=(not self._for_negative),
+            )
+        else:
+            return other.MergeEither(
+                mine,
+                self._strength,
+                self._mask,
+                remaining,
+                for_cond=(not self._for_negative),
+            )
 
     def UnionMask(self, other_mask, remaining: float):
         return self._strength.UnionMask(
@@ -1541,6 +1862,7 @@ class LayeredDiffusionPipeline:
         size: Optional[Tuple[int, int]] = None,
         default_encoding: Optional[StandardEncoding] = None,
         use_rmm: bool = True,  # rmm = Residual Merge Method
+        use_decomposed_rmm: bool = True,
         rand_seed: Optional[int] = None,
         eta: float = 0.0,
         vae_encoder_adjust: Optional[float] = None,
@@ -1560,34 +1882,55 @@ class LayeredDiffusionPipeline:
         layers = [l for l in layers if not l.disabled]
         if not layers:
             raise ValueError("`iterate` should contain at least 1 enabled layer.")
+        if not use_rmm:
+            if any(
+                l.IsDistinct() or l.IsZeroSum() or isinstance(l, SPLayer)
+                for l in layers
+            ):
+                raise ValueError(
+                    "Distinct, zero sum or SP layers are available only with RMM."
+                )
 
         # Anything v3.0's VAE has a degradation problem in its encoder.
         # Multiplying the adjustment factor of 1.25 to the encoder output mitigates
         # the problem to a lower level.
+        # See https://twitter.com/tomo161382/status/1601962971085041664 for details.
         if not vae_encoder_adjust:
             if self._dataset == "Linaqruf/anything-v3.0":
                 vae_encoder_adjust = 1.25
+        if vae_encoder_adjust != 1.0:
+            Debug(1, f"Adjusting VAE Encoder level by {vae_encoder_adjust}")
 
         bglayer = BackgroundLayer(initialize, vae_encoder_adjust)
         prompts = Prompts(self.text_model, default_encoding)
         target = self.text_model.target
 
         if use_rmm:
-            MergeMethod = self.ResidualMergeMethod
+            mm = self.ResidualMergeMethod(
+                self.scheduler,
+                self.unet,
+                target,
+                bglayer,
+                layers,
+                prompts,
+                decomposed=use_decomposed_rmm,
+            )
         else:
-            MergeMethod = self.LatentMergeMethod
-        mm = MergeMethod(self.scheduler, self.unet, target, bglayer, layers, prompts)
+            mm = self.LatentMergeMethod(
+                self.scheduler, self.unet, target, bglayer, layers, prompts
+            )
 
         with autocast(target.device_type()):
             mm.Initialize(self.image_model, num_steps, size, self.pipe, eta)
 
             for i, ts in enumerate(self.pipe.progress_bar(mm.timesteps)):
-                # TODO: deprecate `progress`
-                progress = float(i + 1) / len(mm.timesteps)
                 remaining = bglayer.GetRemaining(mm.timesteps, i)
-                Debug(4, f"progress: {progress:.2f} <= {i + 1} / {len(mm.timesteps)}")
+                Debug(
+                    3,
+                    f"remaining: {remaining:.2f} @ step {i + 1} of {len(mm.timesteps)}",
+                )
 
-                mm.Step(i, ts, progress, remaining)
+                mm.Step(i, ts, remaining)
 
                 # TODO: implement residual inspection
                 # latents_debug = self.scheduler.InspectLatents(
@@ -1618,10 +1961,10 @@ class LayeredDiffusionPipeline:
             self.scheduler.PrepareExtraStepKwargs(pipe, eta)
             self.timesteps = timesteps
 
-        def Step(self, i, ts, progress, remaining):
+        def Step(self, i, ts, remaining):
             latents_for_prompts = [self.latents] * len(self.prompts)
 
-            residuals_for_layers = self.UNet(latents_for_prompts, ts, progress)
+            residuals_for_layers = self.UNet(latents_for_prompts, ts, remaining)
 
             latents_for_layers = self.scheduler.Step(
                 residuals_for_layers, ts, [self.latents] * len(self.all_layers)
@@ -1637,12 +1980,13 @@ class LayeredDiffusionPipeline:
             )
             self.latents = next_latents
 
-        def UNet(self, latents_for_prompts, ts, progress):
+        def UNet(self, latents_for_prompts, ts, remaining, decomposed=False):
             residuals_for_prompts = self.prompts.PredictResiduals(
-                self.scheduler, self.unet, latents_for_prompts, ts, progress
+                self.scheduler, self.unet, latents_for_prompts, ts, remaining
             )
             residuals_for_layers = [
-                l.GetResidual(residuals_for_prompts) for l in self.all_layers
+                l.GetResidual(residuals_for_prompts, remaining, decomposed)
+                for l in self.all_layers
             ]
             return residuals_for_layers
 
@@ -1650,7 +1994,10 @@ class LayeredDiffusionPipeline:
             return image_model.Decode(self.latents)[0], None
 
     class ResidualMergeMethod(LatentMergeMethod):
-        def __init__(self, scheduler, unet, target, bglayer, layers, prompts):
+        def __init__(
+            self, scheduler, unet, target, bglayer, layers, prompts, decomposed
+        ):
+            Debug(1, f"Using RMM with decomposed = {decomposed}")
             super().__init__(scheduler, unet, target, bglayer, layers, prompts)
             rmm_index = 0
             rmm_layers = []
@@ -1664,12 +2011,15 @@ class LayeredDiffusionPipeline:
             Debug(1, f"number of rmm latents = {num_rmm_latents}")
             self.rmm_layers = rmm_layers
             self.num_rmm_latents = num_rmm_latents
+            self.decomposed = decomposed
 
         def Initialize(self, image_model, num_steps, size, pipe, eta):
+            Debug(3, f"RMM.Initialize()")
             super().Initialize(image_model, num_steps, size, pipe, eta)
             self.rmm_latents = [self.latents] * self.num_rmm_latents
 
-        def Step(self, i, ts, progress, remaining):
+        def Step(self, i, ts, remaining):
+            Debug(4, f"RMM.Step() for step {i + 1}")
             latents_for_prompts = [None] * len(self.prompts)
             for layer, k, rmm_index in self.rmm_layers:
                 l = self.rmm_latents[rmm_index]
@@ -1679,7 +2029,10 @@ class LayeredDiffusionPipeline:
                 if l is None:
                     raise ValueError(f"unexpected error: missing latents for index {k}")
 
-            residuals_for_layers = self.UNet(latents_for_prompts, ts, progress)
+            Debug(4, f"Calling UNet() for step {i + 1}")
+            residuals_for_layers = self.UNet(
+                latents_for_prompts, ts, remaining, self.decomposed
+            )
 
             latents, rmm_latents = self.RMM(residuals_for_layers, i, ts, remaining)
             self.latents = latents
@@ -1702,6 +2055,7 @@ class LayeredDiffusionPipeline:
             )
 
         def RMM(self, residuals_for_layers, i, ts, remaining):
+            Debug(4, f"RMM.RMM() for step {i + 1}")
             residuals_for_bg = residuals_for_layers[0]
             residuals_for_rmm = [residuals_for_bg] * self.num_rmm_latents
             residuals_for_all = residuals_for_bg
@@ -1710,6 +2064,7 @@ class LayeredDiffusionPipeline:
                     residuals_for_all,
                     residuals_for_layers[k],
                     remaining,
+                    self.decomposed,
                 )
                 for m in range(self.num_rmm_latents):
                     if rmm_index in (0, m):
@@ -1717,9 +2072,13 @@ class LayeredDiffusionPipeline:
                             residuals_for_rmm[m],
                             residuals_for_layers[k],
                             remaining,
+                            self.decomposed,
                         )
             latents_for_rmm = self.scheduler.Step(
-                [residuals_for_bg, residuals_for_all] + residuals_for_rmm,
+                [
+                    r.Compose() if self.decomposed else r
+                    for r in [residuals_for_bg, residuals_for_all] + residuals_for_rmm
+                ],
                 ts,
                 [self.rmm_latents[0], self.latents] + self.rmm_latents,
             )
@@ -1731,6 +2090,7 @@ class LayeredDiffusionPipeline:
             return latents, rmm_latents
 
         def SynthesizeLatents(self, latents_for_rmm, rmm_index, i, remaining):
+            Debug(4, f"RMM.SynthesizeLatents({rmm_index}) for step {i + 1}")
             next_latents = latents_for_rmm[0]
             next_latents = self.bglayer.OverwriteLatents(  # unconditionally
                 self.scheduler,
@@ -1752,7 +2112,7 @@ class LayeredDiffusionPipeline:
             return next_latents
 
         def UnionLayerMask(self, rmm_layers, m, remaining, black, white):
-            Debug(4, f"UnionLayerMask: latents {m}, remaining {remaining:.2f}")
+            Debug(4, f"RMM.UnionLayerMask(): latents {m}, remaining {remaining:.2f}")
             mask = 1.0
             for layer, i, rmm_index in rmm_layers[1:]:
                 if (m < 0) or (rmm_index in (0, m)):
