@@ -1849,8 +1849,8 @@ class LayeredDiffusionPipeline:
     def __call__(
         self,
         num_steps: int,
-        initialize: Optional[Union[Initializer, List[Initializer]]],
         iterate: Union[Layer, List[Layer]],
+        initialize: Optional[Union[Initializer, List[Initializer]]] = None,
         size: Optional[Tuple[int, int]] = None,
         default_encoding: Optional[StandardEncoding] = None,
         use_rmm: bool = True,  # rmm = Residual Merge Method
