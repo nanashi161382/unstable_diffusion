@@ -60,7 +60,6 @@ image_size = (512, 512)  # width, height
 image = pipe(
     num_steps=30,
     size=image_size,
-    initialize=Randomly(),
     iterate=Layer(
         prompt="photo of orange pomeranian dog running in the park >>> cute face, fluffy",
         negative_prompt="bad quality, blur",
