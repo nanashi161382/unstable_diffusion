@@ -212,14 +212,17 @@ class RangeMap:
             f"RangeMap at {remaining:.2f} for {debug_label}: end",
             self._end if ShouldDebug(5) else None,
         )
-        return self._end
+        if remaining >= 1.0:
+            return self._start
+        else:
+            return self._end
 
     def GetFirst(self):
         if len(self._segments) == 0:
             if self._end == self._start:
                 return self._end, 0.0
             else:
-                return self._end, 1.0
+                return self._start, 1.0
         value, until = self._segments[0]
         if (value is None) or (value == self._start):
             if len(self._segments) == 1:
@@ -1253,7 +1256,11 @@ class InitializerList:
         reverse_index = -1
         for i, init in enumerate(reversed(initializers)):
             value, until = init.GetStrength().First()
-            if init.IsWholeImage() and until > max_strength:
+            if (
+                init.IsWholeImage()
+                and (until > max_strength)
+                or ((its_level < 1.0) and (until == max_strength))
+            ):
                 max_strength = until
                 its_level = value
                 reverse_index = i
