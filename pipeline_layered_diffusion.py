@@ -1801,12 +1801,16 @@ class LayeredDiffusionPipeline:
     def Connect(
         self,
         dataset: str,
+        cache_path: Optional[str] = None,
         revision: Optional[str] = None,
         auth_token: Optional[str] = None,
         use_xformers: bool = False,
         device_type: str = "cuda",
     ):
         self._dataset = dataset
+        if cache_path:
+            dataset = cache_path
+
         extra_args = {
             "torch_dtype": torch.float32,  # This may be needed to avoid OOM.
             "revision": self.GetRevision(dataset, revision),
