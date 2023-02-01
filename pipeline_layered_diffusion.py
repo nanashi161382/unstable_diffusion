@@ -342,9 +342,16 @@ class TextModel:
     def max_length(self):
         return self._tokenizer.model_max_length
 
+    def hidden_size(self):
+        return self._text_encoder.config.hidden_size
+
     def num_tokens(self, text: str):
+        """
+        Returns:
+            number of tokens including SOT and EOT
+        """
         tokens = self._tokenizer(text)
-        return len(tokens.input_ids) - 2
+        return len(tokens.input_ids)
 
     def tokenize(self, text: str):
         max_length = self.max_length()
@@ -352,13 +359,21 @@ class TextModel:
             text,
             padding="max_length",
             max_length=max_length,
-            return_tensors="pt",
+            return_tensors="pt",  # PyTorch
         )
 
     def decode_tokens(self, tokens):
         return self._tokenizer.batch_decode(tokens)
 
     def EncodeText(self, text: str, fail_on_truncation: bool = True):
+        """
+        Returns:
+            Tuple of (
+                last_hidden_state, (= embeddings for UNet)
+                pooled_output,  (= EOT embedding)
+                num_tokens,  (= number of tokens including SOT and EOT)
+            )
+        """
         max_length = self.max_length()
         text_inputs = self.tokenize(text)
         text_input_ids = text_inputs.input_ids
@@ -382,6 +397,12 @@ class TextModel:
             if m.item() > 0:
                 num_tokens += 1
         return embeddings[0], embeddings[1], num_tokens
+
+    def GetConstant(self, value: float):
+        mat = [
+            [value for _ in range(self.hidden_size())] for _ in range(self.max_length())
+        ]
+        return torch.tensor([mat]).to(**self.target.dict)
 
 
 #
@@ -429,7 +450,9 @@ class ImageModel:
             latents = latent_dist.mode()
         else:
             latents = latent_dist.sample(generator=generator)
-        latents = 0.18215 * latents
+        latents = (
+            0.18215 * latents
+        )  # TODO: use vae.config.scaling_factor instead of 0.18215
 
         return latents
 
@@ -605,8 +628,71 @@ class GeneralizedStrength:
 # -- Encoding is a class that defines how to encode a prompt --
 #
 class StandardEncoding:
-    def Encode(self, text_model: TextModel, text: str):
-        return text_model.EncodeText(text)[0]
+    def __init__(self, text: Optional[str] = None):
+        self._text = text
+
+    def IsTerminated(self):
+        return True
+
+    def EncodeSelf(
+        self, text_model: TextModel, default_encoding
+    ):  #: StandardEncoding):
+        text = self._text
+        if text is None:
+            Debug(
+                0,
+                "The default text is not set for the encoding. A null string is used instead.",
+            )
+            text = ""
+        return self.Encode(text_model, text, default_encoding)
+
+    def Encode(
+        self, text_model: TextModel, text: str, default_encoding  #: StandardEncoding
+    ):
+        emb = text_model.EncodeText(text)[0]
+        return emb
+
+
+class ConstEncoding(StandardEncoding):
+    def __init__(self, value: float = 0.0):
+        self.value = value
+
+    def EncodeSelf(self, text_model: TextModel, default_encoding: StandardEncoding):
+        emb = text_model.GetConstant(self.value)
+        return emb
+
+    def Encode(
+        self, text_model: TextModel, text: str, default_encoding: StandardEncoding
+    ):
+        Debug(0, f"A prompt is ignored for ConstEncoding: {text}")
+        return self.EncodeSelf(text_model)
+
+
+class ScaledEncoding(StandardEncoding):
+    def __init__(self, scale: float, encoding: Optional[StandardEncoding] = None):
+        self._scale = scale
+        self._encoding = encoding
+
+    def IsTerminated(self):
+        if self._encoding is None:
+            return False
+        return self._encoding.IsTerminated()
+
+    def EncodeSelf(self, text_model: TextModel, default_encoding: StandardEncoding):
+        encoding = self._encoding
+        if encoding is None:
+            encoding = default_encoding
+        emb = encoding.EncodeSelf(text_model, default_encoding)
+        return emb * self._scale
+
+    def Encode(
+        self, text_model: TextModel, text: str, default_encoding: StandardEncoding
+    ):
+        encoding = self._encoding
+        if encoding is None:
+            encoding = default_encoding
+        emb = encoding.Encode(text_model, text, default_encoding)
+        return emb * self._scale
 
 
 class PromptParser:
@@ -634,7 +720,7 @@ class PromptParser:
 
         def __init__(
             self,
-            anchored,  # : PromptParser.Chunks,
+            anchored,  #: PromptParser.Chunks,
             unanchored,  #: PromptParser.Chunks,
         ):
             self.anchored = anchored
@@ -680,8 +766,6 @@ class PromptParser:
                 repeat = int(word[1:])
             else:
                 words.append(word)
-        if weight < 0.0:
-            raise ValueError(f"Invalid weight: {weight}")
         if repeat < 1:
             raise ValueError(f"Invalid repeat: {repeat}")
         return " ".join(words), weight, repeat
@@ -696,7 +780,7 @@ class PromptParser:
         weights = []
         token_nums = []
         for text, weight, repeat in annotations:
-            num_tokens = text_model.num_tokens(text)
+            num_tokens = text_model.num_tokens(text) - 2
             for i in range(repeat):
                 texts.append(text)
                 weights.append(weight)
@@ -741,7 +825,7 @@ class BaseAccumulator:
     def AdjustMean(self, states):
         new_mean = states.float().mean(axis=[-2, -1]).to(self.target.dtype())
         states *= (self.unweighted_mean / new_mean).unsqueeze(-1)
-        return torch.cat([torch.unsqueeze(states, 0)], dim=0).to(self.target.device())
+        return states
 
 
 class ParallelAccumulator(BaseAccumulator):
@@ -764,10 +848,14 @@ class ParallelAccumulator(BaseAccumulator):
 class ShiftEncoding(StandardEncoding):
     def __init__(
         self,
+        text: Optional[str] = None,
+        normalize_weight: bool = True,
         reverse: bool = True,
         rotate: bool = True,
         convolve: Union[bool, List[float]] = False,
     ):
+        super().__init__(text)
+        self._normalize_weight = normalize_weight
         self._reverse = reverse
         self._rotate = rotate
         if not isinstance(convolve, list):
@@ -778,24 +866,37 @@ class ShiftEncoding(StandardEncoding):
         self._convolve = np.array(convolve)
 
     def GetWeights(self, text_model: TextModel, chunks):
-        weights = [1.0]
+        weights = []
+        weight_sum = 0.0
         for w, n in zip(chunks.weights, chunks.token_nums):
             weights += [w] * n
-        weights = (
-            np.convolve(np.array(weights) - 1.0, self._convolve, mode="full") + 1.0
-        )
-        Debug(3, "weights:", weights)
+            weight_sum += w * n
+        if self._normalize_weight and (len(weights) > 0):
+            if weight_sum == 0.0:
+                raise ValueError(
+                    f"unable to normalize weights if the sum is 0.0: {weights}"
+                )
+            coeff = len(weights) / weight_sum
+            weights = [coeff * w for w in weights]
+        weights = [1.0] + weights
         if len(weights) >= text_model.max_length():
             weights = weights[: text_model.max_length()]
+        orig_len = len(weights)
         weights = np.concatenate(
             [
                 weights,
                 np.array([1.0] * (text_model.max_length() - len(weights))),
             ]
         )
+        weights = (
+            np.convolve(np.array(weights) - 1.0, self._convolve, mode="full") + 1.0
+        )
+        Debug(3, "weights:", weights[1:orig_len])
         return weights
 
-    def Encode(self, text_model: TextModel, text: str):
+    def Encode(
+        self, text_model: TextModel, text: str, default_encoding: StandardEncoding
+    ):
         target = text_model.target
         parser = PromptParser()
         prompt = parser.Parse(text_model, text)
@@ -825,7 +926,9 @@ class ShiftEncoding(StandardEncoding):
         proc.Average(n)
 
         new_states = proc.ToStates()
-        return proc.AdjustMean(new_states)
+        if not self._normalize_weight:
+            new_states = proc.AdjustMean(new_states)
+        return torch.cat([torch.unsqueeze(new_states, 0)], dim=0).to(target.device())
 
 
 #
@@ -833,11 +936,27 @@ class ShiftEncoding(StandardEncoding):
 #
 # A prompt can be
 #  * str  --  a prompt text
+#  * Encoding  -- an encoding without a promppt text
 #  * (str, Encoding)  --  a prompt text & its encoding method
 #  * following the RangeMap format.
+class UniquePromptType:
+    def __init__(self, name: str):
+        self.name = name
+
+    def __str__(self):
+        return f"UniquePromptType[{self.name}]"
+
+    def _repr_pretty_(self, p, cycle):
+        p.text(str(self))
+
+
+NullPrompt = UniquePromptType("null_prompt")
+
 PromptType = Optional[
     Union[
         str,
+        UniquePromptType,
+        StandardEncoding,
         Tuple[str, StandardEncoding],
         RangeMap,
     ]
@@ -852,7 +971,8 @@ class TextEmbeddings:
         self._text_embeddings = text_embeddings
 
     def GetEmbedding(self, remaining: float):
-        return self._text_embeddings.Get(remaining, debug_label="TextEmbeddings")
+        emb = self._text_embeddings.Get(remaining, debug_label="TextEmbeddings")
+        return emb
 
     @classmethod
     def Create(
@@ -860,18 +980,31 @@ class TextEmbeddings:
         input: PromptType,
         text_model: TextModel,
         default_encoding: StandardEncoding,
+        null_prompt: PromptType,
     ):
+        if not default_encoding.IsTerminated():
+            raise ValueError("Default encoding must be terminated.")
+        if null_prompt is NullPrompt:
+            raise ValueError("Null prompt must not be NullPrompt.")
+        if input == null_prompt:
+            input = None
+
         def finalizer(arg):
             if isinstance(arg, str):
-                return default_encoding.Encode(text_model, arg)
+                return default_encoding.Encode(text_model, arg, default_encoding)
+            elif isinstance(arg, UniquePromptType):
+                if arg is NullPrompt:
+                    return default_embedding
+                else:
+                    raise ValueError(f"Unsupported UniquePromptType: {arg}")
+            elif isinstance(arg, StandardEncoding):
+                return arg.EncodeSelf(text_model, default_encoding)
             elif isinstance(arg, tuple):
-                return arg[1].Encode(text_model, arg[0])
+                return arg[1].Encode(text_model, arg[0], default_encoding)
             else:
                 return arg
 
-        default_embedding = default_encoding.Encode(text_model, "")
-        if input == "":
-            input = None
+        default_embedding = finalizer(null_prompt)
         embeddings = RangeMap.CreateAndFinalize(
             input, True, default_embedding, default_embedding, finalizer
         )
@@ -1343,9 +1476,11 @@ class Prompts:
         self,
         text_model: TextModel,
         default_encoding: StandardEncoding,
+        null_prompt: PromptType,
     ):
         self._text_model = text_model
         self._default_encoding = default_encoding
+        self._null_prompt = null_prompt
         self._prompts = []
 
     def __len__(self):
@@ -1355,7 +1490,9 @@ class Prompts:
         Debug(3, "Add prompt:", prompt)
         index = len(self._prompts)
         self._prompts.append(
-            TextEmbeddings.Create(prompt, self._text_model, self._default_encoding)
+            TextEmbeddings.Create(
+                prompt, self._text_model, self._default_encoding, self._null_prompt
+            )
         )
         return index
 
@@ -1502,8 +1639,8 @@ class DecomposedResidual:
 class BaseLayer:
     def __init__(
         self,
-        prompt: Optional[PromptType] = None,
-        negative_prompt: Optional[PromptType] = None,
+        prompt: PromptType = None,
+        negative_prompt: PromptType = None,
         cfg_scale: Union[float, RangeMap] = 1.0,
         is_zero_sum: bool = False,
         default_cfg_scale: float = 1.0,
@@ -1658,11 +1795,12 @@ class BackgroundLayer(BaseLayer):
         )
 
 
+# TODO: Remove non zero_sum layers.
 class Layer(BaseLayer):
     def __init__(
         self,
-        prompt: Optional[PromptType] = None,
-        negative_prompt: Optional[PromptType] = None,
+        prompt: PromptType = None,
+        negative_prompt: PromptType = None,
         cfg_scale: Union[
             float, RangeMap
         ] = 4.0,  # follows https://huggingface.co/stabilityai/stable-diffusion-2
@@ -1670,7 +1808,7 @@ class Layer(BaseLayer):
         strength: StrengthType = None,
         is_distinct: bool = False,  # False: common layer, True: distinct layer
         disabled: bool = False,
-        is_zero_sum: bool = False,  # False: normal layer, True: zero sum layer
+        is_zero_sum: bool = True,  # False: normal layer, True: zero sum layer
     ):
         super().__init__(
             prompt, negative_prompt, cfg_scale, is_zero_sum, default_cfg_scale=4.0
@@ -1721,7 +1859,7 @@ class Layer(BaseLayer):
 class SPLayer(BaseLayer):  # Single-Prompt Layer
     def __init__(
         self,
-        prompt: Optional[PromptType] = None,
+        prompt: PromptType = None,
         mask_by: MaskType = 1.0,
         strength: StrengthType = None,
         for_negative: bool = False,
@@ -1864,6 +2002,7 @@ class LayeredDiffusionPipeline:
         initialize: Optional[Union[Initializer, List[Initializer]]] = None,
         size: Optional[Tuple[int, int]] = None,
         default_encoding: Optional[StandardEncoding] = None,
+        null_prompt: PromptType = None,
         use_rmm: bool = True,  # rmm = Residual Merge Method
         use_decomposed_rmm: bool = True,
         rand_seed: Optional[int] = None,
@@ -1876,6 +2015,10 @@ class LayeredDiffusionPipeline:
             raise ValueError(f"`num_steps` must be > 0. actual: {num_steps}")
         if not default_encoding:
             default_encoding = ShiftEncoding()
+        if isinstance(null_prompt, UniquePromptType):
+            raise ValueError(f"null_prompt must not be UniquePromptType: {null_prompt}")
+        if null_prompt is None:
+            null_prompt = ConstEncoding(0.0)
         if not iterate:
             raise ValueError("`iterate` should contain at least 1 layer.")
         elif not isinstance(iterate, list):
@@ -1905,7 +2048,7 @@ class LayeredDiffusionPipeline:
             Debug(1, f"Adjusting VAE Encoder level by {vae_encoder_adjust}")
 
         bglayer = BackgroundLayer(initialize, vae_encoder_adjust)
-        prompts = Prompts(self.text_model, default_encoding)
+        prompts = Prompts(self.text_model, default_encoding, null_prompt)
         target = self.text_model.target
 
         if use_rmm:
