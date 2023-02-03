@@ -804,10 +804,9 @@ class PromptParser:
         )
 
 
-class BaseAccumulator:
+class Accumulator:
     def __init__(self, target: SharedTarget):
-        self.unweighted_mean = None
-        self.target = target
+        self.states = None
 
     def AddOrInit(self, v, x):
         if v is None:
@@ -815,30 +814,10 @@ class BaseAccumulator:
         else:
             return v + x
 
-    def Add(self, unweighted_mean):
-        self.unweighted_mean = self.AddOrInit(self.unweighted_mean, unweighted_mean)
-
-    def Average(self, chunk_len):
-        chunk_len = torch.tensor(chunk_len).to(self.target.dtype())
-        self.unweighted_mean /= chunk_len
-
-    def AdjustMean(self, states):
-        new_mean = states.float().mean(axis=[-2, -1]).to(self.target.dtype())
-        states *= (self.unweighted_mean / new_mean).unsqueeze(-1)
-        return states
-
-
-class ParallelAccumulator(BaseAccumulator):
-    def __init__(self, target: SharedTarget):
-        super().__init__(target)
-        self.states = None
-
-    def Add(self, states, unweighted_mean):
-        super().Add(unweighted_mean)
+    def Add(self, states):
         self.states = self.AddOrInit(self.states, states)
 
     def Average(self, chunk_len):
-        super().Average(chunk_len)
         self.states /= chunk_len
 
     def ToStates(self):
@@ -849,7 +828,7 @@ class ShiftEncoding(StandardEncoding):
     def __init__(
         self,
         text: Optional[str] = None,
-        normalize_weight: bool = True,
+        normalize_weight: bool = False,
         reverse: bool = True,
         rotate: bool = True,
         convolve: Union[bool, List[float]] = False,
@@ -866,33 +845,27 @@ class ShiftEncoding(StandardEncoding):
         self._convolve = np.array(convolve)
 
     def GetWeights(self, text_model: TextModel, chunks):
-        weights = []
-        weight_sum = 0.0
+        weights = [1.0]  # SOT
         for w, n in zip(chunks.weights, chunks.token_nums):
             weights += [w] * n
-            weight_sum += w * n
-        if self._normalize_weight and (len(weights) > 0):
+        if len(weights) >= text_model.max_length() - 1:
+            weights = weights[: text_model.max_length() - 1]
+        weights += [1.0]  # EOT
+        orig_len = len(weights)
+        weights += weights[-1:] * (text_model.max_length() - orig_len)
+        if self._normalize_weight:
+            weight_sum = sum(weights)
             if weight_sum == 0.0:
                 raise ValueError(
                     f"unable to normalize weights if the sum is 0.0: {weights}"
                 )
-            coeff = len(weights) / weight_sum
+            coeff = len(weights) / weight_sum  # inverse of average weight
             weights = [coeff * w for w in weights]
-        weights = [1.0] + weights
-        if len(weights) >= text_model.max_length():
-            weights = weights[: text_model.max_length()]
-        orig_len = len(weights)
-        weights = np.concatenate(
-            [
-                weights,
-                np.array([1.0] * (text_model.max_length() - len(weights))),
-            ]
-        )
         weights = (
             np.convolve(np.array(weights) - 1.0, self._convolve, mode="full") + 1.0
         )
-        Debug(3, "weights:", weights[1:orig_len])
-        return weights
+        Debug(3, "weights:", weights[:orig_len])
+        return torch.tensor(weights).to(**target.dict).unsqueeze(-1)
 
     def Encode(
         self, text_model: TextModel, text: str, default_encoding: StandardEncoding
@@ -900,34 +873,27 @@ class ShiftEncoding(StandardEncoding):
         target = text_model.target
         parser = PromptParser()
         prompt = parser.Parse(text_model, text)
-        proc = ParallelAccumulator(target)
+        accum = Accumulator(target)
 
         def run():
             shift_range = prompt.ShiftRange()
             for i in range(shift_range):
                 chunks = prompt.Shift(i, self._rotate)
                 shifted_text = " ".join(chunks.texts)
+                Debug(3, f"shifted_text: {shifted_text}")
                 weights = self.GetWeights(text_model, chunks)
-                Debug(4, f"shifted_text:", shifted_text)
-
                 embeddings = text_model.EncodeText(shifted_text, False)
-                unweighted_mean = (
-                    embeddings[0][0].float().mean(axis=[-2, -1]).to(**target.dict)
-                )
-                weights = torch.tensor(weights).to(**target.dict).unsqueeze(-1)
                 full = embeddings[0][0] * weights
-                proc.Add(full, unweighted_mean)
+                accum.Add(full)
             return shift_range
 
         n = run()
         if self._reverse:
             prompt.Reverse()
             n += run()
-        proc.Average(n)
+        accum.Average(n)
 
-        new_states = proc.ToStates()
-        if not self._normalize_weight:
-            new_states = proc.AdjustMean(new_states)
+        new_states = accum.ToStates()
         return torch.cat([torch.unsqueeze(new_states, 0)], dim=0).to(target.device())
 
 
@@ -1763,6 +1729,9 @@ class BackgroundLayer:
             self._vae_encoder_adjust = 1.0
         else:
             self._vae_encoder_adjust = vae_encoder_adjust
+
+    def IsDistinct(self):
+        return False
 
     def Initialize(
         self,
