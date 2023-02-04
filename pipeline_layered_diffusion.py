@@ -865,6 +865,7 @@ class ShiftEncoding(StandardEncoding):
             np.convolve(np.array(weights) - 1.0, self._convolve, mode="full") + 1.0
         )
         Debug(3, "weights:", weights[:orig_len])
+        target = text_model.target
         return torch.tensor(weights).to(**target.dict).unsqueeze(-1)
 
     def Encode(
@@ -1478,244 +1479,163 @@ class Prompts:
 # -- Layer --
 #
 class DecomposedResidual:
-    def __init__(self, cond, cond_scale, uncond, uncond_scale, with_uncond):
+    def __init__(self, cond, uncond, scale):
         self.cond = cond
-        self.cond_scale = cond_scale
         self.uncond = uncond
-        self.uncond_scale = uncond_scale
-        self.with_uncond = with_uncond  # TODO: may not need this.
+        self.scale = scale
 
     @classmethod
-    def Create(cls, cond, uncond, scale):
+    def CreateForLayer(cls, cond, uncond, scale):
+        # CreateForLayer() is for normal Layer.
         return DecomposedResidual(
             cond * scale,
-            scale,
             uncond * scale,
-            scale,
-            with_uncond=True,
+            scale=scale,
         )
 
     @classmethod
-    def CreateWithoutUncond(cls, cond):
-        return DecomposedResidual(cond, 1.0, 0.0, 0.0, with_uncond=False)
+    def CreateForSPLayer(cls, cond):
+        # CreateForSPLayer() is for SPLayer.
+        return DecomposedResidual(
+            cond,
+            None,
+            scale=None,
+        )
 
     @classmethod
-    def CreateZero(cls, shape, target):
+    def CreateForBGLayer(cls, shape, target):
+        # CreateForBGLayer() is for BackgroundLayer.
         return DecomposedResidual(
             torch.zeros(shape).to(**target.dict),
-            0.0,
             torch.zeros(shape).to(**target.dict),
-            0.0,
-            with_uncond=False,
+            scale=0.0,
         )
 
-    def Add(self, mine, strength: GeneralizedStrength, mask, remaining: float):
-        def _add(a, b):
-            return strength.Add(mask=mask, other=a, mine=b, remaining=remaining)
+    def IsForBG(self):
+        return (not isinstance(self, torch.Tensor)) and (self.scale == 0.0)
+
+    def AddOrMerge(
+        self, mine, strength: GeneralizedStrength, mask, remaining: float, to_add: bool
+    ):
+        if mine.uncond is None:
+            raise ValueError(
+                f"AddOrMerge() works only for DecomposedResidual with uncond."
+            )
+
+        def _do(a, b):
+            if to_add:
+                return strength.Add(mask=mask, other=a, mine=b, remaining=remaining)
+            else:
+                return strength.Merge(mask=mask, other=a, mine=b, remaining=remaining)
 
         return DecomposedResidual(
-            cond=_add(self.cond, mine.cond),
-            cond_scale=_add(self.cond_scale, mine.cond_scale),
-            uncond=_add(self.uncond, mine.uncond),
-            uncond_scale=_add(self.uncond_scale, mine.uncond_scale),
-            with_uncond=self.with_uncond or mine.with_uncond,
+            cond=_do(self.cond, mine.cond),
+            uncond=_do(self.uncond, mine.uncond),
+            scale=_do(self.scale, mine.scale),
         )
 
-    def Merge(self, mine, strength: GeneralizedStrength, mask, remaining: float):
-        def _merge(a, b):
-            return strength.Merge(mask=mask, other=a, mine=b, remaining=remaining)
-
-        return DecomposedResidual(
-            cond=_merge(self.cond, mine.cond),
-            cond_scale=_merge(self.cond_scale, mine.cond_scale),
-            uncond=_merge(self.uncond, mine.uncond),
-            uncond_scale=_merge(self.uncond_scale, mine.uncond_scale),
-            with_uncond=self.with_uncond or mine.with_uncond,
-        )
-
-    def AddEither(
+    def AddOrMergeForCond(
         self,
         mine,
         strength: GeneralizedStrength,
         mask,
         remaining: float,
-        for_cond: bool,
+        to_add: bool,
     ):
-        if mine.with_uncond:
+        if mine.uncond is not None:
             raise ValueError(
-                f"AddEither() works only for DecomposedResidual without uncond."
+                f"AddOrMergeForCond() works only for DecomposedResidual without uncond."
+            )
+        if self.IsForBG():
+            # Ignore `to_add`
+            return DecomposedResidual(
+                cond=mine.cond,
+                uncond=self.uncond,  # zero tensor
+                scale=1.0,
             )
 
-        def _add(other, my_cond):
-            return strength.Add(
-                mask=mask,
-                other=other,
-                mine=my_cond * self.cond_scale,
-                remaining=remaining,
-            )
+        def _do(other, my_cond, same: bool):
+            if to_add:
+                # TODO: multiply rather than add if same == True
+                return strength.Add(
+                    mask=mask,
+                    other=other,
+                    mine=my_cond,
+                    remaining=remaining,
+                )
+            elif same:
+                # Merge but two args are same
+                return other
+            else:
+                return strength.Merge(
+                    mask=mask,
+                    other=other,
+                    mine=my_cond,
+                    remaining=remaining,
+                )
 
         return DecomposedResidual(
-            cond=_add(
-                self.cond,
-                (mine.cond if for_cond else self.cond / self.cond_scale),
-            ),
-            cond_scale=_add(self.cond_scale, 1.0),
-            uncond=_add(
-                self.uncond,
-                (self.uncond / self.uncond_scale if for_cond else mine.uncond),
-            ),
-            uncond_scale=_add(self.uncond_scale, 1.0),
-            with_uncond=self.with_uncond,
+            cond=_do(self.cond, mine.cond * self.scale, False),
+            uncond=_do(self.uncond, self.uncond, True),
+            scale=_do(self.scale, self.scale, True),
         )
 
-    def MergeEither(
+    def AddOrMergeForUncond(
         self,
         mine,
         strength: GeneralizedStrength,
         mask,
         remaining: float,
-        for_cond: bool,
+        to_add: bool,
     ):
-        if mine.with_uncond:
+        if mine.uncond is not None:
             raise ValueError(
-                f"MergeEither() works only for DecomposedResidual without uncond."
+                f"AddOrMergeForUncond() works only for DecomposedResidual without uncond."
+            )
+        if self.IsForBG():
+            raise ValueError(
+                f"AddOrMergeForUncond() must not be called for the BackgroundLayer."
             )
 
-        def _merge(other, scale):
-            return strength.Merge(
+        if to_add:
+            uncond = strength.Add(
                 mask=mask,
-                other=other,
-                mine=mine.cond * scale,
+                other=self.uncond,
+                mine=mine.cond * self.scale,
+                remaining=remaining,
+            )
+            new_scale = strength.Add(
+                mask=mask,
+                other=self.scale,
+                mine=self.scale,
+                remaining=remaining,
+            )
+            # scale back to the original scale
+            uncond = uncond * scale / new_scale
+        else:
+            uncond = strength.Merge(
+                mask=mask,
+                other=self.uncond,
+                mine=mine.cond * self.scale,
                 remaining=remaining,
             )
 
-        return DecomposedResidual(
-            cond=_merge(self.cond, self.cond_scale) if for_cond else self.cond,
-            cond_scale=self.cond_scale,
-            uncond=self.uncond if for_cond else _merge(self.uncond, self.uncond_scale),
-            uncond_scale=self.uncond_scale,
-            with_uncond=self.with_uncond,
-        )
+        return DecomposedResidual(cond=self.cond, uncond=uncond, scale=self.scale)
 
     def Compose(self):
-        if not self.with_uncond:  # TODO: remove if possible
-            return self.cond
-        if not isinstance(self.uncond_scale, torch.Tensor):
-            if self.uncond_scale == 0.0:
+        if not isinstance(self.scale, torch.Tensor):
+            if self.scale <= 1.0:
                 return self.cond
             else:
-                uncond = self.uncond * (self.uncond_scale - 1.0) / self.uncond_scale
+                uncond = self.uncond * (self.scale - 1.0) / self.scale
                 res = self.cond - uncond
                 return res
 
-        is_zero = torch.eq(self.uncond_scale, 0.0)
-        uncond = self.uncond * (self.uncond_scale - 1.0) / self.uncond_scale
-        res = torch.where(is_zero, self.cond, self.cond - uncond)
+        le_one = torch.le(self.scale, 1.0)
+        coeff = torch.where(le_one, 0.0, (self.scale - 1.0) / self.scale)
+        uncond = self.uncond * coeff
+        res = self.cond - uncond
         return res
-
-
-class BaseLayer:
-    def __init__(
-        self,
-        prompt: PromptType = None,
-        negative_prompt: PromptType = None,
-        cfg_scale: Optional[Union[float, RangeMap]] = None,
-        to_add: bool = False,  # default: merge mode
-    ):
-        # The default image generation = no prompts, no cfg
-        self._prompt = prompt
-        self._negative_prompt = negative_prompt
-        self.to_add = to_add
-
-        if cfg_scale is None:
-            self._cfg_scale = None
-        else:
-            default_cfg_scale = 4.0
-            cfg_scale = RangeMap.CreateAndFinalize(
-                cfg_scale, True, default_cfg_scale, default_cfg_scale
-            )
-            self._cfg_scale = cfg_scale
-
-    def GetCfgScale(self, remaining):
-        if self._cfg_scale is None:
-            raise ValueError(f"GetCfgScale() must not be called if cfg_scale is None.")
-
-        cfg_scale = self._cfg_scale.Get(remaining, debug_label="CFG Scale")
-
-        if self.IsZeroSum():
-            if cfg_scale < 0.0:
-                raise ValueError(
-                    f"cfg_scale must be 0.0 or bigger for a zero sum layer: {cfg_scale}"
-                )
-            elif cfg_scale == 0.0:
-                Debug(4, f"Effectively ignore a zero sum layer if cfg_scale = 0.")
-        else:
-            if cfg_scale < 1.0:
-                raise ValueError(
-                    f"cfg_scale must be 1.0 or bigger for a normal layer: {cfg_scale}"
-                )
-            elif cfg_scale == 1.0:
-                Debug(4, f"Effectively ignore a normal layer if cfg_scale = 1.")
-
-        return cfg_scale
-
-    def IsDistinct(self):
-        return False
-
-    def IsZeroSum(self):
-        return self._is_zero_sum
-
-    def _Initialize(self, prompts: Prompts, decomposed: bool):
-        self.decomposed = decomposed
-
-        if self._cfg_scale is None:
-            self._do_cfg = False
-        else:
-            if decomposed:
-                self._is_zero_sum = True
-                self._do_cfg = True
-            else:
-                self._is_zero_sum = self.to_add
-                if self.IsZeroSum():
-                    self._do_cfg = True
-                    Debug(3, "CFG is disabled for a zero sum layer.")
-                else:
-                    cfg_is_const, const_cfg_scale = self._cfg_scale.IsConstant()
-                    cfg_scale_is_always_one = cfg_is_const and (const_cfg_scale == 1.0)
-                    self._do_cfg = not cfg_scale_is_always_one
-                    if not self._do_cfg:
-                        Debug(
-                            3,
-                            "CFG is disabled for a layer whose cfg_scale is always one.",
-                        )
-
-        self._prompts = prompts
-        self._indices = [prompts.Add(self._prompt)]
-        if self._do_cfg:
-            self._indices.append(prompts.Add(self._negative_prompt))
-
-    def GetResidualAt(self, residuals, index: int):
-        return residuals[self._indices[index]]
-
-    def GetResidual(self, residuals, remaining, decomposed, target: SharedTarget):
-        if decomposed:
-            residual_cond = self.GetResidualAt(residuals, 0)
-            residual_uncond = self.GetResidualAt(residuals, 1)
-            return DecomposedResidual.Create(
-                cond=residual_cond,
-                uncond=residual_uncond,
-                scale=self.GetCfgScale(remaining),
-            )
-        else:
-            residual_cond = self.GetResidualAt(residuals, 0)
-            if not self._do_cfg:
-                return residual_cond
-
-            residual_uncond = self.GetResidualAt(residuals, 1)
-            residual = self.GetCfgScale(remaining) * (residual_cond - residual_uncond)
-            if not self.IsZeroSum():
-                residual = residual_uncond + residual
-            return residual
 
 
 class BackgroundLayer:
@@ -1795,12 +1715,34 @@ class BackgroundLayer:
 
     def GetResidual(self, residuals, remaining, decomposed, target: SharedTarget):
         if decomposed:
-            return DecomposedResidual.CreateZero(residuals[0].shape, target)
+            return DecomposedResidual.CreateForBGLayer(residuals[0].shape, target)
         else:
             return torch.zeros_like(residuals[0]).to(**target.dict)
 
 
-# TODO: Clean up
+class BaseLayer:
+    def __init__(
+        self,
+        prompt: PromptType,
+        negative_prompt: PromptType = None,
+        to_add: bool = False,  # default: merge mode
+    ):
+        self._prompt = prompt
+        self._negative_prompt = negative_prompt
+        self.to_add = to_add
+
+    def _Initialize(self, prompts: Prompts, decomposed: bool, do_cfg: bool):
+        self.decomposed = decomposed
+        self._do_cfg = do_cfg
+        self._prompts = prompts
+        self._indices = [prompts.Add(self._prompt)]
+        if self._do_cfg:
+            self._indices.append(prompts.Add(self._negative_prompt))
+
+    def GetResidualAt(self, residuals, index: int):
+        return residuals[self._indices[index]]
+
+
 class Layer(BaseLayer):
     def __init__(
         self,
@@ -1817,10 +1759,14 @@ class Layer(BaseLayer):
     ):
         if cfg_scale is None:
             raise ValueError(f"cfg_scale must not be None.")
+        default_cfg_scale = 4.0
+        cfg_scale = RangeMap.CreateAndFinalize(
+            cfg_scale, True, default_cfg_scale, default_cfg_scale
+        )
+        self._cfg_scale = cfg_scale
         super().__init__(
             prompt,
             negative_prompt,
-            cfg_scale,
             to_add=to_add,
         )
         self._mask = LatentMask.CreateIfNeeded(mask_by)
@@ -1842,17 +1788,72 @@ class Layer(BaseLayer):
         decomposed: bool,
     ):
         Debug(3, "Initialize Layer.")
-        super()._Initialize(prompts, decomposed=decomposed)
+        if decomposed:
+            # If decomposed, always do CFG.
+            do_cfg = True
+        else:
+            if self.to_add:
+                # For an adding Layer, always do CFG.
+                do_cfg = True
+            else:
+                cfg_is_const, const_cfg_scale = self._cfg_scale.IsConstant()
+                cfg_scale_is_always_one = cfg_is_const and (const_cfg_scale == 1.0)
+                do_cfg = not cfg_scale_is_always_one
+                if not do_cfg:
+                    Debug(
+                        3,
+                        "CFG is disabled for a merging Layer whose cfg_scale is always one.",
+                    )
+        super()._Initialize(prompts, decomposed=decomposed, do_cfg=do_cfg)
         self._mask.Initialize(size, image_model, target)
+
+    def GetCfgScale(self, remaining):
+        cfg_scale = self._cfg_scale.Get(remaining, debug_label="CFG Scale")
+
+        if self.to_add:
+            if cfg_scale < 0.0:
+                raise ValueError(
+                    f"cfg_scale must be 0.0 or bigger for an adding Layer: {cfg_scale}"
+                )
+            elif cfg_scale == 0.0:
+                Debug(4, f"Effectively ignore an adding Layer if cfg_scale = 0.")
+        else:
+            if cfg_scale < 1.0:
+                raise ValueError(
+                    f"cfg_scale must be 1.0 or bigger for a merging layer: {cfg_scale}"
+                )
+            elif cfg_scale == 1.0:
+                Debug(4, f"Effectively ignore a merging layer if cfg_scale = 1.")
+
+        return cfg_scale
+
+    def GetResidual(self, residuals, remaining, decomposed, target: SharedTarget):
+        if decomposed:
+            residual_cond = self.GetResidualAt(residuals, 0)
+            residual_uncond = self.GetResidualAt(residuals, 1)
+            return DecomposedResidual.CreateForLayer(
+                cond=residual_cond,
+                uncond=residual_uncond,
+                scale=self.GetCfgScale(remaining),
+            )
+        else:
+            residual_cond = self.GetResidualAt(residuals, 0)
+            if not self._do_cfg:
+                return residual_cond
+
+            residual_uncond = self.GetResidualAt(residuals, 1)
+            residual = self.GetCfgScale(remaining) * (residual_cond - residual_uncond)
+            if not self.to_add:
+                residual = residual_uncond + residual
+            return residual
 
     def Merge(self, other, mine, remaining: float, decomposed: bool = False):
         if decomposed:
-            if self.IsZeroSum():
-                return other.Add(mine, self._strength, self._mask, remaining)
-            else:
-                return other.Merge(mine, self._strength, self._mask, remaining)
+            return other.AddOrMerge(
+                mine, self._strength, self._mask, remaining, self.to_add
+            )
 
-        if self.IsZeroSum():
+        if self.to_add:
             return self._strength.Add(
                 mask=self._mask, other=other, mine=mine, remaining=remaining
             )
@@ -1896,6 +1897,9 @@ class SPLayer(BaseLayer):  # Single-Prompt Layer
         )
         self.disabled = disabled
 
+    def IsDistinct(self):
+        return False
+
     def Initialize(
         self,
         size: Optional[Tuple[int, int]],
@@ -1905,27 +1909,23 @@ class SPLayer(BaseLayer):  # Single-Prompt Layer
         decomposed: bool,
     ):
         Debug(3, "Initialize SPLayer.")
-        super()._Initialize(prompts, decomposed=decomposed)
+        super()._Initialize(prompts, decomposed=decomposed, do_cfg=False)
         self._mask.Initialize(size, image_model, target)
+
+    def GetResidual(self, residuals, remaining, decomposed, target: SharedTarget):
+        residual_cond = self.GetResidualAt(residuals, 0)
+        return DecomposedResidual.CreateForSPLayer(residual_cond)
 
     def Merge(self, other, mine, remaining: float, decomposed: bool = False):
         if not decomposed:
             raise NotImplementedError(f"SPLayer is only for DecomposedResidual.")
-        if self.to_add:
-            return other.AddEither(
-                mine,
-                self._strength,
-                self._mask,
-                remaining,
-                for_cond=self._for_positive,
+        if self._for_positive:
+            return other.AddOrMergeForCond(
+                mine, self._strength, self._mask, remaining, self.to_add
             )
         else:
-            return other.MergeEither(
-                mine,
-                self._strength,
-                self._mask,
-                remaining,
-                for_cond=self._for_positive,
+            return other.AddOrMergeForUncond(
+                mine, self._strength, self._mask, remaining, self.to_add
             )
 
     def UnionMask(self, other_mask, remaining: float):
