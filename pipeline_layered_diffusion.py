@@ -1546,13 +1546,6 @@ class DecomposedResidual:
             raise ValueError(
                 f"AddOrMergeForCond() works only for DecomposedResidual without uncond."
             )
-        if self.IsForBG():
-            # Ignore `to_add`
-            return DecomposedResidual(
-                cond=mine.cond,
-                uncond=self.uncond,  # zero tensor
-                scale=1.0,
-            )
 
         def _do(other, my_cond, same: bool):
             if to_add:
@@ -1574,10 +1567,11 @@ class DecomposedResidual:
                     remaining=remaining,
                 )
 
+        my_scale = 1.0 if self.IsForBG() else self.scale
         return DecomposedResidual(
-            cond=_do(self.cond, mine.cond * self.scale, False),
+            cond=_do(self.cond, mine.cond * my_scale, False),
             uncond=_do(self.uncond, self.uncond, True),
-            scale=_do(self.scale, self.scale, True),
+            scale=_do(my_scale, my_scale, True),
         )
 
     def AddOrMergeForUncond(
