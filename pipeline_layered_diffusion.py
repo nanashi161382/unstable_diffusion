@@ -1567,12 +1567,18 @@ class DecomposedResidual:
                     remaining=remaining,
                 )
 
-        my_scale = 1.0 if self.IsForBG() else self.scale
-        return DecomposedResidual(
-            cond=_do(self.cond, mine.cond * my_scale, False),
-            uncond=_do(self.uncond, self.uncond, True),
-            scale=_do(my_scale, my_scale, True),
-        )
+        if self.IsForBG():
+            return DecomposedResidual(
+                cond=_do(self.cond, mine.cond, False),
+                uncond=_do(self.uncond, self.uncond, True),
+                scale=_do(self.scale, 1.0, False),
+            )
+        else:
+            return DecomposedResidual(
+                cond=_do(self.cond, mine.cond * self.scale, False),
+                uncond=_do(self.uncond, self.uncond, True),
+                scale=_do(self.scale, self.scale, True),
+            )
 
     def AddOrMergeForUncond(
         self,
