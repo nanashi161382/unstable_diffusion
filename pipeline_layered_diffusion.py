@@ -365,11 +365,12 @@ class TextModel:
     def decode_tokens(self, tokens):
         return self._tokenizer.batch_decode(tokens)
 
-    def EncodeText(self, text: str, fail_on_truncation: bool = True):
+    def EncodeText(self, text: str, fail_on_truncation: bool):
         """
         Returns:
             Tuple of (
                 last_hidden_state, (= embeddings for UNet)
+                truncated: bool,  (= whether tokens are truncated)
                 pooled_output,  (= EOT embedding)
                 num_tokens,  (= number of tokens including SOT and EOT)
             )
@@ -378,14 +379,22 @@ class TextModel:
         text_inputs = self.tokenize(text)
         text_input_ids = text_inputs.input_ids
         attention_mask = text_inputs.attention_mask
+        truncated = False
 
         if text_input_ids.shape[-1] > max_length:
             removed_text = self.decode_tokens(text_input_ids[:, max_length:])
             if fail_on_truncation:
                 raise ValueError(
-                    "The following part of your input was truncated because CLIP can only handle sequences up to"
-                    f" {max_length} tokens: {removed_text}"
+                    f"The following part of your input was truncated because CLIP can only"
+                    f" handle sequences up to {max_length} tokens: {removed_text}"
                 )
+            else:
+                Debug(
+                    5,
+                    f"The following part of your input was truncated because CLIP can only"
+                    f" handle sequences up to {max_length} tokens: {removed_text}",
+                )
+                truncated = True
             text_input_ids = text_input_ids[:, :max_length]
         embeddings = self._text_encoder(
             text_input_ids.to(self.target.device()),
@@ -396,7 +405,7 @@ class TextModel:
         for m in attention_mask[0]:
             if m.item() > 0:
                 num_tokens += 1
-        return embeddings[0], embeddings[1], num_tokens
+        return embeddings[0], truncated, embeddings[1], num_tokens
 
     def GetConstant(self, value: float):
         mat = [
@@ -649,8 +658,8 @@ class StandardEncoding:
     def Encode(
         self, text_model: TextModel, text: str, default_encoding  #: StandardEncoding
     ):
-        emb = text_model.EncodeText(text)[0]
-        return emb
+        result = text_model.EncodeText(text, fail_on_truncation=True)
+        return result[0]
 
 
 class ConstEncoding(StandardEncoding):
@@ -669,8 +678,17 @@ class ConstEncoding(StandardEncoding):
 
 
 class ScaledEncoding(StandardEncoding):
-    def __init__(self, scale: float, encoding: Optional[StandardEncoding] = None):
-        self._scale = scale
+    def __init__(
+        self,
+        scale: Union[float, Tuple[float, float]],
+        encoding: Optional[StandardEncoding] = None,
+    ):
+        if isinstance(scale, tuple):
+            self._scale = scale
+            self._scale_tensor = None  # compute later
+        else:
+            self._scale = (scale, scale)
+            self._scale_tensor = scale
         self._encoding = encoding
 
     def IsTerminated(self):
@@ -678,12 +696,22 @@ class ScaledEncoding(StandardEncoding):
             return False
         return self._encoding.IsTerminated()
 
+    def GetScale(self, text_model):
+        if self._scale_tensor is None:
+            scale = [self._scale[0]] + (
+                [self._scale[1]] * (text_model.max_length() - 1)
+            )
+            self._scale_tensor = (
+                torch.tensor(scale).to(**text_model.target.dict).unsqueeze(-1)
+            )
+        return self._scale_tensor
+
     def EncodeSelf(self, text_model: TextModel, default_encoding: StandardEncoding):
         encoding = self._encoding
         if encoding is None:
             encoding = default_encoding
         emb = encoding.EncodeSelf(text_model, default_encoding)
-        return emb * self._scale
+        return emb * self.GetScale(text_model)
 
     def Encode(
         self, text_model: TextModel, text: str, default_encoding: StandardEncoding
@@ -692,7 +720,7 @@ class ScaledEncoding(StandardEncoding):
         if encoding is None:
             encoding = default_encoding
         emb = encoding.Encode(text_model, text, default_encoding)
-        return emb * self._scale
+        return emb * self.GetScale(text_model)
 
 
 class PromptParser:
@@ -875,16 +903,22 @@ class ShiftEncoding(StandardEncoding):
         parser = PromptParser()
         prompt = parser.Parse(text_model, text)
         accum = Accumulator(target)
+        truncated = False
 
         def run():
+            nonlocal truncated
             shift_range = prompt.ShiftRange()
             for i in range(shift_range):
                 chunks = prompt.Shift(i, self._rotate)
                 shifted_text = " ".join(chunks.texts)
                 Debug(3, f"shifted_text: {shifted_text}")
                 weights = self.GetWeights(text_model, chunks)
-                embeddings = text_model.EncodeText(shifted_text, False)
-                full = embeddings[0][0] * weights
+                encode_result = text_model.EncodeText(
+                    shifted_text, fail_on_truncation=False
+                )
+                truncated = truncated or encode_result[1]
+                embeddings = encode_result[0][0]
+                full = embeddings * weights
                 accum.Add(full)
             return shift_range
 
@@ -893,6 +927,8 @@ class ShiftEncoding(StandardEncoding):
             prompt.Reverse()
             n += run()
         accum.Average(n)
+        if truncated:
+            Debug(1, f"ShiftEncoding: text is truncated: {text}")
 
         new_states = accum.ToStates()
         return torch.cat([torch.unsqueeze(new_states, 0)], dim=0).to(target.device())
@@ -906,29 +942,18 @@ class ShiftEncoding(StandardEncoding):
 #  * Encoding  -- an encoding without a promppt text
 #  * (str, Encoding)  --  a prompt text & its encoding method
 #  * following the RangeMap format.
-class UniquePromptType:
-    def __init__(self, name: str):
-        self.name = name
-
-    def __str__(self):
-        return f"UniquePromptType[{self.name}]"
-
-    def _repr_pretty_(self, p, cycle):
-        p.text(str(self))
-
-
-NullPrompt = UniquePromptType("null_prompt")
-
 PromptType = Optional[
     Union[
         str,
-        UniquePromptType,
         StandardEncoding,
         Tuple[str, StandardEncoding],
         RangeMap,
     ]
 ]
 
+ZeroEmbedding = ConstEncoding(0.0)
+# -0.11 is the approximate average of embedding vector elements.
+UnitEmbedding = ConstEncoding(-0.11)
 
 #
 # -- Text embedding utility to combine multiple embeddings --
@@ -947,23 +972,13 @@ class TextEmbeddings:
         input: PromptType,
         text_model: TextModel,
         default_encoding: StandardEncoding,
-        null_prompt: PromptType,
     ):
         if not default_encoding.IsTerminated():
             raise ValueError("Default encoding must be terminated.")
-        if null_prompt is NullPrompt:
-            raise ValueError("Null prompt must not be NullPrompt.")
-        if input == null_prompt:
-            input = None
 
         def finalizer(arg):
             if isinstance(arg, str):
                 return default_encoding.Encode(text_model, arg, default_encoding)
-            elif isinstance(arg, UniquePromptType):
-                if arg is NullPrompt:
-                    return default_embedding
-                else:
-                    raise ValueError(f"Unsupported UniquePromptType: {arg}")
             elif isinstance(arg, StandardEncoding):
                 return arg.EncodeSelf(text_model, default_encoding)
             elif isinstance(arg, tuple):
@@ -971,7 +986,9 @@ class TextEmbeddings:
             else:
                 return arg
 
-        default_embedding = finalizer(null_prompt)
+        default_embedding = default_encoding.Encode(text_model, "", default_encoding)
+        if input == "":
+            input = None
         embeddings = RangeMap.CreateAndFinalize(
             input, True, default_embedding, default_embedding, finalizer
         )
@@ -1443,23 +1460,29 @@ class Prompts:
         self,
         text_model: TextModel,
         default_encoding: StandardEncoding,
-        null_prompt: PromptType,
+        negative_sot_scale: Optional[float],
     ):
         self._text_model = text_model
         self._default_encoding = default_encoding
-        self._null_prompt = null_prompt
+        if negative_sot_scale is None:
+            self._default_negative_encoding = default_encoding
+        else:
+            self._default_negative_encoding = ScaledEncoding(
+                scale=(negative_sot_scale, 1.0), encoding=default_encoding
+            )
         self._prompts = []
 
     def __len__(self):
         return len(self._prompts)
 
-    def Add(self, prompt: PromptType) -> int:
+    def Add(self, prompt: PromptType, is_negative: bool) -> int:
         Debug(3, "Add prompt:", prompt)
         index = len(self._prompts)
+        default_encoding = (
+            self._default_negative_encoding if is_negative else self._default_encoding
+        )
         self._prompts.append(
-            TextEmbeddings.Create(
-                prompt, self._text_model, self._default_encoding, self._null_prompt
-            )
+            TextEmbeddings.Create(prompt, self._text_model, default_encoding)
         )
         return index
 
@@ -1731,13 +1754,15 @@ class BaseLayer:
         self._negative_prompt = negative_prompt
         self.to_add = to_add
 
-    def _Initialize(self, prompts: Prompts, decomposed: bool, do_cfg: bool):
+    def _Initialize(
+        self, prompts: Prompts, decomposed: bool, do_cfg: bool, is_sp_negative: bool
+    ):
         self.decomposed = decomposed
         self._do_cfg = do_cfg
         self._prompts = prompts
-        self._indices = [prompts.Add(self._prompt)]
+        self._indices = [prompts.Add(self._prompt, is_negative=is_sp_negative)]
         if self._do_cfg:
-            self._indices.append(prompts.Add(self._negative_prompt))
+            self._indices.append(prompts.Add(self._negative_prompt, is_negative=True))
 
     def GetResidualAt(self, residuals, index: int):
         return residuals[self._indices[index]]
@@ -1804,7 +1829,9 @@ class Layer(BaseLayer):
                         3,
                         "CFG is disabled for a merging Layer whose cfg_scale is always one.",
                     )
-        super()._Initialize(prompts, decomposed=decomposed, do_cfg=do_cfg)
+        super()._Initialize(
+            prompts, decomposed=decomposed, do_cfg=do_cfg, is_sp_negative=False
+        )
         self._mask.Initialize(size, image_model, target)
 
     def GetCfgScale(self, remaining):
@@ -1909,7 +1936,12 @@ class SPLayer(BaseLayer):  # Single-Prompt Layer
         decomposed: bool,
     ):
         Debug(3, "Initialize SPLayer.")
-        super()._Initialize(prompts, decomposed=decomposed, do_cfg=False)
+        super()._Initialize(
+            prompts,
+            decomposed=decomposed,
+            do_cfg=False,
+            is_sp_negative=(not self._for_positive),
+        )
         self._mask.Initialize(size, image_model, target)
 
     def GetResidual(self, residuals, remaining, decomposed, target: SharedTarget):
@@ -2024,7 +2056,7 @@ class LayeredDiffusionPipeline:
         initialize: Optional[Union[Initializer, List[Initializer]]] = None,
         size: Optional[Tuple[int, int]] = None,
         default_encoding: Optional[StandardEncoding] = None,
-        null_prompt: PromptType = None,
+        negative_sot_scale: Optional[float] = 0.8,
         use_rmm: bool = True,  # rmm = Residual Merge Method
         use_decomposed_rmm: bool = True,
         rand_seed: Optional[int] = None,
@@ -2037,10 +2069,6 @@ class LayeredDiffusionPipeline:
             raise ValueError(f"`num_steps` must be > 0. actual: {num_steps}")
         if not default_encoding:
             default_encoding = ShiftEncoding()
-        if isinstance(null_prompt, UniquePromptType):
-            raise ValueError(f"null_prompt must not be UniquePromptType: {null_prompt}")
-        if null_prompt is None:
-            null_prompt = ConstEncoding(0.0)
         if not iterate:
             raise ValueError("`iterate` should contain at least 1 layer.")
         elif not isinstance(iterate, list):
@@ -2069,7 +2097,7 @@ class LayeredDiffusionPipeline:
             Debug(1, f"Adjusting VAE Encoder level by {vae_encoder_adjust}")
 
         bglayer = BackgroundLayer(initialize, vae_encoder_adjust)
-        prompts = Prompts(self.text_model, default_encoding, null_prompt)
+        prompts = Prompts(self.text_model, default_encoding, negative_sot_scale)
         target = self.text_model.target
 
         if use_rmm:
