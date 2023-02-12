@@ -658,8 +658,8 @@ class StandardEncoding:
     def Encode(
         self, text_model: TextModel, text: str, default_encoding  #: StandardEncoding
     ):
-        result = text_model.EncodeText(text, fail_on_truncation=True)
-        return result[0]
+        emb = text_model.EncodeText(text, fail_on_truncation=True)[0]
+        return emb
 
 
 class ConstEncoding(StandardEncoding):
@@ -1460,15 +1460,15 @@ class Prompts:
         self,
         text_model: TextModel,
         default_encoding: StandardEncoding,
-        negative_sot_scale: Optional[float],
+        negative_scale: Union[float, Tuple[float, float]],
     ):
         self._text_model = text_model
         self._default_encoding = default_encoding
-        if negative_sot_scale is None:
+        if (negative_scale == 1.0) or (negative_scale == (1.0, 1.0)):
             self._default_negative_encoding = default_encoding
         else:
             self._default_negative_encoding = ScaledEncoding(
-                scale=(negative_sot_scale, 1.0), encoding=default_encoding
+                scale=negative_scale, encoding=default_encoding
             )
         self._prompts = []
 
@@ -2056,7 +2056,7 @@ class LayeredDiffusionPipeline:
         initialize: Optional[Union[Initializer, List[Initializer]]] = None,
         size: Optional[Tuple[int, int]] = None,
         default_encoding: Optional[StandardEncoding] = None,
-        negative_sot_scale: Optional[float] = 0.8,
+        negative_scale: Union[float, Tuple[float, float]] = 1.0,
         use_rmm: bool = True,  # rmm = Residual Merge Method
         use_decomposed_rmm: bool = True,
         rand_seed: Optional[int] = None,
@@ -2097,7 +2097,7 @@ class LayeredDiffusionPipeline:
             Debug(1, f"Adjusting VAE Encoder level by {vae_encoder_adjust}")
 
         bglayer = BackgroundLayer(initialize, vae_encoder_adjust)
-        prompts = Prompts(self.text_model, default_encoding, negative_sot_scale)
+        prompts = Prompts(self.text_model, default_encoding, negative_scale)
         target = self.text_model.target
 
         if use_rmm:
