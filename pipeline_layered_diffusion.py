@@ -955,6 +955,7 @@ ZeroEmbedding = ConstEncoding(0.0)
 # -0.11 is the approximate average of embedding vector elements.
 UnitEmbedding = ConstEncoding(-0.11)
 
+
 #
 # -- Text embedding utility to combine multiple embeddings --
 #
@@ -1535,7 +1536,7 @@ class DecomposedResidual:
         )
 
     def IsForBG(self):
-        return (not isinstance(self, torch.Tensor)) and (self.scale == 0.0)
+        return (not isinstance(self.scale, torch.Tensor)) and (self.scale == 0.0)
 
     def AddOrMerge(
         self, mine, strength: GeneralizedStrength, mask, remaining: float, to_add: bool
