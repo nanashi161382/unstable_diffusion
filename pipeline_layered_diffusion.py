@@ -2,9 +2,13 @@
 # See the following web page for the usage.
 # https://github.com/nanashi161382/unstable_diffusion/tree/main
 from diffusers import (
-    StableDiffusionInpaintPipelineLegacy,
+    StableDiffusionPipeline,
     DiffusionPipeline,
     DPMSolverMultistepScheduler,
+)
+from diffusers.pipelines.stable_diffusion.convert_from_ckpt import (
+    # download_from_original_stable_diffusion_ckpt,
+    load_pipeline_from_original_stable_diffusion_ckpt,
 )
 from IPython.display import display
 import numpy as np
@@ -337,7 +341,11 @@ class TextModel:
         """
         self._tokenizer = tokenizer
         self._text_encoder = text_encoder
-        self.target = SharedTarget(device, text_encoder.config.torch_dtype)
+        dtype = text_encoder.config.torch_dtype
+        if not dtype:
+            Debug(1, f"Text encoder doesn't have dtype. Setting float32 as default.")
+            dtype = torch.float32
+        self.target = SharedTarget(device, dtype)
 
     def max_length(self):
         return self._tokenizer.model_max_length
@@ -677,6 +685,63 @@ class ConstEncoding(StandardEncoding):
         return self.EncodeSelf(text_model)
 
 
+class _FoldEncoding(StandardEncoding):
+    "This is currently an experimental feature."
+
+    def __init__(self, text: Optional[str] = None):
+        super().__init__(text)
+        self.encoding = ShiftEncoding()
+
+    def _Average(self, embs):
+        Debug(1, f"Take the average of {len(embs)} embeddings.")
+        s = embs[0]
+        for e in embs[1:]:
+            s += e
+        return s / len(embs)
+
+    def Encode(
+        self, text_model: TextModel, text: str, default_encoding: StandardEncoding
+    ):
+        Debug(1, f"Before folding: {text}")
+        folded_texts = [s for s in (s.strip() for s in text.split(",")) if s]
+        Debug(1, "Folded Texts:", folded_texts)
+        if not folded_texts:
+            return self.encoding.Encode(text_model, text, default_encoding)
+        embs = [
+            self.encoding.Encode(text_model, s, default_encoding) for s in folded_texts
+        ]
+        return self._Average(embs)
+
+
+class _AverageEncoding(StandardEncoding):
+    "This is currently an experimental feature."
+
+    def __init__(self, encodings: List[StandardEncoding]):
+        if not encodings:
+            raise ValueError(f"Encodings must not be empty.")
+        self.encodings = encodings
+
+    def IsTerminated(self):
+        return all(e.IsTerminated() for e in self.encodings)
+
+    def EncodeSelf(self, text_model: TextModel, default_encoding: StandardEncoding):
+        embs = [e.EncodeSelf(text_model, default_encoding) for e in self.encodings]
+        return self._Average(embs)
+
+    def Encode(
+        self, text_model: TextModel, text: str, default_encoding: StandardEncoding
+    ):
+        embs = [e.Encode(text_model, text, default_encoding) for e in self.encodings]
+        return self._Average(embs)
+
+    def _Average(self, embs):
+        Debug(1, f"Take the average of {len(embs)} embeddings.")
+        s = embs[0]
+        for e in embs[1:]:
+            s += e
+        return s / len(embs)
+
+
 class ScaledEncoding(StandardEncoding):
     def __init__(
         self,
@@ -1005,6 +1070,17 @@ class Scheduler:
             dataset, subfolder="scheduler"
         )
         self.have_max_timesteps = False
+        self._rand_seed = None
+        self._generator = None
+        return self
+
+    def Wrap(self, scheduler_type: str, scheduler):
+        self.scheduler = scheduler
+        if scheduler_type == "dpm":
+            self.have_max_timesteps = False
+        else:
+            Debug(0, f"Unknown scheduler type: {scheduler_type}")
+            self.have_max_timesteps = True
         self._rand_seed = None
         self._generator = None
         return self
@@ -2016,13 +2092,73 @@ class LayeredDiffusionPipeline:
         extra_args["scheduler"] = self.scheduler.Get()
 
         # Prepare the StableDiffusion pipeline.
-        pipe = StableDiffusionInpaintPipelineLegacy.from_pretrained(
-            dataset, **extra_args
-        ).to(device_type)
+        pipe = StableDiffusionPipeline.from_pretrained(dataset, **extra_args).to(
+            device_type
+        )
 
         # Options for efficient execution
         pipe.enable_attention_slicing()
-        if use_xformers and (self._devicetype_str == "cuda"):
+        if use_xformers and (device_type == "cuda"):
+            pipe.enable_xformers_memory_efficient_attention()
+
+        self._SetPipeline(pipe)
+        return self
+
+    @torch.no_grad()
+    def ConnectCkpt(
+        self,
+        dataset: str,
+        checkpoint_path: str,
+        use_xformers: bool = False,
+        device_type: str = "cuda",
+        scheduler_type: str = "dpm",  # use DPM-Solver++ scheduler
+        # After here, I copied the argument list from download_from_original_stable_diffusion_ckpt
+        # without checking if they are compatible with this library.
+        original_config_file: str = None,
+        image_size: int = 512,
+        prediction_type: str = None,
+        model_type: str = None,
+        extract_ema: bool = False,
+        num_in_channels: Optional[int] = None,
+        upcast_attention: Optional[bool] = None,
+        stable_unclip: Optional[str] = None,
+        stable_unclip_prior: Optional[str] = None,
+        clip_stats_path: Optional[str] = None,
+        controlnet: Optional[bool] = None,
+    ):
+        self._dataset = dataset
+
+        from_safetensors = False
+        safetensors_suffix = ".safetensors"
+        if checkpoint_path[-len(safetensors_suffix) :] == safetensors_suffix:
+            from_safetensors = True
+        Debug(1, f"checkpoint_path: {checkpoint_path}")
+        Debug(3, f"suffix: {checkpoint_path[-len(safetensors_suffix):]}")
+        Debug(1, f"from_safetensors: {from_safetensors}")
+
+        # pipe = download_from_original_stable_diffusion_ckpt(
+        pipe = load_pipeline_from_original_stable_diffusion_ckpt(
+            checkpoint_path=checkpoint_path,
+            original_config_file=original_config_file,
+            image_size=image_size,
+            prediction_type=prediction_type,
+            model_type=model_type,
+            extract_ema=extract_ema,
+            scheduler_type=scheduler_type,
+            num_in_channels=num_in_channels,
+            upcast_attention=upcast_attention,
+            from_safetensors=from_safetensors,
+            device=device_type,
+            stable_unclip=stable_unclip,
+            stable_unclip_prior=stable_unclip_prior,
+            clip_stats_path=clip_stats_path,
+            controlnet=controlnet,
+        ).to(device_type)
+        self.scheduler = Scheduler().Wrap(scheduler_type, pipe.scheduler)
+
+        # Options for efficient execution
+        pipe.enable_attention_slicing()
+        if use_xformers and (device_type == "cuda"):
             pipe.enable_xformers_memory_efficient_attention()
 
         self._SetPipeline(pipe)
