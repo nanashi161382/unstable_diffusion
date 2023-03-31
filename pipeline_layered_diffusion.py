@@ -6,6 +6,7 @@ from diffusers import (
     DiffusionPipeline,
     DPMSolverMultistepScheduler,
 )
+import diffusers.pipelines.stable_diffusion.convert_from_ckpt as convert_from_ckpt
 from diffusers.pipelines.stable_diffusion.convert_from_ckpt import (
     # download_from_original_stable_diffusion_ckpt,
     load_pipeline_from_original_stable_diffusion_ckpt,
@@ -2067,18 +2068,21 @@ class LayeredDiffusionPipeline:
 
         return recommended_revision.get(dataset, default_revision)
 
+    @torch.no_grad()
     def Connect(
         self,
-        dataset: str,
+        model_name: str,
         cache_path: Optional[str] = None,
         revision: Optional[str] = None,
         auth_token: Optional[str] = None,
         use_xformers: bool = False,
         device_type: str = "cuda",
     ):
-        self._dataset = dataset
+        self._model_name = model_name
         if cache_path:
             dataset = cache_path
+        else:
+            dataset = model_name
 
         extra_args = {
             "torch_dtype": torch.float32,  # This may be needed to avoid OOM.
@@ -2107,8 +2111,9 @@ class LayeredDiffusionPipeline:
     @torch.no_grad()
     def ConnectCkpt(
         self,
-        dataset: str,
+        model_name: str,
         checkpoint_path: str,
+        vae_path: Optional[str] = None,
         use_xformers: bool = False,
         device_type: str = "cuda",
         scheduler_type: str = "dpm",  # use DPM-Solver++ scheduler
@@ -2126,7 +2131,7 @@ class LayeredDiffusionPipeline:
         clip_stats_path: Optional[str] = None,
         controlnet: Optional[bool] = None,
     ):
-        self._dataset = dataset
+        self._model_name = model_name
 
         from_safetensors = False
         safetensors_suffix = ".safetensors"
@@ -2135,6 +2140,18 @@ class LayeredDiffusionPipeline:
         Debug(1, f"checkpoint_path: {checkpoint_path}")
         Debug(3, f"suffix: {checkpoint_path[-len(safetensors_suffix):]}")
         Debug(1, f"from_safetensors: {from_safetensors}")
+
+        if vae_path:
+            # TODO: also load config.json
+            vae_ckpt_ldm = torch.load(
+                vae_path + "/diffusion_pytorch_model.bin", map_location=device_type
+            )
+            original_convert_ldm_vae_checkpoint = (
+                convert_from_ckpt.convert_ldm_vae_checkpoint
+            )
+            convert_from_ckpt.convert_ldm_vae_checkpoint = (
+                lambda _, config: vae_ckpt_ldm
+            )
 
         # pipe = download_from_original_stable_diffusion_ckpt(
         pipe = load_pipeline_from_original_stable_diffusion_ckpt(
@@ -2156,6 +2173,11 @@ class LayeredDiffusionPipeline:
         ).to(device_type)
         self.scheduler = Scheduler().Wrap(scheduler_type, pipe.scheduler)
 
+        if vae_path:
+            convert_from_ckpt.convert_ldm_vae_checkpoint = (
+                original_convert_ldm_vae_checkpoint
+            )
+
         # Options for efficient execution
         pipe.enable_attention_slicing()
         if use_xformers and (device_type == "cuda"):
@@ -2165,7 +2187,7 @@ class LayeredDiffusionPipeline:
         return self
 
     def CopyFrom(self, another):
-        self._dataset = another._dataset
+        self._model_name = another._model_name
         self.scheduler = Scheduler().CopyFrom(another.scheduler)
         self._SetPipeline(another.pipe)
         return self
@@ -2181,6 +2203,23 @@ class LayeredDiffusionPipeline:
             rand_seed = random.SystemRandom().randint(1, 4294967295)
         self._rand_seed = rand_seed
         self.scheduler.ResetGenerator(self.text_model.target, rand_seed)
+
+    def _GetVaeEncoderAdjust(self):
+        # Anything v3.0's VAE has a degradation problem in its encoder.
+        # Multiplying the adjustment factor of 1.25 to the encoder output mitigates
+        # the problem to a lower level.
+        # See https://twitter.com/tomo161382/status/1601962971085041664 for details.
+        #
+        # TODO: revisit this function considering that now VAE is swappable.
+        if self._model_name == "Linaqruf/anything-v3.0":
+            return 1.25
+        return 1.0
+
+    def GetModelName(self):
+        return self._model_name
+
+    def GetShortModelName(self):
+        return self._model_name.split("/")[-1]
 
     def GetRandSeed(self):
         return self._rand_seed
@@ -2223,13 +2262,8 @@ class LayeredDiffusionPipeline:
                     "Distinct layers, layers to add or SP layers are available only with RMM."
                 )
 
-        # Anything v3.0's VAE has a degradation problem in its encoder.
-        # Multiplying the adjustment factor of 1.25 to the encoder output mitigates
-        # the problem to a lower level.
-        # See https://twitter.com/tomo161382/status/1601962971085041664 for details.
         if not vae_encoder_adjust:
-            if self._dataset == "Linaqruf/anything-v3.0":
-                vae_encoder_adjust = 1.25
+            vae_encoder_adjust = self._GetVaeEncoderAdjust()
         if vae_encoder_adjust != 1.0:
             Debug(1, f"Adjusting VAE Encoder level by {vae_encoder_adjust}")
 
