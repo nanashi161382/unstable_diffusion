@@ -2075,7 +2075,7 @@ class LayeredDiffusionPipeline:
         cache_path: Optional[str] = None,
         revision: Optional[str] = None,
         auth_token: Optional[str] = None,
-        use_xformers: bool = False,
+        use_xformers: bool = True,
         device_type: str = "cuda",
     ):
         self._model_name = model_name
@@ -2114,7 +2114,7 @@ class LayeredDiffusionPipeline:
         model_name: str,
         checkpoint_path: str,
         vae_path: Optional[str] = None,
-        use_xformers: bool = False,
+        use_xformers: bool = True,
         device_type: str = "cuda",
         scheduler_type: str = "dpm",  # use DPM-Solver++ scheduler
         # After here, I copied the argument list from download_from_original_stable_diffusion_ckpt
