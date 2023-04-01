@@ -48,7 +48,7 @@ Then initialize the pipeline as follows.
 ```python
 dataset = "stabilityai/stable-diffusion-2"
 auth_token = "" # auth token for HuggingFace if needed
-pipe = UnstableDiffusionPipeline().Connect(dataset, auth_token=auth_token, use_xformers=use_xformers)
+pipe = LayeredDiffusionPipeline().Connect(dataset, auth_token=auth_token, use_xformers=use_xformers)
 ```
 
 Now you are ready for running the stable diffusion pipeline.
