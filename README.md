@@ -14,6 +14,8 @@ The Layered Diffusion Pipeline can perform the same tasks as the original Stable
 * image to image
 * legacy inpainting
 
+### Initialization
+
 First, to use the library, you should put the python file in your current directory and then import like this.
 
 ```python
@@ -23,33 +25,46 @@ from pipeline_layered_diffusion import *
 You can import the library in Google Colab like this.
 
 ```python
-!pip install --upgrade diffusers transformers scipy accelerate
-use_xformers = False
+!pip install --upgrade diffusers transformers scipy accelerate xformers safetensors omegaconf pytorch_lightning
 # Original code: https://github.com/nanashi161382/unstable_diffusion/blob/main/pipeline_layered_diffusion.py
 !wget 'https://raw.githubusercontent.com/nanashi161382/unstable_diffusion/main/pipeline_layered_diffusion.py'
 from pipeline_layered_diffusion import *
 ```
 
-If you want to enable xformers memory efficient attention, you can run this instead.
+Then initialize the pipeline with a diffusers-format model data from a HuggingFace repository as follows.
 
 ```python
-!pip install --upgrade diffusers transformers scipy accelerate
-# use the pre-release versions for triton
-!pip install --upgrade --pre triton
-!pip install -q https://github.com/metrolobo/xformers_wheels/releases/download/1d31a3ac_various_6/xformers-0.0.14.dev0-cp37-cp37m-linux_x86_64.whl
-use_xformers = True
-# Original code: https://github.com/nanashi161382/unstable_diffusion/blob/main/pipeline_layered_diffusion.py
-!wget 'https://raw.githubusercontent.com/nanashi161382/unstable_diffusion/main/pipeline_layered_diffusion.py'
-from pipeline_layered_diffusion import *
-```
-
-Then initialize the pipeline as follows.
-
-```python
-dataset = "stabilityai/stable-diffusion-2"
+model_name = "stabilityai/stable-diffusion-2"
 auth_token = "" # auth token for HuggingFace if needed
-pipe = LayeredDiffusionPipeline().Connect(dataset, auth_token=auth_token, use_xformers=use_xformers)
+pipe = LayeredDiffusionPipeline().Connect(model_name, auth_token=auth_token)
 ```
+
+If you have a diffusers-format model data locally, you can initialize the pipeline as follows.
+
+```python
+model_name = "stabilityai/stable-diffusion-2"  # This can be an arbitrary string.
+model_path = "/path/to/model/directory"
+pipe = LayeredDiffusionPipeline().Connect(model_name, cache_path=model_path)
+```
+
+If you have a StableDiffusion-style ckpt/safetensors file, you can also use it as follows.
+
+```python
+model_name = "stabilityai/stable-diffusion-2"  # This can be an arbitrary string.
+model_path = "/path/to/model/directory/model_name.ckpt"
+pipe = LayeredDiffusionPipeline().ConnectCkpt(model_name, checkpoint_path=model_path)
+```
+
+In this case, you can also swap the VAE as you like. Both the .pt-format data and the diffusers-format data are accepted.
+
+```python
+model_name = "stabilityai/stable-diffusion-2"  # This can be an arbitrary string.
+model_path = "/path/to/model/directory/model_name.ckpt"
+vae_path = "/path/to/vae/model/directory/vae_name.vae.pt"
+pipe = LayeredDiffusionPipeline().ConnectCkpt(model_name, checkpoint_path=model_path, vae_path=vae_path)
+```
+
+### Image generation
 
 Now you are ready for running the stable diffusion pipeline.
 
@@ -117,7 +132,7 @@ display(image)
 ![inpainting example](https://user-images.githubusercontent.com/118838049/209058798-6898bfd7-a906-4079-89fd-ad8f5c5e3ffa.png)
 
 
-## ShiftEncoding
+### ShiftEncoding
 
 By default, prompts and negative prompts are interpreted by ShiftEncoding that works differently from the stable diffusion pipeline.
 
