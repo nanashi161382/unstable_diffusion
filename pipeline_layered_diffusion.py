@@ -2045,6 +2045,52 @@ class SPLayer(BaseLayer):  # Single-Prompt Layer
 
 
 #
+# -- Sideloader --
+#
+class CkptVAESideloader:
+    def __init__(self, vae_path, device_type):
+        self._enabled = bool(vae_path)
+        if not self._enabled:
+            return
+        vae_pt_suffix = ".pt"
+        if vae_path[-len(vae_pt_suffix) :] == vae_pt_suffix:
+            # VAE pt file
+            pt_ckpt = torch.load(vae_path, map_location=device_type)
+            if "state_dict" in pt_ckpt.keys():
+                pt_ckpt = pt_ckpt.get("state_dict")
+            sd_ckpt = {}
+            for key in pt_ckpt.keys():
+                sd_ckpt["first_stage_model." + key] = pt_ckpt.get(key)
+            self._ckpt = sd_ckpt
+            self._should_convert = True
+        else:
+            # diffusers VAE dir
+            self._ckpt = torch.load(
+                vae_path + "/diffusion_pytorch_model.bin", map_location=device_type
+            )
+            self._should_convert = False
+
+    def Initialize(self):
+        self._original_function = convert_from_ckpt.convert_ldm_vae_checkpoint
+        convert_from_ckpt.convert_ldm_vae_checkpoint = (
+            lambda orig_ckpt, config: self.convert_ldm_vae_checkpoint(config, orig_ckpt)
+        )
+        return self
+
+    def convert_ldm_vae_checkpoint(self, config, orig_ckpt):
+        Debug(1, "VAE sideloader is invoked .")
+        if not self._enabled:
+            # Call the original function with the original checkpoint data.
+            return self._original_function(orig_ckpt, config)
+        if not self._should_convert:
+            return self._ckpt
+        return self._original_function(self._ckpt, config)
+
+    def Finalize(self):
+        convert_from_ckpt.convert_ldm_vae_checkpoint = self._original_function
+
+
+#
 # -- Main pipeline --
 #
 class LayeredDiffusionPipeline:
@@ -2141,17 +2187,7 @@ class LayeredDiffusionPipeline:
         Debug(3, f"suffix: {checkpoint_path[-len(safetensors_suffix):]}")
         Debug(1, f"from_safetensors: {from_safetensors}")
 
-        if vae_path:
-            # TODO: also load config.json
-            vae_ckpt_ldm = torch.load(
-                vae_path + "/diffusion_pytorch_model.bin", map_location=device_type
-            )
-            original_convert_ldm_vae_checkpoint = (
-                convert_from_ckpt.convert_ldm_vae_checkpoint
-            )
-            convert_from_ckpt.convert_ldm_vae_checkpoint = (
-                lambda _, config: vae_ckpt_ldm
-            )
+        vae_sideloader = CkptVAESideloader(vae_path, device_type).Initialize()
 
         # pipe = download_from_original_stable_diffusion_ckpt(
         pipe = load_pipeline_from_original_stable_diffusion_ckpt(
@@ -2173,10 +2209,7 @@ class LayeredDiffusionPipeline:
         ).to(device_type)
         self.scheduler = Scheduler().Wrap(scheduler_type, pipe.scheduler)
 
-        if vae_path:
-            convert_from_ckpt.convert_ldm_vae_checkpoint = (
-                original_convert_ldm_vae_checkpoint
-            )
+        vae_sideloader.Finalize()
 
         # Options for efficient execution
         pipe.enable_attention_slicing()
