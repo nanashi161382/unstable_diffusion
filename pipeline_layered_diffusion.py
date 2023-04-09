@@ -5,6 +5,7 @@ from diffusers import (
     StableDiffusionPipeline,
     DiffusionPipeline,
     DPMSolverMultistepScheduler,
+    ControlNetModel,
 )
 import diffusers.pipelines.stable_diffusion.convert_from_ckpt as convert_from_ckpt
 from diffusers.pipelines.stable_diffusion.convert_from_ckpt import (
@@ -17,6 +18,7 @@ import PIL
 from PIL import ImageDraw, ImageFont
 import random
 import re
+from safetensors import safe_open
 import torch
 from torch import autocast
 from typing import Any, Optional, List, Union, Callable, Tuple, Dict
@@ -443,15 +445,14 @@ class ImageModel:
     def num_channels(self):
         return self._num_channels
 
-    def Preprocess(self, image: PIL.Image.Image):
+    def Preprocess(self, image: PIL.Image.Image, target: SharedTarget):
         w, h = image.size
         # Shouldn't this be consistent with vae_scale_factor?
         w, h = map(lambda x: x - x % 32, (w, h))  # resize to integer multiple of 32
         image = image.resize((w, h), resample=PIL.Image.LANCZOS)
         image = np.array(image).astype(np.float32) / 255.0
         image = image[None].transpose(0, 3, 1, 2)
-        image = torch.from_numpy(image)
-        return 2.0 * image - 1.0
+        return torch.from_numpy(image).to(**target.dict)
 
     def Encode(
         self,
@@ -460,7 +461,8 @@ class ImageModel:
         target: SharedTarget,
         deterministic: bool = False,
     ):
-        image = self.Preprocess(image).to(**target.dict)
+        image = self.Preprocess(image)
+        image = 2.0 * image - 1.0
 
         # encode the init image into latents and scale the latents
         latent_dist = self._vae.encode(image).latent_dist
@@ -511,8 +513,9 @@ class LatentMask:
         else:
             return cls(mask_by)
 
-    def __init__(self, mask_by: Union[float, str, PIL.Image.Image]):
+    def __init__(self, mask_by: Union[float, str, PIL.Image.Image], inverse=False):
         self._mask_by = mask_by
+        self._inverse = inverse
 
     def Initialize(
         self,
@@ -531,6 +534,9 @@ class LatentMask:
             self._mask = image_model.PreprocessMask(mask, target)
         else:
             self._mask = 1.0 - mask  # make the scale same as the mask image.
+
+        if self._inverse:
+            self._mask = 1.0 - self._mask
 
     def Merge(self, black, white, level: float = 1.0):
         inverted_mask = 1.0 - self._mask  # make white = 1.0 & black = 0.0
@@ -1211,6 +1217,9 @@ class Initializer:
     def GetStrength(self):
         return self.strength
 
+    def GetSize(self):
+        raise NotImplementedError("Subclass should implement this.")
+
     def InitializeMask(
         self,
         size: Optional[Tuple[int, int]],
@@ -1283,7 +1292,11 @@ class Randomly(Initializer):
         latents = self._GetLatents(
             size, image_model, scheduler.generator(), target, vae_encoder_adjust
         )
+        self._size = size
         return latents * scheduler.Get().init_noise_sigma
+
+    def GetSize(self):
+        return self._size
 
     def _GetLatents(
         self,
@@ -1360,9 +1373,20 @@ class ByLatents(Initializer):
         scheduler: Scheduler,
         timesteps,
     ):
+        scale_factor = image_model.vae_scale_factor()
+        _, _, h, w = latents.shape
+        self._size = (w * scale_factor, h * scale_factor)
+        if size and (size != self._size):
+            raise ValueError(
+                f"Latent size should match the given image size: {self._size}"
+            )
+
         self.InitializeMask(size, image_model, target)
         latents = self._latents.to(**target.dict)
         return latents * scheduler.Get().init_noise_sigma
+
+    def GetSize(self):
+        return self._size
 
 
 class ByImage(Initializer):
@@ -1408,6 +1432,7 @@ class ByImage(Initializer):
         if size and (image.size != size):
             Debug(1, f"Resize image from {image.size} to {size}.")
             image = image.resize(size, resample=PIL.Image.LANCZOS)
+        self._size = image.size
 
         latents = image_model.Encode(image, generator, target) * vae_encoder_adjust
         self._initial_latents = latents
@@ -1416,6 +1441,9 @@ class ByImage(Initializer):
         return scheduler.Get().add_noise(
             self._initial_latents, self._noise, initial_timestep
         )
+
+    def GetSize(self):
+        return self._size
 
     def OverwriteLatents(
         self,
@@ -1498,11 +1526,20 @@ class InitializerList:
             for init in self.initializers
         ]
         init_latents = latents_list[0][0]
+        init_size = latents_list[0][1].GetSize()
         for latents, init in latents_list[1:]:
+            if init_size != init.GetSize():
+                raise ValueError(
+                    f"Image size of initializers are not the same: {init_size} vs {init.GetSize()}"
+                )
             init_latents = init.Merge(
                 other=init_latents, mine=latents, remaining=1.0, force_overwrite=True
             )
+        self._size = init_size
         return init_latents
+
+    def GetSize(self):
+        return self._size
 
     def OverwriteLatents(
         self,
@@ -1564,14 +1601,26 @@ class Prompts:
         )
         return index
 
-    def PredictResiduals(self, scheduler, unet, latents, timestep, remaining: float):
+    def PredictResiduals(
+        self, scheduler, unet, controlnet, latents, timestep, remaining: float
+    ):
         model_input = torch.cat(latents)
         model_input = scheduler.Get().scale_model_input(model_input, timestep)
         text_embeddings = torch.cat(
             [te.GetEmbedding(remaining) for te in self._prompts]
         )
+        if controlnet:
+            down_block_residuals, mid_block_residuals = controlnet(
+                model_input, timestep, text_embeddings
+            )
+        else:
+            down_block_residuals, mid_block_residuals = None, None
         residuals = unet(
-            model_input, timestep, encoder_hidden_states=text_embeddings
+            model_input,
+            timestep,
+            encoder_hidden_states=text_embeddings,
+            down_block_additional_residuals=down_block_residuals,
+            mid_block_additional_residual=mid_block_residuals,
         ).sample
         return residuals.chunk(len(self._prompts))
 
@@ -1753,6 +1802,9 @@ class BackgroundLayer:
 
     def IsDistinct(self):
         return False
+
+    def GetSize(self):
+        return self._initializers.GetSize()
 
     def Initialize(
         self,
@@ -2053,11 +2105,28 @@ class CkptVAESideloader:
         if not self._enabled:
             return
         vae_pt_suffix = ".pt"
-        if vae_path[-len(vae_pt_suffix) :] == vae_pt_suffix:
+        vae_ckpt_suffix = ".ckpt"
+        vae_safetensors_suffix = ".safetensors"
+
+        is_safetensors = (
+            vae_path[-len(vae_safetensors_suffix) :] == vae_safetensors_suffix
+        )
+        if (
+            is_safetensors
+            or (vae_path[-len(vae_pt_suffix) :] == vae_pt_suffix)
+            or (vae_path[-len(vae_ckpt_suffix) :] == vae_ckpt_suffix)
+        ):
             # VAE pt file
-            pt_ckpt = torch.load(vae_path, map_location=device_type)
+            if is_safetensors:
+                pt_ckpt = {}
+                with safe_open(vae_path, framework="pt", device="cpu") as f:
+                    for key in f.keys():
+                        pt_ckpt[key] = f.get_tensor(key)
+            else:
+                pt_ckpt = torch.load(vae_path, map_location=device_type)
             if "state_dict" in pt_ckpt.keys():
                 pt_ckpt = pt_ckpt.get("state_dict")
+
             sd_ckpt = {}
             for key in pt_ckpt.keys():
                 sd_ckpt["first_stage_model." + key] = pt_ckpt.get(key)
@@ -2078,7 +2147,7 @@ class CkptVAESideloader:
         return self
 
     def convert_ldm_vae_checkpoint(self, config, orig_ckpt):
-        Debug(1, "VAE sideloader is invoked .")
+        Debug(1, "VAE sideloader is invoked.")
         if not self._enabled:
             # Call the original function with the original checkpoint data.
             return self._original_function(orig_ckpt, config)
@@ -2088,6 +2157,86 @@ class CkptVAESideloader:
 
     def Finalize(self):
         convert_from_ckpt.convert_ldm_vae_checkpoint = self._original_function
+
+
+#
+# -- ControlNet --
+#
+class ControlNet:
+    def __init__(
+        self,
+        default_image: Optional[Union[str, PIL.Image.Image]] = None,
+        default_scale: float = 1.0,
+    ):
+        self._default_image = default_image
+        self._default_scale = default_scale
+        self._models = []
+        self._images = []
+        self._scales = []
+
+    def Add(
+        self,
+        model: ControlNetModel,
+        image: Optional[Union[str, PIL.Image.Image]] = None,
+        scale: Optional[float] = None,
+    ):
+        self._models.append(model)
+        self._images.append(image)
+        self._scales.append(scale if scale else self._default_scale)
+        return self
+
+    def Initialize(
+        self,
+        size: Tuple[int, int],
+        image_model: ImageModel,
+        prompts: Prompts,
+        target: SharedTarget,
+    ):
+        Debug(1, "ControlNet is initialized.")
+        default_image_input = None
+
+        def PreprocessImageInput(image):
+            if isinstance(image, str):
+                image = OpenImageWithBackground(image, background="black")
+            return torch.cat([image_model.Preprocess(image, target)] * len(prompts))
+
+        def GetDefaultImageInput():
+            nonlocal default_image_input
+            if not default_image_input:
+                if not self._default_image:
+                    raise ValueError(f"No default image input for ControlNet.")
+                default_image_input = PreprocessImageInput(self._default_image)
+            return default_image_input
+
+        def GetImageInput(image):
+            if not image:
+                return GetDefaultImageInput()
+            return PreprocessImageInput(image)
+
+        self._image_inputs = [GetImageInput(image) for image in self._images]
+
+    def __call__(self, model_input, timestep, text_embeddings):
+        for i, (model, image, scale) in enumerate(
+            zip(self._models, self._image_inputs, self._scales)
+        ):
+            dbr, mbr = model(
+                model_input,
+                timestep,
+                encoder_hidden_states=text_embeddings,
+                controlnet_cond=image,
+                return_dict=False,
+            )
+            if scale != 1.0:
+                dbr = [x * scale for x in dbr]
+                mbr *= scale
+            if i == 0:
+                down_block_residuals, mid_block_residuals = dbr, mbr
+            else:
+                down_block_residuals = [
+                    sum(x) for x in zip(down_block_residuals, dbr, strict=True)
+                ]
+                mid_block_residuals += mbr
+        return down_block_residuals, mid_block_residuals
 
 
 #
@@ -2159,17 +2308,20 @@ class LayeredDiffusionPipeline:
         self,
         model_name: str,
         checkpoint_path: str,
+        original_config_file: str = None,  # YAML file only if necessary
         vae_path: Optional[str] = None,
+        embedding_path: Optional[
+            Union[str, List[str]]
+        ] = None,  # Textual Inversion 'embedding' file
         use_xformers: bool = True,
         device_type: str = "cuda",
         scheduler_type: str = "dpm",  # use DPM-Solver++ scheduler
+        extract_ema: bool = True,  # ignored if not applicable
         # After here, I copied the argument list from download_from_original_stable_diffusion_ckpt
         # without checking if they are compatible with this library.
-        original_config_file: str = None,
         image_size: int = 512,
         prediction_type: str = None,
         model_type: str = None,
-        extract_ema: bool = False,
         num_in_channels: Optional[int] = None,
         upcast_attention: Optional[bool] = None,
         stable_unclip: Optional[str] = None,
@@ -2207,6 +2359,12 @@ class LayeredDiffusionPipeline:
             clip_stats_path=clip_stats_path,
             controlnet=controlnet,
         ).to(device_type)
+        if embedding_path:
+            if isinstance(embedding_path, list):
+                for path in embedding_path:
+                    pipe.load_textual_inversion(path)
+            else:
+                pipe.load_textual_inversion(embedding_path)
         self.scheduler = Scheduler().Wrap(scheduler_type, pipe.scheduler)
 
         vae_sideloader.Finalize()
@@ -2263,6 +2421,7 @@ class LayeredDiffusionPipeline:
         num_steps: int,
         iterate: Union[Layer, List[Layer]],
         initialize: Optional[Union[Initializer, List[Initializer]]] = None,
+        controlnet: Optional[ControlNet] = None,
         size: Optional[Tuple[int, int]] = None,
         default_encoding: Optional[StandardEncoding] = None,
         negative_prompt_scale: Union[float, Tuple[float, float]] = 1.0,
@@ -2308,6 +2467,7 @@ class LayeredDiffusionPipeline:
             mm = self.ResidualMergeMethod(
                 self.scheduler,
                 self.unet,
+                controlnet,
                 target,
                 bglayer,
                 layers,
@@ -2316,7 +2476,7 @@ class LayeredDiffusionPipeline:
             )
         else:
             mm = self.LatentMergeMethod(
-                self.scheduler, self.unet, target, bglayer, layers, prompts
+                self.scheduler, self.unet, controlnet, target, bglayer, layers, prompts
             )
 
         with autocast(target.device_type()):
@@ -2340,9 +2500,12 @@ class LayeredDiffusionPipeline:
             return mm.Result(self.image_model)
 
     class LatentMergeMethod:
-        def __init__(self, scheduler, unet, target, bglayer, layers, prompts):
+        def __init__(
+            self, scheduler, unet, controlnet, target, bglayer, layers, prompts
+        ):
             self.scheduler = scheduler
             self.unet = unet
+            self.controlnet = controlnet
             self.target = target
             self.bglayer = bglayer
             self.layers = layers
@@ -2366,6 +2529,10 @@ class LayeredDiffusionPipeline:
             self.latents = latents
             self.scheduler.PrepareExtraStepKwargs(pipe, eta)
             self.timesteps = timesteps
+            if self.controlnet:
+                self.controlnet.Initialize(
+                    self.bglayer.GetSize(), image_model, self.prompts, self.target
+                )
 
         def Step(self, i, ts, remaining):
             latents_for_prompts = [self.latents] * len(self.prompts)
@@ -2388,7 +2555,12 @@ class LayeredDiffusionPipeline:
 
         def UNet(self, latents_for_prompts, ts, remaining, decomposed=False):
             residuals_for_prompts = self.prompts.PredictResiduals(
-                self.scheduler, self.unet, latents_for_prompts, ts, remaining
+                self.scheduler,
+                self.unet,
+                self.controlnet,
+                latents_for_prompts,
+                ts,
+                remaining,
             )
             residuals_for_layers = [
                 l.GetResidual(residuals_for_prompts, remaining, decomposed, self.target)
@@ -2401,10 +2573,20 @@ class LayeredDiffusionPipeline:
 
     class ResidualMergeMethod(LatentMergeMethod):
         def __init__(
-            self, scheduler, unet, target, bglayer, layers, prompts, decomposed
+            self,
+            scheduler,
+            unet,
+            controlnet,
+            target,
+            bglayer,
+            layers,
+            prompts,
+            decomposed,
         ):
             Debug(1, f"Using RMM with decomposed = {decomposed}")
-            super().__init__(scheduler, unet, target, bglayer, layers, prompts)
+            super().__init__(
+                scheduler, unet, controlnet, target, bglayer, layers, prompts
+            )
             rmm_index = 0
             rmm_layers = []
             for i, layer in enumerate(self.all_layers):
