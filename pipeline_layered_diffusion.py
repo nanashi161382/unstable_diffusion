@@ -1,6 +1,7 @@
 # @title LayeredDiffusionPipeline
 # See the following web page for the usage.
 # https://github.com/nanashi161382/unstable_diffusion/tree/main
+import accelerate
 from diffusers import (
     StableDiffusionPipeline,
     DiffusionPipeline,
@@ -312,10 +313,13 @@ def using(value, after=None, until=None):
 #
 class SharedTarget:
     def __init__(self, device, dtype):
+        Debug(1, f"SharedTarget is created for {device}, {dtype}")
         if not device:
             raise ValueError(f"device should not be None.")
         if not dtype:
             raise ValueError(f"dtype should not be None.")
+        if isinstance(device, str):
+            device = torch.device(device)
         self.dict = {
             "device": device,
             "dtype": dtype,
@@ -329,6 +333,9 @@ class SharedTarget:
 
     def dtype(self):
         return self.dict["dtype"]
+
+    def __str__(self):
+        return f"({self.device_type()}, {self.dtype()})"
 
 
 #
@@ -461,7 +468,7 @@ class ImageModel:
         target: SharedTarget,
         deterministic: bool = False,
     ):
-        image = self.Preprocess(image)
+        image = self.Preprocess(image, target)
         image = 2.0 * image - 1.0
 
         # encode the init image into latents and scale the latents
@@ -2198,7 +2205,10 @@ class ControlNet:
         def PreprocessImageInput(image):
             if isinstance(image, str):
                 image = OpenImageWithBackground(image, background="black")
-            return torch.cat([image_model.Preprocess(image, target)] * len(prompts))
+            if image.size != size:
+                image = image.resize(size, resample=PIL.Image.LANCZOS)
+            image = image_model.Preprocess(image, target)
+            return torch.cat([image] * len(prompts))
 
         def GetDefaultImageInput():
             nonlocal default_image_input
@@ -2213,6 +2223,10 @@ class ControlNet:
                 return GetDefaultImageInput()
             return PreprocessImageInput(image)
 
+        self._offload_hooks = [
+            accelerate.cpu_offload_with_hook(model, target.device())[1]
+            for model in self._models
+        ]
         self._image_inputs = [GetImageInput(image) for image in self._images]
 
     def __call__(self, model_input, timestep, text_embeddings):
@@ -2224,8 +2238,11 @@ class ControlNet:
                 timestep,
                 encoder_hidden_states=text_embeddings,
                 controlnet_cond=image,
+                # conditioning_scale=scale,  # Not available at diffusers 0.14
                 return_dict=False,
             )
+            # TODO: update when diffusers are updated
+            # This is an intermediate implementation for diffusers 0.14
             if scale != 1.0:
                 dbr = [x * scale for x in dbr]
                 mbr *= scale
@@ -2243,7 +2260,7 @@ class ControlNet:
 # -- Main pipeline --
 #
 class LayeredDiffusionPipeline:
-    def GetRevision(self, dataset: str, revision: Optional[str] = None):
+    def GetRevision(self, model_name: str, revision: Optional[str] = None):
         # revision is a git branch name assigned to the model repository.
 
         # Always return the provided revision if any.
@@ -2261,7 +2278,7 @@ class LayeredDiffusionPipeline:
             "naclbit/trinart_stable_diffusion_v2": "diffusers-60k",
         }
 
-        return recommended_revision.get(dataset, default_revision)
+        return recommended_revision.get(model_name, default_revision)
 
     @torch.no_grad()
     def Connect(
@@ -2274,14 +2291,16 @@ class LayeredDiffusionPipeline:
         device_type: str = "cuda",
     ):
         self._model_name = model_name
+        self._device_type = device_type
+
         if cache_path:
             dataset = cache_path
         else:
             dataset = model_name
 
         extra_args = {
-            "torch_dtype": torch.float32,  # This may be needed to avoid OOM.
-            "revision": self.GetRevision(dataset, revision),
+            "torch_dtype": torch.float32,
+            "revision": self.GetRevision(model_name, revision),
         }
         if auth_token:
             extra_args["use_auth_token"] = auth_token
@@ -2291,15 +2310,9 @@ class LayeredDiffusionPipeline:
         extra_args["scheduler"] = self.scheduler.Get()
 
         # Prepare the StableDiffusion pipeline.
-        pipe = StableDiffusionPipeline.from_pretrained(dataset, **extra_args).to(
-            device_type
-        )
+        pipe = StableDiffusionPipeline.from_pretrained(dataset, **extra_args)
 
-        # Options for efficient execution
-        pipe.enable_attention_slicing()
-        if use_xformers and (device_type == "cuda"):
-            pipe.enable_xformers_memory_efficient_attention()
-
+        self._SetOptions(pipe, use_xformers, device_type)
         self._SetPipeline(pipe)
         return self
 
@@ -2330,6 +2343,7 @@ class LayeredDiffusionPipeline:
         controlnet: Optional[bool] = None,
     ):
         self._model_name = model_name
+        self._device_type = device_type
 
         from_safetensors = False
         safetensors_suffix = ".safetensors"
@@ -2358,7 +2372,7 @@ class LayeredDiffusionPipeline:
             stable_unclip_prior=stable_unclip_prior,
             clip_stats_path=clip_stats_path,
             controlnet=controlnet,
-        ).to(device_type)
+        )
         if embedding_path:
             if isinstance(embedding_path, list):
                 for path in embedding_path:
@@ -2369,24 +2383,46 @@ class LayeredDiffusionPipeline:
 
         vae_sideloader.Finalize()
 
-        # Options for efficient execution
-        pipe.enable_attention_slicing()
-        if use_xformers and (device_type == "cuda"):
-            pipe.enable_xformers_memory_efficient_attention()
-
+        self._SetOptions(pipe, use_xformers, device_type)
         self._SetPipeline(pipe)
         return self
 
     def CopyFrom(self, another):
         self._model_name = another._model_name
+        self._device_type = another._device_type
         self.scheduler = Scheduler().CopyFrom(another.scheduler)
         self._SetPipeline(another.pipe)
+        another._DeleteFields()
         return self
+
+    def Dispose(self):
+        # TODO: This is still developing.
+        self.pipe.to("cpu")
+        self._DeleteFields()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
+    def _DeleteFields(self):
+        del self.pipe
+        del self.unet
+        del self.text_model
+        del self.image_model
+        del self.scheduler
+
+    def _SetOptions(self, pipe, use_xformers, device_type):
+        # Options for efficient execution
+        pipe.enable_attention_slicing()
+        if use_xformers:
+            pipe.enable_xformers_memory_efficient_attention()
+        # pipe.enable_model_cpu_offload()
+        pipe.to(device_type)
 
     def _SetPipeline(self, pipe):
         self.pipe = pipe
         self.unet = pipe.unet
-        self.text_model = TextModel(pipe.tokenizer, pipe.text_encoder, pipe.device)
+        self.text_model = TextModel(
+            pipe.tokenizer, pipe.text_encoder, self._device_type
+        )
         self.image_model = ImageModel(pipe.vae, pipe.vae_scale_factor)
 
     def _ResetGenerator(self, rand_seed: Optional[int] = None):
@@ -2497,7 +2533,17 @@ class LayeredDiffusionPipeline:
                 # )
                 # Debug(3, "", self.image_model.Decode(latents_debug)[0])
 
-            return mm.Result(self.image_model)
+            result = mm.Result(self.image_model)
+
+        # Offload last model to CPU
+        if (
+            hasattr(self.pipe, "final_offload_hook")
+            and self.pipe.final_offload_hook is not None
+        ):
+            self.pipe.final_offload_hook.offload()
+            torch.cuda.empty_cache()
+
+        return result
 
     class LatentMergeMethod:
         def __init__(
