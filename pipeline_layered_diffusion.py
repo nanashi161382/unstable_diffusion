@@ -7,11 +7,12 @@ from diffusers import (
     DiffusionPipeline,
     DPMSolverMultistepScheduler,
     ControlNetModel,
+    TextualInversionLoaderMixin,
 )
 import diffusers.pipelines.stable_diffusion.convert_from_ckpt as convert_from_ckpt
 from diffusers.pipelines.stable_diffusion.convert_from_ckpt import (
-    # download_from_original_stable_diffusion_ckpt,
-    load_pipeline_from_original_stable_diffusion_ckpt,
+    download_from_original_stable_diffusion_ckpt,
+    # load_pipeline_from_original_stable_diffusion_ckpt,
 )
 from IPython.display import display
 import numpy as np
@@ -341,7 +342,7 @@ class SharedTarget:
 #
 # --  TextModel - a wrapper to the CLIP tokenizer and the CLIP text encoder --
 #
-class TextModel:
+class TextModel(TextualInversionLoaderMixin):
     def __init__(self, tokenizer, text_encoder, device):
         """
         Args:
@@ -349,8 +350,8 @@ class TextModel:
             text_encoder:
             device:
         """
-        self._tokenizer = tokenizer
-        self._text_encoder = text_encoder
+        self.tokenizer = tokenizer
+        self.text_encoder = text_encoder
         dtype = text_encoder.config.torch_dtype
         if not dtype:
             Debug(1, f"Text encoder doesn't have dtype. Setting float32 as default.")
@@ -358,22 +359,22 @@ class TextModel:
         self.target = SharedTarget(device, dtype)
 
     def max_length(self):
-        return self._tokenizer.model_max_length
+        return self.tokenizer.model_max_length
 
     def hidden_size(self):
-        return self._text_encoder.config.hidden_size
+        return self.text_encoder.config.hidden_size
 
     def num_tokens(self, text: str):
         """
         Returns:
             number of tokens including SOT and EOT
         """
-        tokens = self._tokenizer(text)
+        tokens = self.tokenizer(text)
         return len(tokens.input_ids)
 
     def tokenize(self, text: str):
         max_length = self.max_length()
-        return self._tokenizer(
+        return self.tokenizer(
             text,
             padding="max_length",
             max_length=max_length,
@@ -381,7 +382,7 @@ class TextModel:
         )
 
     def decode_tokens(self, tokens):
-        return self._tokenizer.batch_decode(tokens)
+        return self.tokenizer.batch_decode(tokens)
 
     def EncodeText(self, text: str, fail_on_truncation: bool):
         """
@@ -394,6 +395,10 @@ class TextModel:
             )
         """
         max_length = self.max_length()
+        new_text = self.maybe_convert_prompt(text, self.tokenizer)
+        if new_text != text:
+            Debug(1, f"Prompt is converted by Textual Inversion: {new_text}")
+            text = new_text
         text_inputs = self.tokenize(text)
         text_input_ids = text_inputs.input_ids
         attention_mask = text_inputs.attention_mask
@@ -414,7 +419,7 @@ class TextModel:
                 )
                 truncated = True
             text_input_ids = text_input_ids[:, :max_length]
-        embeddings = self._text_encoder(
+        embeddings = self.text_encoder(
             text_input_ids.to(self.target.device()),
             attention_mask=None,
         )
@@ -2166,30 +2171,69 @@ class CkptVAESideloader:
         convert_from_ckpt.convert_ldm_vae_checkpoint = self._original_function
 
 
+class TextualInversion:
+    def __init__(self):
+        self.tokens = []
+        self.paths = []
+        self.kwargs_list = []
+
+    def Add(self, token: str, path: str, **kwargs):
+        if not token:
+            raise ValueError(f"`token` must not be empty.")
+        if not path:
+            raise ValueError(f"`path` must not be empty.")
+        self.tokens.append(token)
+        self.paths.append(path)
+        self.kwargs_list.append(kwargs)
+        return self
+
+    def Keywords(self):
+        return self.tokens
+
+    def Apply(self, mixin):
+        for token, path, kwargs in zip(self.tokens, self.paths, self.kwargs_list):
+            mixin.load_textual_inversion(path, token, **kwargs)
+
+
 #
 # -- ControlNet --
 #
 class ControlNet:
-    def __init__(
-        self,
-        default_image: Optional[Union[str, PIL.Image.Image]] = None,
-        default_scale: float = 1.0,
-    ):
-        self._default_image = default_image
-        self._default_scale = default_scale
+    def __init__(self, scale: float = 1.0, pre_scale: float = 1.0):
+        self._master_scale = scale
+        self._master_pre_scale = pre_scale
         self._models = []
         self._images = []
         self._scales = []
+        self._pre_scales = []
+        self._detectors = []
+        self._detector_args = []
 
     def Add(
         self,
         model: ControlNetModel,
-        image: Optional[Union[str, PIL.Image.Image]] = None,
-        scale: Optional[float] = None,
+        image: Union[str, PIL.Image.Image],
+        scale: float = 1.0,
+        pre_scale: float = 1.0,
+        detector=None,
     ):
+        if not model:
+            raise ValueError(f"`model` must be set.")
+        if not image:
+            raise ValueError(f"`image` must be set.")
         self._models.append(model)
         self._images.append(image)
-        self._scales.append(scale if scale else self._default_scale)
+        self._scales.append(scale * self._master_scale)
+        self._pre_scales.append(pre_scale * self._master_pre_scale)
+
+        if isinstance(detector, tuple) or isinstance(detector, list):
+            Debug(2, "Detector with arg")
+            self._detectors.append(detector[0])
+            self._detector_args.append(detector[1:])
+        else:
+            Debug(2, "Detector without arg")
+            self._detectors.append(detector)
+            self._detector_args.append([])
         return self
 
     def Initialize(
@@ -2200,37 +2244,38 @@ class ControlNet:
         target: SharedTarget,
     ):
         Debug(1, "ControlNet is initialized.")
-        default_image_input = None
 
-        def PreprocessImageInput(image):
+        def GetImageInput(image, pre_scale, detector, arg):
             if isinstance(image, str):
                 image = OpenImageWithBackground(image, background="black")
             if image.size != size:
                 image = image.resize(size, resample=PIL.Image.LANCZOS)
-            image = image_model.Preprocess(image, target)
-            return torch.cat([image] * len(prompts))
+            if detector:
+                image = detector(image, *arg).convert("RGB")
+                Debug(2, f"Image detection for ControlNet", image)
+            orig_image = image
+            image = image_model.Preprocess(image, target) * pre_scale
+            return torch.cat([image] * len(prompts)), orig_image
 
-        def GetDefaultImageInput():
-            nonlocal default_image_input
-            if not default_image_input:
-                if not self._default_image:
-                    raise ValueError(f"No default image input for ControlNet.")
-                default_image_input = PreprocessImageInput(self._default_image)
-            return default_image_input
-
-        def GetImageInput(image):
-            if not image:
-                return GetDefaultImageInput()
-            return PreprocessImageInput(image)
-
-        self._offload_hooks = [
-            accelerate.cpu_offload_with_hook(model, target.device())[1]
-            for model in self._models
+        self._image_inputs = [
+            GetImageInput(image, pre_scale, detector, arg)
+            for image, pre_scale, detector, arg in zip(
+                self._images, self._pre_scales, self._detectors, self._detector_args
+            )
         ]
-        self._image_inputs = [GetImageInput(image) for image in self._images]
+
+        # self._offload_hooks = [
+        #     accelerate.cpu_offload_with_hook(model, target.device())[1]
+        #     for model in self._models
+        # ]
+        for model in self._models:
+            model.to(target.device())
+
+    def GetImages(self):
+        return [x[1] for x in self._image_inputs]
 
     def __call__(self, model_input, timestep, text_embeddings):
-        for i, (model, image, scale) in enumerate(
+        for i, (model, (image, _), scale) in enumerate(
             zip(self._models, self._image_inputs, self._scales)
         ):
             dbr, mbr = model(
@@ -2238,14 +2283,14 @@ class ControlNet:
                 timestep,
                 encoder_hidden_states=text_embeddings,
                 controlnet_cond=image,
-                # conditioning_scale=scale,  # Not available at diffusers 0.14
+                conditioning_scale=scale,  # Not available at diffusers 0.14
                 return_dict=False,
             )
             # TODO: update when diffusers are updated
             # This is an intermediate implementation for diffusers 0.14
-            if scale != 1.0:
-                dbr = [x * scale for x in dbr]
-                mbr *= scale
+            # if scale != 1.0:
+            #     dbr = [x * scale for x in dbr]
+            #     mbr *= scale
             if i == 0:
                 down_block_residuals, mid_block_residuals = dbr, mbr
             else:
@@ -2323,9 +2368,7 @@ class LayeredDiffusionPipeline:
         checkpoint_path: str,
         original_config_file: str = None,  # YAML file only if necessary
         vae_path: Optional[str] = None,
-        embedding_path: Optional[
-            Union[str, List[str]]
-        ] = None,  # Textual Inversion 'embedding' file
+        embeddings: Optional[TextualInversion] = None,
         use_xformers: bool = True,
         device_type: str = "cuda",
         scheduler_type: str = "dpm",  # use DPM-Solver++ scheduler
@@ -2351,12 +2394,12 @@ class LayeredDiffusionPipeline:
             from_safetensors = True
         Debug(1, f"checkpoint_path: {checkpoint_path}")
         Debug(3, f"suffix: {checkpoint_path[-len(safetensors_suffix):]}")
-        Debug(1, f"from_safetensors: {from_safetensors}")
+        Debug(3, f"from_safetensors: {from_safetensors}")
 
         vae_sideloader = CkptVAESideloader(vae_path, device_type).Initialize()
 
-        # pipe = download_from_original_stable_diffusion_ckpt(
-        pipe = load_pipeline_from_original_stable_diffusion_ckpt(
+        # pipe = load_pipeline_from_original_stable_diffusion_ckpt(
+        pipe = download_from_original_stable_diffusion_ckpt(
             checkpoint_path=checkpoint_path,
             original_config_file=original_config_file,
             image_size=image_size,
@@ -2373,18 +2416,14 @@ class LayeredDiffusionPipeline:
             clip_stats_path=clip_stats_path,
             controlnet=controlnet,
         )
-        if embedding_path:
-            if isinstance(embedding_path, list):
-                for path in embedding_path:
-                    pipe.load_textual_inversion(path)
-            else:
-                pipe.load_textual_inversion(embedding_path)
         self.scheduler = Scheduler().Wrap(scheduler_type, pipe.scheduler)
 
         vae_sideloader.Finalize()
 
         self._SetOptions(pipe, use_xformers, device_type)
         self._SetPipeline(pipe)
+        if embeddings:
+            embeddings.Apply(self.text_model)
         return self
 
     def CopyFrom(self, another):
@@ -2396,11 +2435,13 @@ class LayeredDiffusionPipeline:
         return self
 
     def Dispose(self):
-        # TODO: This is still developing.
         self.pipe.to("cpu")
         self._DeleteFields()
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
+
+    def EnableCPUOffload(self):
+        pipe.enable_model_cpu_offload()
 
     def _DeleteFields(self):
         del self.pipe
@@ -2414,7 +2455,7 @@ class LayeredDiffusionPipeline:
         pipe.enable_attention_slicing()
         if use_xformers:
             pipe.enable_xformers_memory_efficient_attention()
-        # pipe.enable_model_cpu_offload()
+        # TODO: this shouldn't be called when using EnableCPUOffload().
         pipe.to(device_type)
 
     def _SetPipeline(self, pipe):
@@ -2614,8 +2655,20 @@ class LayeredDiffusionPipeline:
             ]
             return residuals_for_layers
 
+        def ControlNetImagesAndTitles(self):
+            if not self.controlnet:
+                return [], []
+            rs = [
+                (ResizeImage(image, S_SIZE), f"controlnet #{i}")
+                for i, image in enumerate(self.controlnet.GetImages())
+            ]
+            return (list(a) for a in zip(*rs))
+
         def Result(self, image_model):
-            return image_model.Decode(self.latents)[0], None
+            return (
+                image_model.Decode(self.latents)[0],
+                ConcatImages(*self.ControlNetImagesAndTitles()),
+            )
 
     class ResidualMergeMethod(LatentMergeMethod):
         def __init__(
@@ -2673,15 +2726,18 @@ class LayeredDiffusionPipeline:
             self.rmm_latents = rmm_latents
 
         def Result(self, image_model):
+            ctn_images, ctn_titles = self.ControlNetImagesAndTitles()
             # Decode images one by one to avoid OOM
             return (
                 image_model.Decode(self.latents)[0],
                 ConcatImages(
-                    [
+                    ctn_images
+                    + [
                         ResizeImage(image_model.Decode(ex)[0], S_SIZE)
                         for ex in self.rmm_latents
                     ],
-                    [
+                    ctn_titles
+                    + [
                         "RMM Image: common" if i == 0 else f"distinct #{i}"
                         for i in range(self.num_rmm_latents)
                     ],
