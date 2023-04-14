@@ -2,6 +2,7 @@
 # See the following web page for the usage.
 # https://github.com/nanashi161382/unstable_diffusion/tree/main
 import accelerate
+import cv2
 from diffusers import (
     StableDiffusionPipeline,
     DiffusionPipeline,
@@ -150,6 +151,27 @@ def OpenImageWithBackground(filename, background="white"):
         return image
     else:
         return MaskImage(image, mask, background)
+
+
+#
+# -- Canny --
+#
+def GradationCanny(degree=1.0):
+    def f(image):
+        if isinstance(image, str):
+            image = OpenImageWithBackground(image)
+        thresholds = [16, 32, 64, 128, 256, 512, 1024]
+        weights = []
+        for k in range(1, len(thresholds) + 1):
+            weights.append((k / len(thresholds)) ** degree)
+        canny_image = 0
+        for threshold, weight in zip(thresholds, weights):
+            canny_image = np.maximum(
+                canny_image, cv2.Canny(image, threshold, threshold) * weight
+            )
+        return canny_image
+
+    return f
 
 
 #
