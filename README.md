@@ -25,7 +25,7 @@ from pipeline_layered_diffusion import *
 You can import the library in Google Colab like this.
 
 ```python
-!pip install --upgrade diffusers transformers scipy accelerate xformers safetensors omegaconf pytorch_lightning
+!pip install diffusers transformers scipy accelerate xformers safetensors omegaconf pytorch_lightning opencv-python
 # Original code: https://github.com/nanashi161382/unstable_diffusion/blob/main/pipeline_layered_diffusion.py
 !wget 'https://raw.githubusercontent.com/nanashi161382/unstable_diffusion/main/pipeline_layered_diffusion.py'
 from pipeline_layered_diffusion import *
