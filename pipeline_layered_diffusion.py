@@ -2223,12 +2223,12 @@ class TextualInversion:
 # -- ControlNet --
 #
 class ControlNet:
-    def __init__(self, scale: float = 1.0, pre_scale: float = 1.0):
-        self._master_scale = scale
+    def __init__(self, post_scale: float = 1.0, pre_scale: float = 1.0):
+        self._master_post_scale = post_scale
         self._master_pre_scale = pre_scale
         self._models = []
         self._images = []
-        self._scales = []
+        self._post_scales = []
         self._pre_scales = []
         self._detectors = []
         self._detector_args = []
@@ -2237,7 +2237,7 @@ class ControlNet:
         self,
         model: ControlNetModel,
         image: Union[str, PIL.Image.Image],
-        scale: float = 1.0,
+        post_scale: float = 1.0,
         pre_scale: float = 1.0,
         detector=None,
     ):
@@ -2247,7 +2247,7 @@ class ControlNet:
             raise ValueError(f"`image` must be set.")
         self._models.append(model)
         self._images.append(image)
-        self._scales.append(scale * self._master_scale)
+        self._post_scales.append(post_scale * self._master_post_scale)
         self._pre_scales.append(pre_scale * self._master_pre_scale)
 
         if isinstance(detector, tuple) or isinstance(detector, list):
@@ -2298,22 +2298,17 @@ class ControlNet:
         return [x[1] for x in self._image_inputs]
 
     def __call__(self, model_input, timestep, text_embeddings):
-        for i, (model, (image, _), scale) in enumerate(
-            zip(self._models, self._image_inputs, self._scales)
+        for i, (model, (image, _), post_scale) in enumerate(
+            zip(self._models, self._image_inputs, self._post_scales)
         ):
             dbr, mbr = model(
                 model_input,
                 timestep,
                 encoder_hidden_states=text_embeddings,
                 controlnet_cond=image,
-                conditioning_scale=scale,  # Not available at diffusers 0.14
+                conditioning_scale=post_scale,
                 return_dict=False,
             )
-            # TODO: update when diffusers are updated
-            # This is an intermediate implementation for diffusers 0.14
-            # if scale != 1.0:
-            #     dbr = [x * scale for x in dbr]
-            #     mbr *= scale
             if i == 0:
                 down_block_residuals, mid_block_residuals = dbr, mbr
             else:
