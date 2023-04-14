@@ -159,7 +159,9 @@ def OpenImageWithBackground(filename, background="white"):
 def GradationCanny(degree=1.0):
     def f(image):
         if isinstance(image, str):
-            image = OpenImageWithBackground(image)
+            image = cv2.imread(image)
+        elif isinstance(image, PIL.Image.Image):
+            image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
         thresholds = [16, 32, 64, 128, 256, 512, 1024]
         weights = []
         for k in range(1, len(thresholds) + 1):
@@ -169,7 +171,7 @@ def GradationCanny(degree=1.0):
             canny_image = np.maximum(
                 canny_image, cv2.Canny(image, threshold, threshold) * weight
             )
-        return canny_image
+        return PIL.Image.fromarray(canny_image)
 
     return f
 
@@ -2274,7 +2276,6 @@ class ControlNet:
                 image = image.resize(size, resample=PIL.Image.LANCZOS)
             if detector:
                 image = detector(image, *arg).convert("RGB")
-                Debug(2, f"Image detection for ControlNet", image)
             orig_image = image
             image = image_model.Preprocess(image, target) * pre_scale
             return torch.cat([image] * len(prompts)), orig_image
