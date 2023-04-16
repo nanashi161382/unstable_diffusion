@@ -2223,7 +2223,7 @@ class LoraSideloader:
     def __init__(
         self,
         path: str,
-        alpha: Optional[float] = None,
+        alpha: float = 1.0,
         text_encoder_alpha: Optional[float] = None,
     ):
         if not path:
@@ -2234,11 +2234,9 @@ class LoraSideloader:
             self.te_alpha = alpha
         else:
             self.te_alpha = text_encoder_alpha
-        self.skip_text_encoder = self.te_alpha == 0.0
-        self.skip_unet = self.unet_alpha == 0.0
 
     def Load(self, device_type):
-        if self.skip_text_encoder and self.skip_unet:
+        if not (self.te_alpha or self.unet_alpha):
             return
 
         safetensors_suffix = ".safetensors"
@@ -2305,8 +2303,7 @@ class LoraSideloader:
         return key
 
     def GetAdditionalWeight(self, weight_dict, alpha):
-        if alpha is None:
-            alpha = weight_dict["alpha"] / 256
+        # Ignore weight_dict["alpha"] as it is only for training and not for inference.
         down = weight_dict["lora_down.weight"]
         up = weight_dict["lora_up.weight"]
         need_squeeze = len(up.shape) == 4
@@ -2320,10 +2317,10 @@ class LoraSideloader:
 
     def Apply(self, text_encoder, unet):
         Debug(1, f"LoraSideloader is invoked.")
-        if not self.skip_text_encoder:
+        if self.te_alpha:
             Debug(3, f"Update Text Encoder model with LoRA.")
             self.ApplyModel(self.te, self.te_alpha, text_encoder)
-        if not self.skip_unet:
+        if self.unet_alpha:
             Debug(3, f"Update UNet model with LoRA.")
             self.ApplyModel(self.unet, self.unet_alpha, unet)
 
@@ -2354,7 +2351,7 @@ class LoRA:
     def Add(
         self,
         path: str,
-        alpha: Optional[float] = None,
+        alpha: float = 1.0,
         text_encoder_alpha: Optional[float] = None,
     ):
         self._lora.append(LoraSideloader(path, alpha, text_encoder_alpha))
