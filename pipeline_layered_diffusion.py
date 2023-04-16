@@ -2231,99 +2231,97 @@ class LoraSideloader:
         else:
             ckpt = torch.load(path, map_location=device_type)
 
-        unet, te = self.ConvertLora(ckpt)
+        unet = {}
+        te = {}
+        for key, value in ckpt.items():
+            Debug(5, f"lora key = {key}")
+            if key.startswith("lora_unet_"):
+                self.AddToModel(key[len("lora_unet_") :], value, unet)
+            elif key.startswith("lora_te_"):
+                self.AddToModel(key[len("lora_te_") :], value, te)
+            else:
+                Debug(0, f"unknown lora key: {key}", value)
         self.unet = unet
         self.te = te
 
-    def ConvertKey(self, key):
-        # [UNet Key]
-        # from: down_blocks_0_attentions_0_transformer_blocks_0_attn1_to_q.lora_up.weight
-        # to: down_blocks.0.attentions.0.transformer_blocks.0.attn1.processor.to_q_lora.up.weight
-        # [TextEncoder Key]
-        # from: text_model_encoder_layers_0_self_attn_k_proj.lora_down.weight
-        # to: ???
+    def AddToModel(self, key, value, model):
+        processor_key, subkey = key.split(".", 1)
+        processor_key = self.ConvertProcessorKey(processor_key)
+        Debug(5, f"processor_key => sub_key: {processor_key} => {subkey}")
+        model.setdefault(processor_key, {})[subkey] = value
+
+    def ConvertProcessorKey(self, key):
+        # Input Examples
+        # UNet:
+        #  * down_blocks_0_attentions_0_proj_in
+        #  * down_blocks_0_attentions_0_transformer_blocks_0_attn1_to_k
+        #  * down_blocks_0_attentions_0_transformer_blocks_0_ff_net_0_proj
+        # TextEncoder:
+        #  * text_model_encoder_layers_0_mlp_fc1
+        #  * text_model_encoder_layers_0_self_attn_k_proj
         phrases = [
             "down_blocks",
             "mid_block",
             "up_blocks",
-            "text_model",
-            "encoder_layers",
             "transformer_blocks",
-            "mlp_fc",
+            "proj_in",
+            "proj_out",
+            "to_k",
+            "to_q",
+            "to_v",
+            "to_out",
+            "text_model",
             "self_attn",
             "k_proj",
             "q_proj",
             "v_proj",
             "out_proj",
-            "fc1_lora",
-            "fc2_lora",
-            "proj_lora",
-            "proj_in_lora",
-            "proj_out_lora",
-            "to_q_lora",
-            "to_k_lora",
-            "to_v_lora",
-            "to_out_0_lora",
-            "ff_net",
         ]
-        replaces = [("to_out_0", "to_out")]
 
         key = key.replace("_", ".")
         for ph in phrases:
             key = key.replace(ph.replace("_", "."), ph)
-        for src, dst in replaces:
-            key = key.replace(src, dst)
 
-        processor_key = ".".join(key.split(".")[:-3])
-        subkey = ".".join(key.split(".")[-3:])
-        key = processor_key + ".processor." + subkey
         return key
 
-    def GetUNetKey(self, key):
-        if not key.startswith("lora_unet_"):
-            return None
-        return key[len("lora_unet_") :]
+    def GetAdditionalWeight(self, weight_dict):
+        alpha = weight_dict["alpha"]
+        down = weight_dict["lora_down.weight"]
+        up = weight_dict["lora_up.weight"]
+        need_squeeze = len(up.shape) == 4
+        if need_squeeze:
+            up = up.squeeze(3).squeeze(2)
+            down = down.squeeze(3).squeeze(2)
+        weights = alpha / 256 * torch.mm(up.to(torch.float32), down.to(torch.float32))
+        if need_squeeze:
+            weights = weights.unsqueeze(2).unsqueeze(3)
+        return weights
 
-    def GetTextEncoderKey(self, key):
-        if not key.startswith("lora_te"):
-            return None
-        return key[len("lora_te") :]
+    def Apply(self, text_encoder, unet):
+        Debug(1, f"LoraSideloader is invoked.")
+        Debug(3, f"Update UNet model with LoRA.")
+        self.ApplyModel(self.unet, unet)
+        Debug(3, f"Update Text Encoder model with LoRA.")
+        self.ApplyModel(self.te, text_encoder)
 
-    def ConvertLora(self, ckpt):
-        unet = {}
-        te = {}
-        for key, value in ckpt.items():
-            Debug(5, f"lora key = {key}")
-            unet_key = self.GetUNetKey(key)
-            te_key = self.GetTextEncoderKey(key)
-            if unet_key:
-                # unet_key = "unet." + self.ConvertKey(unet_key)
-                unet_key = self.ConvertKey(unet_key)
-                if all(
-                    k not in unet_key
-                    # These keys are not supported by diffusers.
-                    for k in ["alpha", "proj_in_lora", "proj_out_lora", "ff_net"]
-                ):
-                    unet[unet_key] = value
-                    Debug(5, f"unet lora key = {unet_key}")
-                else:
-                    Debug(1, f"exclude unet lora key: {unet_key}")
-                    Debug(5, f"excluded value:", value)
-            if te_key:
-                te_key = "text_encoder." + self.ConvertKey(te_key)
-                te[te_key] = value
-                Debug(5, f"text encoder lora key = {te_key}")
-        if unet or te:
-            return unet, te
-        # If both unet and te are empty, just return the original ckpt.
-        return ckpt, None
-
-    def Apply(self, loader):
-        if self.unet:
-            loader.load_lora_weights(self.unet)
-        # TODO: Enable Text Encoder LoRA
-        # if self.te:
-        #    loader.load_lora_weights(self.te)
+    def ApplyModel(self, model_dict, root):
+        for key, weights in model_dict.items():
+            Debug(5, f"apply to key = {key}")
+            path = key.split(".")
+            layer = root
+            for name in path:
+                try:
+                    layer = layer.__getattr__(name)
+                    Debug(5, f"go down to layer {name}")
+                except Exception as e:
+                    Debug(0, f"ERROR: {type(e)} occurred: {e}")
+                    Debug(0, f"key = {key}")
+                    Debug(0, f"name = {name}")
+                    continue
+            if "weight" in dir(layer):
+                layer.weight.data += self.GetAdditionalWeight(weights)
+            else:
+                Debug(0, f"ERROR: Skipping layer witout weight: {key}")
 
 
 #
@@ -2358,11 +2356,9 @@ class ControlNet:
         self._pre_scales.append(pre_scale * self._master_pre_scale)
 
         if isinstance(detector, tuple) or isinstance(detector, list):
-            Debug(2, "Detector with arg")
             self._detectors.append(detector[0])
             self._detector_args.append(detector[1:])
         else:
-            Debug(2, "Detector without arg")
             self._detectors.append(detector)
             self._detector_args.append([])
         return self
@@ -2547,7 +2543,7 @@ class LayeredDiffusionPipeline:
         vae_sideloader.Finalize()
 
         if lora_path:
-            LoraSideloader(lora_path, device_type).Apply(pipe)
+            LoraSideloader(lora_path, device_type).Apply(pipe.text_encoder, pipe.unet)
         self._SetOptions(pipe, use_xformers, device_type)
         self._SetPipeline(pipe)
         if embeddings:
