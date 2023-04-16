@@ -2224,15 +2224,18 @@ class LoraSideloader:
         self,
         path: str,
         alpha: Optional[float] = None,
-        skip_text_encoder: bool = False,
-        skip_unet: bool = False,
+        text_encoder_alpha: Optional[float] = None,
     ):
         if not path:
             raise ValueError(f"`path` must not be empty.")
         self.path = path
-        self.alpha = alpha
-        self.skip_text_encoder = skip_text_encoder
-        self.skip_unet = skip_unet
+        self.unet_alpha = alpha
+        if text_encoder_alpha is None:
+            self.te_alpha = alpha
+        else:
+            self.te_alpha = text_encoder_alpha
+        self.skip_text_encoder = self.te_alpha == 0.0
+        self.skip_unet = self.unet_alpha == 0.0
 
     def Load(self, device_type):
         if self.skip_text_encoder and self.skip_unet:
@@ -2301,10 +2304,8 @@ class LoraSideloader:
 
         return key
 
-    def GetAdditionalWeight(self, weight_dict):
-        if self.alpha:
-            alpha = self.alpha
-        else:
+    def GetAdditionalWeight(self, weight_dict, alpha):
+        if alpha is None:
             alpha = weight_dict["alpha"] / 256
         down = weight_dict["lora_down.weight"]
         up = weight_dict["lora_up.weight"]
@@ -2321,12 +2322,12 @@ class LoraSideloader:
         Debug(1, f"LoraSideloader is invoked.")
         if not self.skip_text_encoder:
             Debug(3, f"Update Text Encoder model with LoRA.")
-            self.ApplyModel(self.te, text_encoder)
+            self.ApplyModel(self.te, self.te_alpha, text_encoder)
         if not self.skip_unet:
             Debug(3, f"Update UNet model with LoRA.")
-            self.ApplyModel(self.unet, unet)
+            self.ApplyModel(self.unet, self.unet_alpha, unet)
 
-    def ApplyModel(self, model_dict, root):
+    def ApplyModel(self, model_dict, alpha, root):
         for key, weights in model_dict.items():
             Debug(5, f"apply to key = {key}")
             path = key.split(".")
@@ -2341,7 +2342,7 @@ class LoraSideloader:
                     Debug(0, f"name = {name}")
                     continue
             if "weight" in dir(layer):
-                layer.weight.data += self.GetAdditionalWeight(weights)
+                layer.weight.data += self.GetAdditionalWeight(weights, alpha)
             else:
                 Debug(0, f"ERROR: Skipping layer witout weight: {key}")
 
@@ -2354,17 +2355,9 @@ class LoRA:
         self,
         path: str,
         alpha: Optional[float] = None,
-        skip_text_encoder: bool = False,
-        skip_unet: bool = False,
+        text_encoder_alpha: Optional[float] = None,
     ):
-        self._lora.append(
-            LoraSideloader(
-                path,
-                alpha,
-                skip_text_encoder=skip_text_encoder,
-                skip_unet=skip_unet,
-            )
-        )
+        self._lora.append(LoraSideloader(path, alpha, text_encoder_alpha))
         return self
 
     def Apply(self, device_type, text_encoder, unet):
