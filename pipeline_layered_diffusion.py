@@ -2220,16 +2220,33 @@ class TextualInversion:
 
 
 class LoraSideloader:
-    def __init__(self, path: str, device_type):
+    def __init__(
+        self,
+        path: str,
+        alpha: Optional[float] = None,
+        skip_text_encoder: bool = False,
+        skip_unet: bool = False,
+    ):
+        if not path:
+            raise ValueError(f"`path` must not be empty.")
+        self.path = path
+        self.alpha = alpha
+        self.skip_text_encoder = skip_text_encoder
+        self.skip_unet = skip_unet
+
+    def Load(self, device_type):
+        if self.skip_text_encoder and self.skip_unet:
+            return
+
         safetensors_suffix = ".safetensors"
-        is_safetensors = path[-len(safetensors_suffix) :] == safetensors_suffix
+        is_safetensors = self.path[-len(safetensors_suffix) :] == safetensors_suffix
         if is_safetensors:
             ckpt = {}
-            with safe_open(path, framework="pt", device="cpu") as f:
+            with safe_open(self.path, framework="pt", device="cpu") as f:
                 for key in f.keys():
                     ckpt[key] = f.get_tensor(key)
         else:
-            ckpt = torch.load(path, map_location=device_type)
+            ckpt = torch.load(self.path, map_location=device_type)
 
         unet = {}
         te = {}
@@ -2285,24 +2302,29 @@ class LoraSideloader:
         return key
 
     def GetAdditionalWeight(self, weight_dict):
-        alpha = weight_dict["alpha"]
+        if self.alpha:
+            alpha = self.alpha
+        else:
+            alpha = weight_dict["alpha"] / 256
         down = weight_dict["lora_down.weight"]
         up = weight_dict["lora_up.weight"]
         need_squeeze = len(up.shape) == 4
         if need_squeeze:
             up = up.squeeze(3).squeeze(2)
             down = down.squeeze(3).squeeze(2)
-        weights = alpha / 256 * torch.mm(up.to(torch.float32), down.to(torch.float32))
+        weights = alpha * torch.mm(up.to(torch.float32), down.to(torch.float32))
         if need_squeeze:
             weights = weights.unsqueeze(2).unsqueeze(3)
         return weights
 
     def Apply(self, text_encoder, unet):
         Debug(1, f"LoraSideloader is invoked.")
-        Debug(3, f"Update UNet model with LoRA.")
-        self.ApplyModel(self.unet, unet)
-        Debug(3, f"Update Text Encoder model with LoRA.")
-        self.ApplyModel(self.te, text_encoder)
+        if not self.skip_text_encoder:
+            Debug(3, f"Update Text Encoder model with LoRA.")
+            self.ApplyModel(self.te, text_encoder)
+        if not self.skip_unet:
+            Debug(3, f"Update UNet model with LoRA.")
+            self.ApplyModel(self.unet, unet)
 
     def ApplyModel(self, model_dict, root):
         for key, weights in model_dict.items():
@@ -2322,6 +2344,33 @@ class LoraSideloader:
                 layer.weight.data += self.GetAdditionalWeight(weights)
             else:
                 Debug(0, f"ERROR: Skipping layer witout weight: {key}")
+
+
+class LoRA:
+    def __init__(self):
+        self._lora = []
+
+    def Add(
+        self,
+        path: str,
+        alpha: Optional[float] = None,
+        skip_text_encoder: bool = False,
+        skip_unet: bool = False,
+    ):
+        self._lora.append(
+            LoraSideloader(
+                path,
+                alpha,
+                skip_text_encoder=skip_text_encoder,
+                skip_unet=skip_unet,
+            )
+        )
+        return self
+
+    def Apply(self, device_type, text_encoder, unet):
+        for loader in self._lora:
+            loader.Load(device_type)
+            loader.Apply(text_encoder, unet)
 
 
 #
@@ -2490,7 +2539,7 @@ class LayeredDiffusionPipeline:
         original_config_file: str = None,  # YAML file only if necessary
         vae_path: Optional[str] = None,
         embeddings: Optional[TextualInversion] = None,
-        lora_path: Optional[str] = None,
+        lora: Optional[LoRA] = None,
         use_xformers: bool = True,
         device_type: str = "cuda",
         scheduler_type: str = "dpm",  # use DPM-Solver++ scheduler
@@ -2542,8 +2591,8 @@ class LayeredDiffusionPipeline:
 
         vae_sideloader.Finalize()
 
-        if lora_path:
-            LoraSideloader(lora_path, device_type).Apply(pipe.text_encoder, pipe.unet)
+        if lora:
+            lora.Apply(device_type, pipe.text_encoder, pipe.unet)
         self._SetOptions(pipe, use_xformers, device_type)
         self._SetPipeline(pipe)
         if embeddings:
