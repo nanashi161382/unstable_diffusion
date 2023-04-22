@@ -23,7 +23,10 @@ import random
 import re
 from safetensors import safe_open
 import torch
+import torch.nn as nn
 from torch import autocast
+from transformers import CLIPPreTrainedModel, CLIPTextConfig
+from transformers.models.clip.modeling_clip import CLIPEncoderLayer
 from typing import Any, Optional, List, Union, Callable, Tuple, Dict
 
 
@@ -364,6 +367,99 @@ class SharedTarget:
 
 
 #
+# -- CLIPTextDeprojector
+#
+class CLIPTextDeprojector(CLIPPreTrainedModel):
+    config_class = CLIPTextConfig
+    _no_split_modules = ["CLIPEncoderLayer"]
+
+    def __init__(self, config: CLIPTextConfig):
+        super().__init__(config)
+        self.config = config
+        embed_dim = config.hidden_size
+
+        self.to_use_projection = True
+        self.projection = nn.Linear(config.projection_dim, embed_dim, bias=False)
+        for param in self.projection.parameters():
+            param.requires_grad = False  # Fix the parameter of the projection layer.
+
+        self.register_buffer(
+            "position_ids", torch.arange(config.max_position_embeddings).expand((1, -1))
+        )
+        self.position_embedding = nn.Embedding(
+            config.max_position_embeddings, embed_dim
+        )
+        self.encoder_layer = CLIPEncoderLayer(config)
+        self.final_layer_norm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
+
+        self.register_buffer("sos_embed", torch.zeros([embed_dim]))
+
+    def use_projection(self, to_use: bool = True):
+        self.to_use_projection = to_use
+
+    def dont_use_projection(self):
+        self.use_projection(False)
+
+    def forward(self, hidden_state):
+        bsz, seq_len, _ = hidden_state.size()
+        causal_attention_mask = self._build_causal_attention_mask(
+            bsz, seq_len, hidden_state.dtype
+        ).to(hidden_state.device)
+
+        attention_mask = None
+
+        if self.to_use_projection:
+            embeds = hidden_state[:, 0, :]
+            embeds = self.projection(embeds)
+            hidden_state = torch.cat(
+                [embeds.unsqueeze(1), hidden_state[:, 1:, :]], dim=1
+            )
+
+        position_embeddings = self.position_embedding(self.position_ids)
+        hidden_state = hidden_state + position_embeddings
+
+        layer_outputs = self.encoder_layer(
+            hidden_state,
+            attention_mask,
+            causal_attention_mask,
+        )
+        output = self.final_layer_norm(layer_outputs[0])
+        sos_embed = torch.cat([self.sos_embed.unsqueeze(0).unsqueeze(0)] * bsz, dim=0)
+        return torch.cat([sos_embed, output[:, 1:]], dim=1)
+
+    def _build_causal_attention_mask(self, bsz, seq_len, dtype):
+        # lazily create causal attention mask, with full attention between the vision tokens
+        # pytorch uses additive attention mask; fill with -inf
+        mask = torch.empty(bsz, seq_len, seq_len, dtype=dtype)
+        mask.fill_(torch.tensor(torch.finfo(dtype).min))
+        mask.triu_(1)  # zero out the lower diagonal
+        mask = mask.unsqueeze(1)  # expand mask
+        return mask
+
+    def Inference(self, embeds):
+        max_len = self.config.max_position_embeddings
+        embeds = embeds.unsqueeze(1)
+        result = torch.zeros([embeds.shape[0], 0, embeds.shape[-1]]).to(embeds.device)
+        while True:
+            result_len = len(result[0])
+            remaining_len = max_len - result_len - 1
+            input = torch.cat(
+                [
+                    embeds,
+                    result,
+                    torch.zeros([embeds.shape[0], remaining_len, embeds.shape[-1]]).to(
+                        embeds.device
+                    ),
+                ],
+                dim=1,
+            )
+            result = self(input)
+            if remaining_len == 0:
+                return result
+            result = result[:, : result_len + 1, :]
+
+
+#
 # --  TextModel - a wrapper to the CLIP tokenizer and the CLIP text encoder --
 #
 class TextModel(TextualInversionLoaderMixin):
@@ -381,6 +477,17 @@ class TextModel(TextualInversionLoaderMixin):
             Debug(1, f"Text encoder doesn't have dtype. Setting float32 as default.")
             dtype = torch.float32
         self.target = SharedTarget(device, dtype)
+        self.deprojector = None
+        self.use_deprojector = False
+
+    def SetDeprojector(self, deprojector):
+        self.deprojector = deprojector
+
+    def UseDeprojector(self, to_use: bool = True):
+        self.use_deprojector = to_use
+
+    def DontUseDeprojector(self):
+        self.UseDeprojector(False)
 
     def max_length(self):
         return self.tokenizer.model_max_length
@@ -402,6 +509,7 @@ class TextModel(TextualInversionLoaderMixin):
             text,
             padding="max_length",
             max_length=max_length,
+            return_overflowing_tokens=True,
             return_tensors="pt",  # PyTorch
         )
 
@@ -428,8 +536,8 @@ class TextModel(TextualInversionLoaderMixin):
         attention_mask = text_inputs.attention_mask
         truncated = False
 
-        if text_input_ids.shape[-1] > max_length:
-            removed_text = self.decode_tokens(text_input_ids[:, max_length:])
+        if text_inputs.num_truncated_tokens > 0:
+            removed_text = self.decode_tokens(tokenized.overflowing_tokens)
             if fail_on_truncation:
                 raise ValueError(
                     f"The following part of your input was truncated because CLIP can only"
@@ -442,17 +550,22 @@ class TextModel(TextualInversionLoaderMixin):
                     f" handle sequences up to {max_length} tokens: {removed_text}",
                 )
                 truncated = True
-            text_input_ids = text_input_ids[:, :max_length]
         embeddings = self.text_encoder(
             text_input_ids.to(self.target.device()),
             attention_mask=None,
         )
+        last_hidden_state = embeddings[0]
+        pooled_output = embeddings[1]
+
+        if self.deprojector and self.use_deprojector:
+            self.deprojector.dont_use_projection()
+            last_hidden_state = self.deprojector.Inference(pooled_output)
 
         num_tokens = 0
         for m in attention_mask[0]:
             if m.item() > 0:
                 num_tokens += 1
-        return embeddings[0], truncated, embeddings[1], num_tokens
+        return last_hidden_state, truncated, pooled_output, num_tokens
 
     def GetConstant(self, value: float):
         mat = [
@@ -1080,6 +1193,7 @@ class TextEmbeddings:
         cls,
         input: PromptType,
         text_model: TextModel,
+        disable_deprojector: bool,
         default_encoding: StandardEncoding,
     ):
         if not default_encoding.IsTerminated():
@@ -1095,12 +1209,16 @@ class TextEmbeddings:
             else:
                 return arg
 
+        use_deprojector = text_model.use_deprojector
+        if disable_deprojector:
+            text_model.DontUseDeprojector()
         default_embedding = default_encoding.Encode(text_model, "", default_encoding)
         if input == "":
             input = None
         embeddings = RangeMap.CreateAndFinalize(
             input, True, default_embedding, default_embedding, finalizer
         )
+        text_model.UseDeprojector(use_deprojector)
         return cls(embeddings)
 
 
@@ -1633,7 +1751,9 @@ class Prompts:
             self._default_negative_encoding if is_negative else self._default_encoding
         )
         self._prompts.append(
-            TextEmbeddings.Create(prompt, self._text_model, default_encoding)
+            TextEmbeddings.Create(
+                prompt, self._text_model, is_negative, default_encoding
+            )
         )
         return index
 
@@ -2576,6 +2696,7 @@ class LayeredDiffusionPipeline:
             stable_unclip_prior=stable_unclip_prior,
             clip_stats_path=clip_stats_path,
             controlnet=controlnet,
+            load_safety_checker=False,
         )
         self.scheduler = Scheduler().Wrap(scheduler_type, pipe.scheduler)
 
