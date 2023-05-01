@@ -8,8 +8,8 @@ from diffusers import (
     DiffusionPipeline,
     DPMSolverMultistepScheduler,
     ControlNetModel,
-    TextualInversionLoaderMixin,
 )
+from diffusers.loaders import TextualInversionLoaderMixin
 import diffusers.pipelines.stable_diffusion.convert_from_ckpt as convert_from_ckpt
 from diffusers.pipelines.stable_diffusion.convert_from_ckpt import (
     download_from_original_stable_diffusion_ckpt,
@@ -25,7 +25,12 @@ from safetensors import safe_open
 import torch
 import torch.nn as nn
 from torch import autocast
-from transformers import CLIPPreTrainedModel, CLIPTextConfig
+from transformers import (
+    AutoProcessor,
+    CLIPPreTrainedModel,
+    CLIPTextConfig,
+    CLIPVisionModelWithProjection,
+)
 from transformers.models.clip.modeling_clip import CLIPEncoderLayer
 from typing import Any, Optional, List, Union, Callable, Tuple, Dict
 
@@ -509,6 +514,7 @@ class TextModel(TextualInversionLoaderMixin):
             text,
             padding="max_length",
             max_length=max_length,
+            truncation=True,
             return_overflowing_tokens=True,
             return_tensors="pt",  # PyTorch
         )
@@ -572,6 +578,10 @@ class TextModel(TextualInversionLoaderMixin):
             [value for _ in range(self.hidden_size())] for _ in range(self.max_length())
         ]
         return torch.tensor([mat]).to(**self.target.dict)
+
+    def Deprojection(self, embeds, from_projected=False):
+        self.deprojector.use_projection(from_projected)
+        return self.deprojector.Inference(embeds)
 
 
 #
@@ -1153,6 +1163,61 @@ class ShiftEncoding(StandardEncoding):
 
         new_states = accum.ToStates()
         return torch.cat([torch.unsqueeze(new_states, 0)], dim=0).to(target.device())
+
+
+class ImageEncoding(StandardEncoding):
+    def __init__(
+        self,
+        model: CLIPVisionModelWithProjection,
+        processor: AutoProcessor,
+        image: Optional[Union[str, PIL.Image.Image]] = None,
+    ):
+        super().__init__(image)
+        self.model = model
+        self.processor = processor
+
+    def Encode(
+        self,
+        text_model: TextModel,
+        image: Union[str, PIL.Image.Image],
+        default_encoding: StandardEncoding,
+    ):
+        Debug(2, image)
+        if isinstance(image, str):
+            image = OpenImageWithBackground(image)
+        input = self.processor(images=image, return_tensor="pt")
+        # Debug(2, input.keys(), input["pixel_values"])
+        output = self.model(
+            pixel_values=torch.tensor(input["pixel_values"]).to(
+                text_model.target.device()
+            )
+        )
+        # Debug(2, output.image_embeds.shape)
+        return text_model.Deprojection(output.image_embeds, from_projected=True)
+
+
+class PooledEncoding(StandardEncoding):
+    def __init__(self, normalize: bool = False, text: Optional[str] = None):
+        super().__init__(text)
+        self.normalize = normalize
+
+    def Encode(
+        self, text_model: TextModel, text: str, default_encoding: StandardEncoding
+    ):
+        chunks = [s for s in (s.strip() for s in text.split(",")) if s]
+        embeds = []
+        for chunk in chunks:
+            _, _, e, _ = text_model.EncodeText(chunk, fail_on_truncation=True)
+            embeds.append(e[0])
+        merged_embeds = sum(embeds)
+        if self.normalize:
+            coeff = (
+                sum(torch.norm(e) for e in embeds)
+                / len(embeds)
+                / torch.norm(merged_embeds)
+            )
+            merged_embeds *= coeff
+        return text_model.Deprojection(merged_embeds.unsqueeze(0), from_projected=False)
 
 
 #
