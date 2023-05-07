@@ -46,6 +46,17 @@ def GetImageEmbeds(img_embed_data, i):
     return None
 
 
+def tokenize(text):
+    return tokenizer(
+        text,
+        padding="max_length",
+        max_length=77,
+        truncation=True,
+        return_overflowing_tokens=True,
+        return_tensors="pt",  # PyTorch
+    )
+
+
 def Encode(text, img_embeds=None):
     tokenized = tokenize(text)
     tokens = tokenized.input_ids.to(device)
@@ -56,6 +67,7 @@ def Encode(text, img_embeds=None):
     if img_embeds is not None:  # Add noise with image embeds
         ratio = np.random.exponential(2) / 100
         embeds = (1.0 - ratio) * embeds + ratio * img_embeds.to(device)
+
     return embeds, encoded.last_hidden_state, tokenized.attention_mask, truncated
 
 
@@ -222,11 +234,17 @@ class Data:
         self.mask_ls = []
 
     def Add(self, embeds, last_states, mask):
+        # embeds.shape = [1, 768]
+        # last_states = [1, 77, 768]
+        # mask = [1, 77]
         self.embed_ls.append(embeds)
         self.last_state_ls.append(last_states)
         self.mask_ls.append(mask)
 
     def Finalize(self):
+        # embeds_ls.shape = [data_len, 768]
+        # last_states_ls = [data_len, 77, 768]
+        # mask_ls = [data_len, 77]
         self.embed_ls = self.CatAndRelease(self.embed_ls)
         self.last_state_ls = self.CatAndRelease(self.last_state_ls)
         self.mask_ls = self.CatAndRelease(self.mask_ls)
@@ -242,6 +260,9 @@ class Data:
         return len(self.embed_ls)
 
     def __getitem__(self, index):
+        # [0].shape = [768]
+        # [1].shape = [77, 768]
+        # [2].shape = [77]
         return (
             self.embed_ls[index],
             self.last_state_ls[index],
@@ -305,10 +326,8 @@ class DataSet:
         )
 
     def GetTokenLen(self, mask):
-        print(f"tolen_len: mask.shape {mask.shape}")
-        # mask = mask[0]
+        # mask.shape = [77]
         mask_len = torch.sum((mask > 0).long())
-        print(f"token_len: mask_len {mask_len}")
         return mask_len
 
     def GetWeights(self, token_len):
@@ -325,10 +344,9 @@ class DataSet:
 
     def GetCoreMask(self, mask):
         # Fill zeros for SOS and EOS.
-        print(f"core_mask: mask.shape {mask.shape}")
-        # mask = mask[0]
+        # mask.shape = [77]
         mask = torch.cat([torch.zeros(1), mask[2:], torch.zeros(1)], dim=0)
-        return mask.to(device)  # .unsqueeze(0)
+        return mask.to(device)
 
 
 class Trainer:
@@ -347,12 +365,19 @@ class Trainer:
         sum_pred = torch.sum(pred, dim=1)
         sum_mask = torch.sum(masks, dim=1)
         avg_pred = sum_pred / sum_mask
-        print(f"avg_pred.shape {avg_pred.shape}")
+        # avg_pred.shape = [bsz, 768] => [bsz, 77, 768]
         avg_pred = avg_pred.reshape((avg_pred.shape[0], 1, avg_pred.shape[1])).repeat(
             1, pred.shape[1], 1
         )
-        print(f"avg_pred.shape {avg_pred.shape}")
         return 0.0 - self.criterion(pred, avg_pred)  # nagate MSE
+
+    def ReshapeWeights(self, weights):
+        # weights.shape = [bsz, 77] => [bsz, 77, 768]
+        return weights.reshape(weights.shape + (1,)).repeat(1, 1, input.shape[-1])
+
+    def ReshapeMasks(self, masks):
+        # masks.shape = [bsz, 77] => [bsz, 77, 768]
+        return masks.reshape(masks.shape + (1,)).repeat(1, 1, input.shape[-1])
 
     def training(self):
         global epoch
@@ -364,9 +389,8 @@ class Trainer:
             self.ds, batch_size=self.bsz, shuffle=True, drop_last=True
         )  # sampler=sampler)
         for i, (target, input, weights, masks) in enumerate(dl):
-            weights = weights.reshape(weights.shape + (1,)).repeat(
-                1, 1, input.shape[-1]
-            )
+            weights = self.ReshapeWeights(weights)
+            masks = self.ReshapeMasks(masks)
             self.optimizer.zero_grad()
             pred = model(input)
             loss = self.criterion(weights * pred, weights * target)
@@ -376,9 +400,9 @@ class Trainer:
             self.optimizer.step()
             if (i + 1) % 10 == 0:
                 print(
-                    f"Batch {i+1}, loss {loss.item():.4f}, target: {target.shape}, input: {input.shape}"
+                    f"Batch {i+1}, loss {loss.item():.4f}, target: {target.shape},"
+                    f" input: {input.shape}"
                 )
-                # print(weights)
             Offload(weights, masks, pred, target, input)
             torch.cuda.empty_cache()
 
@@ -386,24 +410,21 @@ class Trainer:
         with torch.no_grad():
             dl = DataLoader(self.test_ds, batch_size=len(self.test_ds))
             for target, input, weights, masks in dl:
-                print(f"input.shape {input.shape}")
-                print(f"weights.shape {weights.shape}")
-                weights = weights.reshape(weights.shape + (1,)).repeat(
-                    1, 1, input.shape[-1]
-                )
-                masks = masks.reshape(masks.shape + (1,)).repeat(1, 1, input.shape[-1])
-                print(f"weights.shape {weights.shape}")
+                weights = self.ReshapeWeights(weights)
+                masks = self.ReshapeMasks(masks)
                 pred = model(input)
                 loss = self.criterion(pred, target).item()
                 print(
-                    f"Test, loss {loss:.4f}, target: {target.shape}, input: {input.shape}"
+                    f"Test, loss {loss:.4f}, target: {target.shape},"
+                    f" input: {input.shape}"
                 )
                 w_loss = self.criterion(weights * pred, weights * target)
                 if self.reg_weight:
                     w_loss += self.reg_weight * self.regularize(pred, masks)
                 w_loss = w_loss.item()
                 print(
-                    f"Test, weighted loss {w_loss:.4f}, target: {target.shape}, input: {input.shape}"
+                    f"Test, weighted loss {w_loss:.4f}, target: {target.shape},"
+                    f" input: {input.shape}"
                 )
                 cs = self.cosine_similarity(pred, target)
                 print(f"Test, cosine similarit:", cs)
@@ -413,20 +434,21 @@ class Trainer:
         with torch.no_grad():
             dl = DataLoader(self.test_ds, batch_size=len(self.test_ds))
             for target, input, weights, masks in dl:
-                weights = weights.reshape(weights.shape + (1,)).repeat(
-                    1, 1, input.shape[-1]
-                )
+                weights = self.ReshapeWeights(weights)
+                masks = self.ReshapeMasks(masks)
                 pred = model.Inference(input[:, :1, :].squeeze(1))
                 loss = self.criterion(pred, target).item()
                 print(
-                    f"Inference test, loss {loss:.4f}, target: {target.shape}, input: {input.shape}"
+                    f"Inference test, loss {loss:.4f}, target: {target.shape},"
+                    f" input: {input.shape}"
                 )
                 w_loss = self.criterion(weights * pred, weights * target)
                 if self.reg_weight:
                     w_loss += self.reg_weight * self.regularize(pred, masks)
                 w_loss = w_loss.item()
                 print(
-                    f"Inference test, weighted loss {w_loss:.4f}, target: {target.shape}, input: {input.shape}"
+                    f"Inference test, weighted loss {w_loss:.4f}, target: {target.shape},"
+                    f" input: {input.shape}"
                 )
                 cs = self.cosine_similarity(pred, target)
                 print(f"Inference test, cosine similarit:", cs)
