@@ -1,11 +1,110 @@
+import csv
+import math
+import numpy as np
+import random
+import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.utils.data.sampler import RandomSampler
-import random
-import math
-import csv
-import torch
-import numpy as np
-from transformers import CLIPTokenizer, CLIPTextModelWithProjection
+from transformers import (
+    CLIPTokenizer,
+    CLIPTextModelWithProjection,
+    CLIPPreTrainedModel,
+    CLIPTextConfig,
+)
+from transformers.models.clip.modeling_clip import CLIPEncoderLayer
+
+device = "cuda"
+
+
+class CLIPTextDeprojector(CLIPPreTrainedModel):
+    config_class = CLIPTextConfig
+    _no_split_modules = ["CLIPEncoderLayer"]
+
+    def __init__(self, config: CLIPTextConfig):
+        super().__init__(config)
+        self.config = config
+        embed_dim = config.hidden_size
+
+        self.to_use_projection = True
+        self.projection = nn.Linear(config.projection_dim, embed_dim, bias=False)
+        for param in self.projection.parameters():
+            param.requires_grad = False  # Fix the parameter of the projection layer.
+
+        self.register_buffer(
+            "position_ids", torch.arange(config.max_position_embeddings).expand((1, -1))
+        )
+        self.position_embedding = nn.Embedding(
+            config.max_position_embeddings, embed_dim
+        )
+        self.encoder_layer = CLIPEncoderLayer(config)
+        self.final_layer_norm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
+
+        self.register_buffer("sos_embed", torch.zeros([embed_dim]))
+
+    def use_projection(self, to_use: bool = True):
+        self.to_use_projection = to_use
+
+    def dont_use_projection(self):
+        self.use_projection(False)
+
+    def forward(self, hidden_state):
+        bsz, seq_len, _ = hidden_state.size()
+        causal_attention_mask = self._build_causal_attention_mask(
+            bsz, seq_len, hidden_state.dtype
+        ).to(hidden_state.device)
+
+        attention_mask = None
+
+        if self.to_use_projection:
+            embeds = hidden_state[:, 0, :]
+            embeds = self.projection(embeds)
+            hidden_state = torch.cat(
+                [embeds.unsqueeze(1), hidden_state[:, 1:, :]], dim=1
+            )
+
+        position_embeddings = self.position_embedding(self.position_ids)
+        hidden_state = hidden_state + position_embeddings
+
+        layer_outputs = self.encoder_layer(
+            hidden_state,
+            attention_mask,
+            causal_attention_mask,
+        )
+        output = self.final_layer_norm(layer_outputs[0])
+        sos_embed = torch.cat([self.sos_embed.unsqueeze(0).unsqueeze(0)] * bsz, dim=0)
+        return torch.cat([sos_embed, output[:, 1:]], dim=1)
+
+    def _build_causal_attention_mask(self, bsz, seq_len, dtype):
+        # lazily create causal attention mask, with full attention between the vision tokens
+        # pytorch uses additive attention mask; fill with -inf
+        mask = torch.empty(bsz, seq_len, seq_len, dtype=dtype)
+        mask.fill_(torch.tensor(torch.finfo(dtype).min))
+        mask.triu_(1)  # zero out the lower diagonal
+        mask = mask.unsqueeze(1)  # expand mask
+        return mask
+
+    def Inference(self, embeds):
+        max_len = self.config.max_position_embeddings
+        embeds = embeds.unsqueeze(1)
+        result = torch.zeros([embeds.shape[0], 0, embeds.shape[-1]]).to(embeds.device)
+        while True:
+            result_len = len(result[0])
+            remaining_len = max_len - result_len - 1
+            input = torch.cat(
+                [
+                    embeds,
+                    result,
+                    torch.zeros([embeds.shape[0], remaining_len, embeds.shape[-1]]).to(
+                        embeds.device
+                    ),
+                ],
+                dim=1,
+            )
+            result = self(input)
+            if remaining_len == 0:
+                return result
+            result = result[:, : result_len + 1, :]
 
 
 def Offload(*ls):
@@ -368,7 +467,8 @@ class DataSet:
 
 
 class Trainer:
-    def __init__(self, dataset, batch_size, test_dataset, reg_weight=0.0):
+    def __init__(self, model, dataset, batch_size, test_dataset, reg_weight=0.0):
+        self.model = model
         self.ds = dataset
         self.bsz = batch_size
         self.test_ds = test_dataset
@@ -389,28 +489,24 @@ class Trainer:
         )
         return 0.0 - self.criterion(pred, avg_pred)  # nagate MSE
 
-    def ReshapeWeights(self, weights):
+    def ReshapeWeights(self, weights, input_shape):
         # weights.shape = [bsz, 77] => [bsz, 77, 768]
-        return weights.reshape(weights.shape + (1,)).repeat(1, 1, input.shape[-1])
+        return weights.reshape(weights.shape + (1,)).repeat(1, 1, input_shape[-1])
 
-    def ReshapeMasks(self, masks):
+    def ReshapeMasks(self, masks, input_shape):
         # masks.shape = [bsz, 77] => [bsz, 77, 768]
-        return masks.reshape(masks.shape + (1,)).repeat(1, 1, input.shape[-1])
+        return masks.reshape(masks.shape + (1,)).repeat(1, 1, input_shape[-1])
 
     def training(self):
-        global epoch
-        epoch += 1
-        print(f"Epoch: {epoch}")
-
         # sampler = RandomSampler(self.ds, replacement=False, num_samples=self.ds_size)
         dl = DataLoader(
             self.ds, batch_size=self.bsz, shuffle=True, drop_last=True
         )  # sampler=sampler)
         for i, (target, input, weights, masks) in enumerate(dl):
-            weights = self.ReshapeWeights(weights)
-            masks = self.ReshapeMasks(masks)
+            weights = self.ReshapeWeights(weights, input.shape)
+            masks = self.ReshapeMasks(masks, input.shape)
             self.optimizer.zero_grad()
-            pred = model(input)
+            pred = self.model(input)
             loss = self.criterion(weights * pred, weights * target)
             if self.reg_weight:
                 loss += self.reg_weight * self.regularize(pred, masks)
@@ -428,9 +524,9 @@ class Trainer:
         with torch.no_grad():
             dl = DataLoader(self.test_ds, batch_size=len(self.test_ds))
             for target, input, weights, masks in dl:
-                weights = self.ReshapeWeights(weights)
-                masks = self.ReshapeMasks(masks)
-                pred = model(input)
+                weights = self.ReshapeWeights(weights, input.shape)
+                masks = self.ReshapeMasks(masks, input.shape)
+                pred = self.model(input)
                 loss = self.criterion(pred, target).item()
                 print(
                     f"Test, loss {loss:.4f}, target: {target.shape},"
@@ -438,7 +534,9 @@ class Trainer:
                 )
                 w_loss = self.criterion(weights * pred, weights * target)
                 if self.reg_weight:
-                    w_loss += self.reg_weight * self.regularize(pred, masks)
+                    reg_loss = self.regularize(pred, masks)
+                    print(f"regularization: {reg_loss}")
+                    w_loss += self.reg_weight * reg_loss
                 w_loss = w_loss.item()
                 print(
                     f"Test, weighted loss {w_loss:.4f}, target: {target.shape},"
@@ -453,9 +551,9 @@ class Trainer:
         with torch.no_grad():
             dl = DataLoader(self.test_ds, batch_size=len(self.test_ds))
             for target, input, weights, masks in dl:
-                weights = self.ReshapeWeights(weights)
-                masks = self.ReshapeMasks(masks)
-                pred = model.Inference(input[:, :1, :].squeeze(1))
+                weights = self.ReshapeWeights(weights, input.shape)
+                masks = self.ReshapeMasks(masks, input.shape)
+                pred = self.model.Inference(input[:, :1, :].squeeze(1))
                 loss = self.criterion(pred, target).item()
                 print(
                     f"Inference test, loss {loss:.4f}, target: {target.shape},"
@@ -463,7 +561,9 @@ class Trainer:
                 )
                 w_loss = self.criterion(weights * pred, weights * target)
                 if self.reg_weight:
-                    w_loss += self.reg_weight * self.regularize(pred, masks)
+                    reg_loss = self.regularize(pred, masks)
+                    print(f"regularization: {reg_loss}")
+                    w_loss += self.reg_weight * reg_loss
                 w_loss = w_loss.item()
                 print(
                     f"Inference test, weighted loss {w_loss:.4f}, target: {target.shape},"
