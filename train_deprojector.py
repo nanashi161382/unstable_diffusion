@@ -12,9 +12,30 @@ from transformers import (
     CLIPPreTrainedModel,
     CLIPTextConfig,
 )
+from transformers.activations import ACT2FN
 from transformers.models.clip.modeling_clip import CLIPEncoderLayer
 
 device = "cuda"
+
+
+class MLP3(nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        intermediate_size = hidden_size * 4
+        self.activation_fn = ACT2FN["quick_gelu"]
+        self.fc1 = nn.Linear(hidden_size, intermediate_size)
+        self.dropout = nn.Dropout(0.02)
+        self.fc2 = nn.Linear(intermediate_size, intermediate_size)
+        self.fc3 = nn.Linear(intermediate_size, hidden_size)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.fc1(hidden_states)
+        hidden_states = self.activation_fn(hidden_states)
+        hideen_states = self.dropout(hidden_states)
+        hidden_states = self.fc2(hidden_states)
+        hidden_states = self.activation_fn(hidden_states)
+        hidden_states = self.fc3(hidden_states)
+        return hidden_states
 
 
 class CLIPTextDeprojector(CLIPPreTrainedModel):
@@ -26,7 +47,6 @@ class CLIPTextDeprojector(CLIPPreTrainedModel):
         self.config = config
         embed_dim = config.hidden_size
 
-        self.to_use_projection = True
         self.projection = nn.Linear(config.projection_dim, embed_dim, bias=False)
         for param in self.projection.parameters():
             param.requires_grad = False  # Fix the parameter of the projection layer.
@@ -42,13 +62,9 @@ class CLIPTextDeprojector(CLIPPreTrainedModel):
 
         self.register_buffer("sos_embed", torch.zeros([embed_dim]))
 
-    def use_projection(self, to_use: bool = True):
-        self.to_use_projection = to_use
+        # self.text_emb_mlp = MLP3(config.hidden_size)
 
-    def dont_use_projection(self):
-        self.use_projection(False)
-
-    def forward(self, hidden_state):
+    def forward(self, hidden_state, mlp=False, proj=False):
         bsz, seq_len, _ = hidden_state.size()
         causal_attention_mask = self._build_causal_attention_mask(
             bsz, seq_len, hidden_state.dtype
@@ -56,12 +72,9 @@ class CLIPTextDeprojector(CLIPPreTrainedModel):
 
         attention_mask = None
 
-        if self.to_use_projection:
-            embeds = hidden_state[:, 0, :]
-            embeds = self.projection(embeds)
-            hidden_state = torch.cat(
-                [embeds.unsqueeze(1), hidden_state[:, 1:, :]], dim=1
-            )
+        embeds = hidden_state[:, 0, :]
+        embeds = self.ConvertEmb(embeds, mlp=mlp, proj=proj)
+        hidden_state = torch.cat([embeds.unsqueeze(1), hidden_state[:, 1:, :]], dim=1)
 
         position_embeddings = self.position_embedding(self.position_ids)
         hidden_state = hidden_state + position_embeddings
@@ -84,7 +97,8 @@ class CLIPTextDeprojector(CLIPPreTrainedModel):
         mask = mask.unsqueeze(1)  # expand mask
         return mask
 
-    def Inference(self, embeds):
+    def Inference(self, embeds, mlp=False, proj=False):
+        self.eval()
         max_len = self.config.max_position_embeddings
         embeds = embeds.unsqueeze(1)
         result = torch.zeros([embeds.shape[0], 0, embeds.shape[-1]]).to(embeds.device)
@@ -101,10 +115,17 @@ class CLIPTextDeprojector(CLIPPreTrainedModel):
                 ],
                 dim=1,
             )
-            result = self(input)
+            result = self(input, mlp=mlp, proj=proj)
             if remaining_len == 0:
                 return result
             result = result[:, : result_len + 1, :]
+
+    def ConvertEmb(self, text_emb, mlp=False, proj=False):
+        if proj:
+            text_emb = self.projection(text_emb)
+        # if mlp:
+        #    text_emb = self.text_emb_mlp(text_emb)
+        return text_emb
 
 
 def Offload(*ls):
@@ -160,20 +181,29 @@ class TextModel:
     def Encode(self, text, img_embeds=None):
         tokenized = self.tokenize(text)
         tokens = tokenized.input_ids.to(device)
-        encoded = self.encoder(tokens)
+        encoded = self.encoder.text_model(tokens)
+        embeds = self.encoder.text_projection(encoded[1])
         truncated = tokenized.num_truncated_tokens > 0
 
-        embeds = encoded.text_embeds
         if img_embeds is not None:  # Add noise with image embeds
             ratio = np.random.exponential(2) / 100
             embeds = (1.0 - ratio) * embeds + ratio * img_embeds.to(device)
 
-        return embeds, encoded.last_hidden_state, tokenized.attention_mask, truncated
+        return (
+            embeds,  # projected
+            encoded[1],  # pooled_output
+            encoded.last_hidden_state,
+            tokenized.attention_mask,
+            truncated,
+        )
 
 
 class DataGenerator:
     def __init__(self, text_model):
         self.text_model = text_model
+        p, e, s, m, _ = self.text_model.Encode("", None)
+        Offload(p, s, m)
+        self.base_embeds = e
 
     def GetImageEmbeds(self, img_embed_data, i):
         if img_embed_data is not None:
@@ -191,21 +221,25 @@ class DataGenerator:
         return ls[:i], ls[i:]
 
     def AverageEmbeddings(self, *es):
-        embeds = sum(es)
-        coeff = sum(torch.norm(e) for e in es) / len(es) / torch.norm(embeds)
-        embeds *= coeff
-        embeds = (embeds * coeff).clone()
-        Offload(coeff)
+        embeds = [e - self.base_embeds for e in es]
+        embeds = sum(embeds) + self.base_embeds
         return embeds
 
-    def SplitEmbeds(self, data, text, img_embeds, last_state, mask):
+        # embeds = sum(es)
+        # coeff = sum(torch.norm(e) for e in es) / len(es) / torch.norm(embeds)
+        # embeds *= coeff
+        # embeds = (embeds * coeff).clone()
+        # Offload(coeff)
+        # return embeds
+
+    def SplitEmbeds(self, data, text, img_embeds, embeds, last_state, mask):
         fst, snd = self.SplitList(text.split(" "))
         if not fst:
             return False
-        e1, s1, m1, _ = self.text_model.Encode(" ".join(fst), img_embeds)
-        e2, s2, m2, _ = self.text_model.Encode(" ".join(snd), img_embeds)
-        data.Add(self.AverageEmbeddings(e1, e2), last_state, mask)
-        Offload(e1, s1, m1, e2, s2, m2)
+        p1, e1, s1, m1, _ = self.text_model.Encode(" ".join(fst), img_embeds)
+        p2, e2, s2, m2, _ = self.text_model.Encode(" ".join(snd), img_embeds)
+        data.Add(self.AverageEmbeddings(e1, e2), embeds, last_state, mask)
+        Offload(p1, e1, s1, m1, p2, e2, s2, m2)
         return True
 
     def PickIndex(self, length, used_idx):
@@ -219,24 +253,36 @@ class DataGenerator:
     def CombineEmbeds(self, data, text, i2, texts, img_embed_data, embeds):
         text2 = texts[i2][1]
         img_embeds2 = self.GetImageEmbeds(img_embed_data, i2)
-        e2, s2, m2, truncated = self.text_model.Encode(text2, img_embeds2)
-        Offload(e2, s2, m2, img_embeds2)
+        p2, e2, s2, m2, truncated = self.text_model.Encode(text2, img_embeds2)
+        Offload(p2, e2, s2, m2, img_embeds2)
         if truncated:
             return False
         text3 = text + " " + text2
-        e3, s3, mask, truncated = self.text_model.Encode(text3)
-        Offload(e3)
+        p3, e3, s3, mask, truncated = self.text_model.Encode(text3)
+        Offload(p3)
         if truncated:
-            Offload(s3)
+            Offload(e3, s3)
             return False
-        data.Add(self.AverageEmbeddings(embeds, e2), s3, mask)
+        data.Add(self.AverageEmbeddings(embeds, e2), e3, s3, mask)
         return True
 
-    def GenerateData(self, data, texts, img_embed_data, only_normal):
+    def GenerateData(
+        self, data, texts, percent, img_embed_data, only_normal, add_empty=False
+    ):
         skip = False
         num_normal = 0
         num_split = 0
         num_combine = 0
+
+        # Add empty text  --  TODO: this is still buggy.
+        if add_empty:
+            projected, embeds, last_state, mask, truncated = self.text_model.Encode(
+                "", None
+            )
+            Offload(projected)
+            data.Add(embeds, embeds, last_state, mask)
+            num_normal += 1
+
         for i, (orig_i, text) in enumerate(texts):
             if i % 500 == 499:
                 print(f"{i+1:04n}: {orig_i:08n} => {text}")
@@ -248,30 +294,35 @@ class DataGenerator:
             img_embeds = self.GetImageEmbeds(img_embed_data, orig_i)
             try:
                 # normal
-                embeds, last_state, mask, truncated = self.text_model.Encode(
+                projected, embeds, last_state, mask, truncated = self.text_model.Encode(
                     text, img_embeds
                 )
+                Offload(projected)
                 if only_normal:
-                    data.Add(embeds, last_state, mask)
+                    data.Add(embeds, embeds, last_state, mask)
                     num_normal += 1
                     Offload(img_embeds)
                     continue
 
                 if False:  # v9
-                    data.Add(embeds, last_state, mask)
+                    data.Add(embeds, embeds, last_state, mask)
                     num_normal += 1
 
                     rn = random.randint(0, 100)
                     i2 = self.PickIndex(len(texts), i)
                     if rn == 0:  #  1 / 101
-                        if self.SplitEmbeds(data, text, img_embeds, last_state, mask):
+                        if self.SplitEmbeds(
+                            data, text, img_embeds, embeds, last_state, mask
+                        ):
                             num_split += 1
                         if self.CombineEmbeds(
                             data, text, i2, texts, img_embed_data, embeds
                         ):
                             num_combine += 1
                     elif rn <= 50:  # 50 / 101
-                        if self.SplitEmbeds(data, text, img_embeds, last_state, mask):
+                        if self.SplitEmbeds(
+                            data, text, img_embeds, embeds, last_state, mask
+                        ):
                             num_split += 1
                         elif self.CombineEmbeds(
                             data, text, i2, texts, img_embed_data, embeds
@@ -282,27 +333,30 @@ class DataGenerator:
                             data, text, i2, texts, img_embed_data, embeds
                         ):
                             num_combine += 1
-                        elif self.SplitEmbeds(data, text, img_embeds, last_state, mask):
-                            num_combine += 1
+                        elif self.SplitEmbeds(
+                            data, text, img_embeds, embeds, last_state, mask
+                        ):
+                            num_split += 1
                     Offload(img_embeds)
                     continue
 
-                # v10 or later
-                rn = random.randint(0, 2)
-                if (rn == 0) or truncated:
+                rn = random.randint(0, 199)
+                if (rn % 100 < percent) or truncated:
                     # normal
-                    data.Add(embeds, last_state, mask)
+                    data.Add(embeds, embeds, last_state, mask)
                     num_normal += 1
-                elif rn == 1:
+                elif rn < 100:
                     # split
-                    if self.SplitEmbeds(data, text, img_embeds, last_state, mask):
+                    if self.SplitEmbeds(
+                        data, text, img_embeds, embeds, last_state, mask
+                    ):
                         num_split += 1
                         Offload(embeds)
                     else:
                         # fall back to normal
-                        data.Add(embeds, last_state, mask)
+                        data.Add(embeds, embeds, last_state, mask)
                         num_normal += 1
-                elif rn == 2:
+                else:
                     # combine
                     i2 = i + 1
                     ok = False
@@ -316,15 +370,15 @@ class DataGenerator:
                             skip = True
                     if not ok:
                         # fall back to split
-                        if self.SplitEmbeds(data, text, img_embeds, last_state, mask):
+                        if self.SplitEmbeds(
+                            data, text, img_embeds, embeds, last_state, mask
+                        ):
                             num_split += 1
                             Offload(embeds)
                         else:
                             # fall back to normal
-                            data.Add(embeds, last_state, mask)
+                            data.Add(embeds, embeds, last_state, mask)
                             num_normal += 1
-                else:
-                    raise ValueError(f"unexpected random number: {rn}")
 
             except Exception:
                 print(f"error at: {orig_i:08n} => {text}")
@@ -340,26 +394,32 @@ class Data:
     def __init__(self, data=None):
         if data:  # copy constructor
             self.embed_ls = data.embed_ls
+            self.target_embed_ls = data.target_embed_ls
             self.last_state_ls = data.last_state_ls
             self.mask_ls = data.mask_ls
             return
         self.embed_ls = []
+        self.target_embed_ls = []
         self.last_state_ls = []
         self.mask_ls = []
 
-    def Add(self, embeds, last_states, mask):
+    def Add(self, embeds, target_embeds, last_states, mask):
         # embeds.shape = [1, 768]
+        # target_embeds.shape = [1, 768]
         # last_states = [1, 77, 768]
         # mask = [1, 77]
         self.embed_ls.append(embeds)
+        self.target_embed_ls.append(target_embeds)
         self.last_state_ls.append(last_states)
         self.mask_ls.append(mask)
 
     def Finalize(self):
         # embeds_ls.shape = [data_len, 768]
+        # target_embed_ls.shape = [data_len, 768]
         # last_states_ls = [data_len, 77, 768]
         # mask_ls = [data_len, 77]
         self.embed_ls = self.CatAndRelease(self.embed_ls)
+        self.target_embed_ls = self.CatAndRelease(self.target_embed_ls)
         self.last_state_ls = self.CatAndRelease(self.last_state_ls)
         self.mask_ls = self.CatAndRelease(self.mask_ls)
         torch.cuda.empty_cache()
@@ -375,10 +435,12 @@ class Data:
 
     def __getitem__(self, index):
         # [0].shape = [768]
-        # [1].shape = [77, 768]
-        # [2].shape = [77]
+        # [1].shape = [768]
+        # [2].shape = [77, 768]
+        # [3].shape = [77]
         return (
             self.embed_ls[index],
+            self.target_embed_ls[index],
             self.last_state_ls[index],
             self.mask_ls[index],
         )
@@ -388,6 +450,7 @@ class Data:
             print(f"Data isn't finalized yet.")
             return self
         self.embed_ls.to(device)
+        self.target_embed_ls.to(device)
         self.last_state_ls.to(device)
         self.mask_ls.to(device)
         return self
@@ -395,6 +458,7 @@ class Data:
     def CleanUp(self):
         self.to("cpu")
         del self.embed_ls
+        del self.target_embed_ls
         del self.last_state_ls
         del self.mask_ls
         torch.cuda.empty_cache()
@@ -405,6 +469,7 @@ class Data:
         torch.save(
             {
                 "embeds": self.embed_ls,
+                "target_embeds": self.target_embed_ls,
                 "last_state": self.last_state_ls,
                 "mask": self.mask_ls,
             },
@@ -429,7 +494,7 @@ class DataSet:
         return len(self.data)
 
     def __getitem__(self, index):
-        embeds, last_state, mask = self.data[index]
+        embeds, _, last_state, mask = self.data[index]
         embeds = self.AddNoise(embeds, self.noise_std)
         token_len = self.GetTokenLen(mask)
         return (
@@ -482,7 +547,7 @@ class Trainer:
         pred = pred * masks
         sum_pred = torch.sum(pred, dim=1)
         sum_mask = torch.sum(masks, dim=1)
-        avg_pred = sum_pred / sum_mask
+        avg_pred = torch.nan_to_num(sum_pred / sum_mask, nan=0.0)
         # avg_pred.shape = [bsz, 768] => [bsz, 77, 768]
         avg_pred = avg_pred.reshape((avg_pred.shape[0], 1, avg_pred.shape[1])).repeat(
             1, pred.shape[1], 1
@@ -498,6 +563,7 @@ class Trainer:
         return masks.reshape(masks.shape + (1,)).repeat(1, 1, input_shape[-1])
 
     def training(self):
+        self.model.train()
         # sampler = RandomSampler(self.ds, replacement=False, num_samples=self.ds_size)
         dl = DataLoader(
             self.ds, batch_size=self.bsz, shuffle=True, drop_last=True
@@ -522,6 +588,7 @@ class Trainer:
 
     def test(self):
         with torch.no_grad():
+            self.model.eval()
             dl = DataLoader(self.test_ds, batch_size=len(self.test_ds))
             for target, input, weights, masks in dl:
                 weights = self.ReshapeWeights(weights, input.shape)
@@ -543,12 +610,13 @@ class Trainer:
                     f" input: {input.shape}"
                 )
                 cs = self.cosine_similarity(pred, target)
-                print(f"Test, cosine similarit:", cs)
+                print(f"Test, cosine similarity:", cs)
                 Offload(weights, masks, pred, target, input)
                 return loss, w_loss, cs
 
     def test_inference(self):
         with torch.no_grad():
+            self.model.eval()
             dl = DataLoader(self.test_ds, batch_size=len(self.test_ds))
             for target, input, weights, masks in dl:
                 weights = self.ReshapeWeights(weights, input.shape)
@@ -570,7 +638,7 @@ class Trainer:
                     f" input: {input.shape}"
                 )
                 cs = self.cosine_similarity(pred, target)
-                print(f"Inference test, cosine similarit:", cs)
+                print(f"Inference test, cosine similarity:", cs)
                 Offload(weights, masks, pred, target, input)
                 return loss, w_loss, cs
 
