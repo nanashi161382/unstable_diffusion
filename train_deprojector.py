@@ -61,20 +61,16 @@ class CLIPTextDeprojector(CLIPPreTrainedModel):
         self.final_layer_norm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
 
         self.register_buffer("sos_embed", torch.zeros([embed_dim]))
+        self.register_buffer("null_embed", torch.zeros([embed_dim]))
 
-        # self.text_emb_mlp = MLP3(config.hidden_size)
+    def forward(self, embeds, prev_output, **kwargs):
+        hidden_state = self.ConstructInput(embeds, prev_output, **kwargs)
+        bsz, seq_len, embed_dim = hidden_state.size()
 
-    def forward(self, hidden_state, mlp=False, proj=False):
-        bsz, seq_len, _ = hidden_state.size()
+        attention_mask = None
         causal_attention_mask = self._build_causal_attention_mask(
             bsz, seq_len, hidden_state.dtype
         ).to(hidden_state.device)
-
-        attention_mask = None
-
-        embeds = hidden_state[:, 0, :]
-        embeds = self.ConvertEmb(embeds, mlp=mlp, proj=proj)
-        hidden_state = torch.cat([embeds.unsqueeze(1), hidden_state[:, 1:, :]], dim=1)
 
         position_embeddings = self.position_embedding(self.position_ids)
         hidden_state = hidden_state + position_embeddings
@@ -85,8 +81,9 @@ class CLIPTextDeprojector(CLIPPreTrainedModel):
             causal_attention_mask,
         )
         output = self.final_layer_norm(layer_outputs[0])
-        sos_embed = torch.cat([self.sos_embed.unsqueeze(0).unsqueeze(0)] * bsz, dim=0)
-        return torch.cat([sos_embed, output[:, 1:]], dim=1)
+
+        sos_embeds = self.sos_embed.reshape([1, 1, embed_dim]).repeat([bsz, 1, 1])
+        return torch.cat([sos_embeds, output[:, 1:]], dim=1)
 
     def _build_causal_attention_mask(self, bsz, seq_len, dtype):
         # lazily create causal attention mask, with full attention between the vision tokens
@@ -97,35 +94,62 @@ class CLIPTextDeprojector(CLIPPreTrainedModel):
         mask = mask.unsqueeze(1)  # expand mask
         return mask
 
-    def Inference(self, embeds, mlp=False, proj=False):
+    def Inference(self, embeds, **kwargs):
         self.eval()
-        max_len = self.config.max_position_embeddings
-        embeds = embeds.unsqueeze(1)
-        result = torch.zeros([embeds.shape[0], 0, embeds.shape[-1]]).to(embeds.device)
+        seq_len = self.config.max_position_embeddings
+        result_len = 2
+        result = self(embeds, None, **kwargs)[:, :result_len, :]
         while True:
-            result_len = len(result[0])
-            remaining_len = max_len - result_len - 1
-            input = torch.cat(
-                [
-                    embeds,
-                    result,
-                    torch.zeros([embeds.shape[0], remaining_len, embeds.shape[-1]]).to(
-                        embeds.device
-                    ),
-                ],
-                dim=1,
-            )
-            result = self(input, mlp=mlp, proj=proj)
-            if remaining_len == 0:
+            result_len += 1
+            result = self(embeds, result, **kwargs)[:, :result_len, :]
+            if result_len == seq_len:
                 return result
-            result = result[:, : result_len + 1, :]
 
-    def ConvertEmb(self, text_emb, mlp=False, proj=False):
+    def ConstructInput(
+        self, embeds, prev_output, proj=False, diff=True, embed_second=True
+    ):
+        seq_len = self.config.max_position_embeddings
+        bsz, embed_dim = embeds.size()
+        device = embeds.device
+        if prev_output is None:
+            prev_len = 0
+        else:
+            prev_len = prev_output.size()[1]
+
         if proj:
-            text_emb = self.projection(text_emb)
-        # if mlp:
-        #    text_emb = self.text_emb_mlp(text_emb)
-        return text_emb
+            embeds = self.projection(embeds)
+        embeds = embeds.unsqueeze(1)
+
+        if diff or embed_second:
+            null_embeds = self.null_embed.reshape([1, 1, embed_dim]).repeat([bsz, 1, 1])
+
+        if embed_second:
+            if diff:
+                embeds = embeds - null_embeds
+            result = [null_embeds, embeds]
+        else:
+            sos_embeds = self.sos_embed.reshape([1, 1, embed_dim]).repeat([bsz, 1, 1])
+            if diff:
+                sos_embeds = sos_embeds - null_embeds
+                embeds = embeds - null_embeds
+            result = [embeds, sos_embeds]
+
+        result_len = 2
+        if prev_len > 1:
+            if diff:
+                prev_output = prev_output - null_embeds.repeat([1, prev_len, 1])
+            result.append(prev_output[:, 1:, :])
+            result_len += prev_len - 1
+
+        if result_len < seq_len:
+            result.append(
+                torch.zeros([bsz, seq_len - result_len, embed_dim]).to(device)
+            )
+        elif result_len > seq_len:
+            result[-1] = result[-1][:, : (seq_len - result_len), :]
+
+        result = torch.cat(result, dim=1)
+        return result
 
 
 def Offload(*ls):
@@ -267,14 +291,14 @@ class DataGenerator:
         return True
 
     def GenerateData(
-        self, data, texts, percent, img_embed_data, only_normal, add_empty=False
+        self, data, texts, percent, img_embed_data, only_normal, add_empty=True
     ):
         skip = False
         num_normal = 0
         num_split = 0
         num_combine = 0
 
-        # Add empty text  --  TODO: this is still buggy.
+        # Add empty text
         if add_empty:
             projected, embeds, last_state, mask, truncated = self.text_model.Encode(
                 "", None
@@ -282,6 +306,7 @@ class DataGenerator:
             Offload(projected)
             data.Add(embeds, embeds, last_state, mask)
             num_normal += 1
+            print(f"Add embedding for the empty text.")
 
         for i, (orig_i, text) in enumerate(texts):
             if i % 500 == 499:
@@ -481,14 +506,9 @@ class Data:
 
 
 class DataSet:
-    def __init__(self, data, noise_std=0, start=0, size=None):
+    def __init__(self, data, noise_std=0):
         self.data = data.to(device)
         self.noise_std = noise_std
-        self.start = start
-        if size:
-            self.size = size
-        else:
-            self.size = len(self.data) - start
 
     def __len__(self):
         return len(self.data)
@@ -499,7 +519,7 @@ class DataSet:
         token_len = self.GetTokenLen(mask)
         return (
             last_state,
-            torch.cat([embeds.unsqueeze(0), last_state], dim=0)[:-1, :],
+            embeds,  # torch.cat([embeds.unsqueeze(0), last_state], dim=0)[:-1, :],
             self.GetWeights(token_len),
             self.GetCoreMask(mask),
         )
@@ -544,102 +564,118 @@ class Trainer:
         self.optimizer = torch.optim.Adam(model.parameters())
 
     def regularize(self, pred, masks):
-        pred = pred * masks
+        # masks.shape = [bsz, 77] => [bsz, 77, 768]
+        repeated_masks = masks.reshape(masks.shape + (1,)).repeat(1, 1, pred.shape[-1])
+
+        pred = pred * repeated_masks
         sum_pred = torch.sum(pred, dim=1)
-        sum_mask = torch.sum(masks, dim=1)
-        avg_pred = torch.nan_to_num(sum_pred / sum_mask, nan=0.0)
+        sum_mask = (
+            torch.sum(masks, dim=1)
+            .reshape([sum_pred.shape[0], 1])
+            .repeat(1, pred.shape[2])
+        )
+
+        idx = sum_mask != 0.0
+        avg_pred = torch.zeros(sum_pred.shape).to(pred.device)
+        avg_pred[idx] = sum_pred[idx] / sum_mask[idx]
+
         # avg_pred.shape = [bsz, 768] => [bsz, 77, 768]
         avg_pred = avg_pred.reshape((avg_pred.shape[0], 1, avg_pred.shape[1])).repeat(
             1, pred.shape[1], 1
         )
-        return 0.0 - self.criterion(pred, avg_pred)  # nagate MSE
+        return 0.0 - self.criterion(pred, avg_pred * repeated_masks)  # nagate MSE
 
     def ReshapeWeights(self, weights, input_shape):
         # weights.shape = [bsz, 77] => [bsz, 77, 768]
         return weights.reshape(weights.shape + (1,)).repeat(1, 1, input_shape[-1])
 
-    def ReshapeMasks(self, masks, input_shape):
-        # masks.shape = [bsz, 77] => [bsz, 77, 768]
-        return masks.reshape(masks.shape + (1,)).repeat(1, 1, input_shape[-1])
-
-    def training(self):
+    def training(self, **kwargs):
         self.model.train()
         # sampler = RandomSampler(self.ds, replacement=False, num_samples=self.ds_size)
         dl = DataLoader(
             self.ds, batch_size=self.bsz, shuffle=True, drop_last=True
         )  # sampler=sampler)
-        for i, (target, input, weights, masks) in enumerate(dl):
-            weights = self.ReshapeWeights(weights, input.shape)
-            masks = self.ReshapeMasks(masks, input.shape)
+        for i, (target, embeds, weights, masks) in enumerate(dl):
+            weights = self.ReshapeWeights(weights, target.shape)
             self.optimizer.zero_grad()
-            pred = self.model(input)
+            pred = self.model(embeds, target, **kwargs)
             loss = self.criterion(weights * pred, weights * target)
             if self.reg_weight:
-                loss += self.reg_weight * self.regularize(pred, masks)
+                reg_loss = self.regularize(pred, masks)
+                loss += self.reg_weight * reg_loss
+                reg_loss = reg_loss.item()
+            else:
+                reg_loss = 0.0
             loss.backward()
             self.optimizer.step()
             if (i + 1) % 10 == 0:
                 print(
-                    f"Batch {i+1}, loss {loss.item():.4f}, target: {target.shape},"
-                    f" input: {input.shape}"
+                    f"Batch {i+1}, loss {loss.item():.4f}, reg_loss {reg_loss:.4f},"
+                    f" target: {target.shape}, embeds: {embeds.shape}"
                 )
-            Offload(weights, masks, pred, target, input)
+            Offload(weights, masks, pred, target, embeds)
             torch.cuda.empty_cache()
+        print(
+            f"Batch {i+1}, loss {loss.item():.4f}, reg_loss {reg_loss:.4f},"
+            f" target: {target.shape}, embeds: {embeds.shape}"
+        )
 
-    def test(self):
+    def test(self, **kwargs):
         with torch.no_grad():
             self.model.eval()
             dl = DataLoader(self.test_ds, batch_size=len(self.test_ds))
-            for target, input, weights, masks in dl:
-                weights = self.ReshapeWeights(weights, input.shape)
-                masks = self.ReshapeMasks(masks, input.shape)
-                pred = self.model(input)
+            for target, embeds, weights, masks in dl:
+                weights = self.ReshapeWeights(weights, target.shape)
+                pred = self.model(embeds, target, **kwargs)
                 loss = self.criterion(pred, target).item()
                 print(
                     f"Test, loss {loss:.4f}, target: {target.shape},"
-                    f" input: {input.shape}"
+                    f" embeds: {embeds.shape}"
                 )
                 w_loss = self.criterion(weights * pred, weights * target)
                 if self.reg_weight:
                     reg_loss = self.regularize(pred, masks)
-                    print(f"regularization: {reg_loss}")
                     w_loss += self.reg_weight * reg_loss
+                    reg_loss = reg_loss.item()
+                else:
+                    reg_loss = 0.0
                 w_loss = w_loss.item()
                 print(
-                    f"Test, weighted loss {w_loss:.4f}, target: {target.shape},"
-                    f" input: {input.shape}"
+                    f"Test, weighted loss {w_loss:.4f}, reg_loss {reg_loss:.4f},"
+                    f" target: {target.shape}, embeds: {embeds.shape}"
                 )
                 cs = self.cosine_similarity(pred, target)
                 print(f"Test, cosine similarity:", cs)
-                Offload(weights, masks, pred, target, input)
+                Offload(weights, masks, pred, target, embeds)
                 return loss, w_loss, cs
 
-    def test_inference(self):
+    def test_inference(self, **kwargs):
         with torch.no_grad():
             self.model.eval()
             dl = DataLoader(self.test_ds, batch_size=len(self.test_ds))
-            for target, input, weights, masks in dl:
-                weights = self.ReshapeWeights(weights, input.shape)
-                masks = self.ReshapeMasks(masks, input.shape)
-                pred = self.model.Inference(input[:, :1, :].squeeze(1))
+            for target, embeds, weights, masks in dl:
+                weights = self.ReshapeWeights(weights, target.shape)
+                pred = self.model.Inference(embeds, **kwargs)
                 loss = self.criterion(pred, target).item()
                 print(
                     f"Inference test, loss {loss:.4f}, target: {target.shape},"
-                    f" input: {input.shape}"
+                    f" embeds: {embeds.shape}"
                 )
                 w_loss = self.criterion(weights * pred, weights * target)
                 if self.reg_weight:
                     reg_loss = self.regularize(pred, masks)
-                    print(f"regularization: {reg_loss}")
                     w_loss += self.reg_weight * reg_loss
+                    reg_loss = reg_loss.item()
+                else:
+                    reg_loss = 0.0
                 w_loss = w_loss.item()
                 print(
-                    f"Inference test, weighted loss {w_loss:.4f}, target: {target.shape},"
-                    f" input: {input.shape}"
+                    f"Inference test, weighted loss {w_loss:.4f}, reg_loss {reg_loss:.4f},"
+                    f" target: {target.shape}, embeds: {embeds.shape}"
                 )
                 cs = self.cosine_similarity(pred, target)
                 print(f"Inference test, cosine similarity:", cs)
-                Offload(weights, masks, pred, target, input)
+                Offload(weights, masks, pred, target, embeds)
                 return loss, w_loss, cs
 
     def cosine_similarity(self, t0, t1):
