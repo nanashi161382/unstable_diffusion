@@ -31,6 +31,7 @@ from transformers import (
     CLIPTextConfig,
     CLIPVisionModelWithProjection,
 )
+from transformers.activations import ACT2FN
 from transformers.models.clip.modeling_clip import CLIPEncoderLayer
 from typing import Any, Optional, List, Union, Callable, Tuple, Dict
 
@@ -374,6 +375,26 @@ class SharedTarget:
 #
 # -- CLIPTextDeprojector
 #
+class MLP3(nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        intermediate_size = hidden_size * 4
+        self.activation_fn = ACT2FN["quick_gelu"]
+        self.fc1 = nn.Linear(hidden_size, intermediate_size)
+        self.dropout = nn.Dropout(0.02)
+        self.fc2 = nn.Linear(intermediate_size, intermediate_size)
+        self.fc3 = nn.Linear(intermediate_size, hidden_size)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.fc1(hidden_states)
+        hidden_states = self.activation_fn(hidden_states)
+        hideen_states = self.dropout(hidden_states)
+        hidden_states = self.fc2(hidden_states)
+        hidden_states = self.activation_fn(hidden_states)
+        hidden_states = self.fc3(hidden_states)
+        return hidden_states
+
+
 class CLIPTextDeprojector(CLIPPreTrainedModel):
     config_class = CLIPTextConfig
     _no_split_modules = ["CLIPEncoderLayer"]
@@ -383,7 +404,6 @@ class CLIPTextDeprojector(CLIPPreTrainedModel):
         self.config = config
         embed_dim = config.hidden_size
 
-        self.to_use_projection = True
         self.projection = nn.Linear(config.projection_dim, embed_dim, bias=False)
         for param in self.projection.parameters():
             param.requires_grad = False  # Fix the parameter of the projection layer.
@@ -398,27 +418,19 @@ class CLIPTextDeprojector(CLIPPreTrainedModel):
         self.final_layer_norm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
 
         self.register_buffer("sos_embed", torch.zeros([embed_dim]))
+        self.register_buffer("null_embed", torch.zeros([embed_dim]))
 
-    def use_projection(self, to_use: bool = True):
-        self.to_use_projection = to_use
+        self.expand = nn.Linear(embed_dim, embed_dim)  # * 2)
+        self.expand_act = ACT2FN["quick_gelu"]
 
-    def dont_use_projection(self):
-        self.use_projection(False)
+    def forward(self, embeds, prev_output, **kwargs):
+        hidden_state = self.ConstructInput(embeds, prev_output, **kwargs)
+        bsz, seq_len, embed_dim = hidden_state.size()
 
-    def forward(self, hidden_state):
-        bsz, seq_len, _ = hidden_state.size()
+        attention_mask = None
         causal_attention_mask = self._build_causal_attention_mask(
             bsz, seq_len, hidden_state.dtype
         ).to(hidden_state.device)
-
-        attention_mask = None
-
-        if self.to_use_projection:
-            embeds = hidden_state[:, 0, :]
-            embeds = self.projection(embeds)
-            hidden_state = torch.cat(
-                [embeds.unsqueeze(1), hidden_state[:, 1:, :]], dim=1
-            )
 
         position_embeddings = self.position_embedding(self.position_ids)
         hidden_state = hidden_state + position_embeddings
@@ -429,8 +441,9 @@ class CLIPTextDeprojector(CLIPPreTrainedModel):
             causal_attention_mask,
         )
         output = self.final_layer_norm(layer_outputs[0])
-        sos_embed = torch.cat([self.sos_embed.unsqueeze(0).unsqueeze(0)] * bsz, dim=0)
-        return torch.cat([sos_embed, output[:, 1:]], dim=1)
+
+        sos_embeds = self.sos_embed.reshape([1, 1, embed_dim]).repeat([bsz, 1, 1])
+        return torch.cat([sos_embeds, output[:, 1:]], dim=1)
 
     def _build_causal_attention_mask(self, bsz, seq_len, dtype):
         # lazily create causal attention mask, with full attention between the vision tokens
@@ -441,27 +454,73 @@ class CLIPTextDeprojector(CLIPPreTrainedModel):
         mask = mask.unsqueeze(1)  # expand mask
         return mask
 
-    def Inference(self, embeds):
-        max_len = self.config.max_position_embeddings
-        embeds = embeds.unsqueeze(1)
-        result = torch.zeros([embeds.shape[0], 0, embeds.shape[-1]]).to(embeds.device)
+    def Inference(self, embeds, **kwargs):
+        self.eval()
+        seq_len = self.config.max_position_embeddings
+        result_len = 2
+        result = self(embeds, None, **kwargs)[:, :result_len, :]
         while True:
-            result_len = len(result[0])
-            remaining_len = max_len - result_len - 1
-            input = torch.cat(
-                [
-                    embeds,
-                    result,
-                    torch.zeros([embeds.shape[0], remaining_len, embeds.shape[-1]]).to(
-                        embeds.device
-                    ),
-                ],
-                dim=1,
-            )
-            result = self(input)
-            if remaining_len == 0:
+            result_len += 1
+            result = self(embeds, result, **kwargs)[:, :result_len, :]
+            if result_len == seq_len:
                 return result
-            result = result[:, : result_len + 1, :]
+
+    def ConstructInput(
+        self,
+        embeds,
+        prev_output,
+        proj=False,
+        diff=True,
+        embed_second=True,
+        expand=False,
+    ):
+        seq_len = self.config.max_position_embeddings
+        bsz, embed_dim = embeds.size()
+        device = embeds.device
+        if prev_output is None:
+            prev_len = 0
+        else:
+            prev_len = prev_output.size()[1]
+
+        if proj:
+            embeds = self.projection(embeds)
+        embeds = embeds.unsqueeze(1)
+
+        if diff or embed_second or expand:
+            null_embeds = self.null_embed.reshape([1, 1, embed_dim]).repeat([bsz, 1, 1])
+
+        if expand:
+            if diff:
+                embeds = embeds - null_embeds
+            result = [self.expand_act(self.expand(embeds)), embeds]
+            # result = [self.expand_act(self.expand(embeds)).reshape([bsz, 2, embed_dim])]
+        elif embed_second:
+            if diff:
+                embeds = embeds - null_embeds
+            result = [null_embeds, embeds]
+        else:
+            sos_embeds = self.sos_embed.reshape([1, 1, embed_dim]).repeat([bsz, 1, 1])
+            if diff:
+                sos_embeds = sos_embeds - null_embeds
+                embeds = embeds - null_embeds
+            result = [embeds, sos_embeds]
+
+        result_len = 2
+        if prev_len > 1:
+            if diff:
+                prev_output = prev_output - null_embeds.repeat([1, prev_len, 1])
+            result.append(prev_output[:, 1:, :])
+            result_len += prev_len - 1
+
+        if result_len < seq_len:
+            result.append(
+                torch.zeros([bsz, seq_len - result_len, embed_dim]).to(device)
+            )
+        elif result_len > seq_len:
+            result[-1] = result[-1][:, : (seq_len - result_len), :]
+
+        result = torch.cat(result, dim=1)
+        return result
 
 
 #
@@ -484,6 +543,27 @@ class TextModel(TextualInversionLoaderMixin):
         self.target = SharedTarget(device, dtype)
         self.deprojector = None
         self.use_deprojector = False
+        self.mask_after_eos = 0.0
+        self.random_after_eos = 0.0
+        self.null_emb_after_eos = 0.0
+
+    def SetMaskAfterEOS(self, mask):
+        """
+        Experimental. Remove later.
+        """
+        self.mask_after_eos = mask
+
+    def SetRandomAfterEOS(self, mask):
+        """
+        Experimental. Remove later.
+        """
+        self.random_after_eos = mask
+
+    def SetNullEmbAfterEOS(self, mask):
+        """
+        Experimental. Remove later.
+        """
+        self.null_emb_after_eos = mask
 
     def SetDeprojector(self, deprojector):
         self.deprojector = deprojector
@@ -564,13 +644,67 @@ class TextModel(TextualInversionLoaderMixin):
         pooled_output = embeddings[1]
 
         if self.deprojector and self.use_deprojector:
-            self.deprojector.dont_use_projection()
-            last_hidden_state = self.deprojector.Inference(pooled_output)
+            last_hidden_state = self.Deprojection(pooled_output, from_projected=False)
 
         num_tokens = 0
         for m in attention_mask[0]:
             if m.item() > 0:
                 num_tokens += 1
+
+        __ones = None
+        __mask = None
+
+        def GetOnes():
+            nonlocal __ones
+            if __ones is None:
+                __ones = torch.ones([1, 77, 768]).to(self.target.device())
+            return __ones
+
+        def GetMask():
+            nonlocal __mask
+            if __mask is None:
+                __mask = GetOnes() - (
+                    attention_mask.reshape(1, 77, 1)
+                    .repeat(1, 1, 768)
+                    .to(self.target.device())
+                )
+            return __mask
+
+        if self.random_after_eos != 0.0:
+            mask = self.random_after_eos * GetMask()
+            noise = torch.normal(0, 1, [1, 77, 768]).to(self.target.device())
+            last_hidden_state = (GetOnes() - mask) * last_hidden_state + mask * noise
+
+        if self.null_emb_after_eos != 0.0:
+            global singleton_null_emb
+            if singleton_null_emb is None:
+                singleton_null_emb = self.text_encoder(
+                    self.tokenize("").input_ids.to(self.target.device()),
+                    attention_mask=None,
+                )[1]
+                singleton_null_emb = singleton_null_emb.reshape(1, 1, 768).repeat(
+                    1, 77, 1
+                )
+            mask = self.null_emb_after_eos * GetMask()
+            last_hidden_state = (
+                GetOnes() - mask
+            ) * last_hidden_state + mask * singleton_null_emb
+
+        if self.mask_after_eos != 0.0:
+            print(attention_mask.shape)
+            print(last_hidden_state.shape)
+            coeff = (
+                (
+                    torch.ones(attention_mask.shape) * (1.0 - self.mask_after_eos)
+                    + attention_mask * self.mask_after_eos
+                )
+                .reshape(1, 77, 1)
+                .repeat(1, 1, 768)
+                .to(self.target.device())
+            )
+            print(coeff.shape)
+            last_hidden_state = coeff * last_hidden_state
+
         return last_hidden_state, truncated, pooled_output, num_tokens
 
     def GetConstant(self, value: float):
@@ -580,8 +714,12 @@ class TextModel(TextualInversionLoaderMixin):
         return torch.tensor([mat]).to(**self.target.dict)
 
     def Deprojection(self, embeds, from_projected=False):
-        self.deprojector.use_projection(from_projected)
-        return self.deprojector.Inference(embeds)
+        if not self.deprojector:
+            raise ValueError(f"Deprojector must be set before calling Deprojection().")
+        return self.deprojector.Inference(embeds, proj=from_projected)
+
+
+singleton_null_emb = None
 
 
 #
@@ -1170,11 +1308,13 @@ class ImageEncoding(StandardEncoding):
         self,
         model: CLIPVisionModelWithProjection,
         processor: AutoProcessor,
+        base_img_emb: torch.Tensor,
         image: Optional[Union[str, PIL.Image.Image]] = None,
     ):
         super().__init__(image)
         self.model = model
         self.processor = processor
+        self.base_img_emb = base_img_emb.unsqueeze(0)
 
     def Encode(
         self,
@@ -1193,13 +1333,21 @@ class ImageEncoding(StandardEncoding):
             )
         )
         # Debug(2, output.image_embeds.shape)
-        return text_model.Deprojection(output.image_embeds, from_projected=True)
+        base_emb = text_model.EncodeText("", fail_on_truncation=True)[2]
+        embeds = output.image_embeds - self.base_img_emb + base_emb
+        return text_model.Deprojection(embeds, from_projected=True)
 
 
 class PooledEncoding(StandardEncoding):
-    def __init__(self, normalize: bool = False, text: Optional[str] = None):
+    def __init__(
+        self,
+        normalize: bool = False,
+        diff_only: bool = False,
+        text: Optional[str] = None,
+    ):
         super().__init__(text)
         self.normalize = normalize
+        self.diff_only = diff_only
 
     def Encode(
         self, text_model: TextModel, text: str, default_encoding: StandardEncoding
@@ -1207,9 +1355,14 @@ class PooledEncoding(StandardEncoding):
         chunks = [s for s in (s.strip() for s in text.split(",")) if s]
         embeds = []
         for chunk in chunks:
-            _, _, e, _ = text_model.EncodeText(chunk, fail_on_truncation=True)
-            embeds.append(e[0])
-        merged_embeds = sum(embeds)
+            e = text_model.EncodeText(chunk, fail_on_truncation=True)[2][0]
+            embeds.append(e)
+        if self.diff_only:
+            base_emb = text_model.EncodeText("", fail_on_truncation=True)[2][0]
+            embeds = [e - base_emb for e in embeds]
+            merged_embeds = sum(embeds) + base_emb
+        else:
+            merged_embeds = sum(embeds)
         if self.normalize:
             coeff = (
                 sum(torch.norm(e) for e in embeds)
