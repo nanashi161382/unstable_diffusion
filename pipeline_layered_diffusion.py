@@ -395,55 +395,12 @@ class MLP3(nn.Module):
         return hidden_states
 
 
-class CLIPTextDeprojector(CLIPPreTrainedModel):
+class CLIPTextDeprojectorBase(CLIPPreTrainedModel):
     config_class = CLIPTextConfig
     _no_split_modules = ["CLIPEncoderLayer"]
 
     def __init__(self, config: CLIPTextConfig):
         super().__init__(config)
-        self.config = config
-        embed_dim = config.hidden_size
-
-        self.projection = nn.Linear(config.projection_dim, embed_dim, bias=False)
-        for param in self.projection.parameters():
-            param.requires_grad = False  # Fix the parameter of the projection layer.
-
-        self.register_buffer(
-            "position_ids", torch.arange(config.max_position_embeddings).expand((1, -1))
-        )
-        self.position_embedding = nn.Embedding(
-            config.max_position_embeddings, embed_dim
-        )
-        self.encoder_layer = CLIPEncoderLayer(config)
-        self.final_layer_norm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
-
-        self.register_buffer("sos_embed", torch.zeros([embed_dim]))
-        self.register_buffer("null_embed", torch.zeros([embed_dim]))
-
-        self.expand = nn.Linear(embed_dim, embed_dim)  # * 2)
-        self.expand_act = ACT2FN["quick_gelu"]
-
-    def forward(self, embeds, prev_output, **kwargs):
-        hidden_state = self.ConstructInput(embeds, prev_output, **kwargs)
-        bsz, seq_len, embed_dim = hidden_state.size()
-
-        attention_mask = None
-        causal_attention_mask = self._build_causal_attention_mask(
-            bsz, seq_len, hidden_state.dtype
-        ).to(hidden_state.device)
-
-        position_embeddings = self.position_embedding(self.position_ids)
-        hidden_state = hidden_state + position_embeddings
-
-        layer_outputs = self.encoder_layer(
-            hidden_state,
-            attention_mask,
-            causal_attention_mask,
-        )
-        output = self.final_layer_norm(layer_outputs[0])
-
-        sos_embeds = self.sos_embed.reshape([1, 1, embed_dim]).repeat([bsz, 1, 1])
-        return torch.cat([sos_embeds, output[:, 1:]], dim=1)
 
     def _build_causal_attention_mask(self, bsz, seq_len, dtype):
         # lazily create causal attention mask, with full attention between the vision tokens
@@ -453,17 +410,6 @@ class CLIPTextDeprojector(CLIPPreTrainedModel):
         mask.triu_(1)  # zero out the lower diagonal
         mask = mask.unsqueeze(1)  # expand mask
         return mask
-
-    def Inference(self, embeds, **kwargs):
-        self.eval()
-        seq_len = self.config.max_position_embeddings
-        result_len = 2
-        result = self(embeds, None, **kwargs)[:, :result_len, :]
-        while True:
-            result_len += 1
-            result = self(embeds, result, **kwargs)[:, :result_len, :]
-            if result_len == seq_len:
-                return result
 
     def ConstructInput(
         self,
@@ -521,6 +467,229 @@ class CLIPTextDeprojector(CLIPPreTrainedModel):
 
         result = torch.cat(result, dim=1)
         return result
+
+
+class CLIPTextDeprojectorSingle(CLIPTextDeprojectorBase):
+    """
+    This is deprecated.
+    """
+
+    def __init__(self, config: CLIPTextConfig):
+        super().__init__(config)
+        self.config = config
+        embed_dim = config.hidden_size
+
+        self.projection = nn.Linear(config.projection_dim, embed_dim, bias=False)
+        for param in self.projection.parameters():
+            param.requires_grad = False  # Fix the parameter of the projection layer.
+
+        self.register_buffer(
+            "position_ids", torch.arange(config.max_position_embeddings).expand((1, -1))
+        )
+        self.register_buffer("sos_embed", torch.zeros([embed_dim]))
+        self.register_buffer("null_embed", torch.zeros([embed_dim]))
+
+        self.position_embedding = nn.Embedding(
+            config.max_position_embeddings, embed_dim
+        )
+        self.encoder_layer = CLIPEncoderLayer(config)
+        self.final_layer_norm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
+
+        # self.expand = nn.Linear(embed_dim, embed_dim)  # * 2)
+        # self.expand_act = ACT2FN["quick_gelu"]
+
+    def forward(self, embeds, prev_output, **kwargs):
+        hidden_state = self.ConstructInput(embeds, prev_output, **kwargs)
+        bsz, seq_len, embed_dim = hidden_state.size()
+
+        attention_mask = None
+        causal_attention_mask = self._build_causal_attention_mask(
+            bsz, seq_len, hidden_state.dtype
+        ).to(hidden_state.device)
+
+        position_embeddings = self.position_embedding(self.position_ids)
+        hidden_state = hidden_state + position_embeddings
+
+        layer_outputs = self.encoder_layer(
+            hidden_state,
+            attention_mask,
+            causal_attention_mask,
+        )
+        output = self.final_layer_norm(layer_outputs[0])
+
+        sos_embeds = self.sos_embed.reshape([1, 1, embed_dim]).repeat([bsz, 1, 1])
+        return torch.cat([sos_embeds, output[:, 1:]], dim=1)
+
+    def Inference(self, embeds, **kwargs):
+        self.eval()
+        seq_len = self.config.max_position_embeddings
+        result_len = 2
+        result = self(embeds, None, **kwargs)[:, :result_len, :]
+        while True:
+            result_len += 1
+            result = self(embeds, result, **kwargs)[:, :result_len, :]
+            if result_len == seq_len:
+                return result
+
+
+class CLIPTextDeprojector(CLIPTextDeprojectorBase):
+    length = 4
+
+    def __init__(self, config: CLIPTextConfig):
+        super().__init__(config)
+        self.config = config
+        embed_dim = config.hidden_size
+
+        self.register_buffer(
+            "position_ids", torch.arange(config.max_position_embeddings).expand((1, -1))
+        )
+        self.register_buffer("sos_embed", torch.zeros([embed_dim]))
+        self.register_buffer("null_embed", torch.zeros([embed_dim]))
+
+        self.projection = nn.Linear(config.projection_dim, embed_dim, bias=False)
+        for param in self.projection.parameters():
+            param.requires_grad = False  # Fix the parameter of the projection layer.
+
+        if self.length == 1:
+            # Treat length == 1 specially due to a historical reason.
+            self.position_embedding = nn.Embedding(
+                config.max_position_embeddings, embed_dim
+            )
+            self.encoder_layer = CLIPEncoderLayer(config)
+            self.final_layer_norm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
+        else:
+            self.position_embedding = nn.ModuleList(
+                [
+                    nn.Embedding(config.max_position_embeddings, embed_dim)
+                    for _ in range(self.length)
+                ]
+            )
+            self.encoder_layer = nn.ModuleList(
+                [CLIPEncoderLayer(config) for _ in range(self.length)]
+            )
+            self.final_layer_norm = nn.ModuleList(
+                [
+                    nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
+                    for _ in range(self.length)
+                ]
+            )
+
+    def forward(self, embeds, prev_outputs, **kwargs):
+        if isinstance(self.encoder_layer, nn.ModuleList):
+            position_embedding_fn = self.position_embedding
+            encoder_layer_fn = self.encoder_layer
+            final_layer_norm_fn = self.final_layer_norm
+        else:
+            position_embedding_fn = [self.position_embedding]
+            encoder_layer_fn = [self.encoder_layer]
+            final_layer_norm_fn = [self.final_layer_norm]
+
+        hidden_states = [self.ConstructInput(embeds, p, **kwargs) for p in prev_outputs]
+        bsz, seq_len, embed_dim = hidden_states[0].size()
+
+        attention_mask = None
+        causal_attention_mask = self._build_causal_attention_mask(
+            bsz, seq_len, hidden_states[0].dtype
+        ).to(hidden_states[0].device)
+
+        position_embeddings = [fn(self.position_ids) for fn in position_embedding_fn]
+        hidden_states = [hs + pe for hs, pe in zip(hidden_states, position_embeddings)]
+
+        layer_outputs = [
+            fn(hs, attention_mask, causal_attention_mask)
+            for fn, hs in zip(encoder_layer_fn, hidden_states)
+        ]
+        output = [fn(lo[0]) for fn, lo in zip(final_layer_norm_fn, layer_outputs)]
+
+        sos_embeds = self.sos_embed.reshape([1, 1, embed_dim]).repeat([bsz, 1, 1])
+        return [torch.cat([sos_embeds, o[:, 1:]], dim=1) for o in output]
+
+    def Inference(self, embeds, **kwargs):
+        self.eval()
+        ensemble_len = (
+            len(self.encoder_layer)
+            if isinstance(self.encoder_layer, nn.ModuleList)
+            else 1
+        )
+        seq_len = self.config.max_position_embeddings
+
+        result = [None]
+        result_len = len(result)
+        result = result * ensemble_len
+        while result_len < seq_len:
+            result_len += 1
+            result = self(embeds, result, **kwargs)
+            result = [r[:, :result_len, :] for r in result]
+
+        if ensemble_len == 1:
+            return result[0]
+        else:
+            return sum(result) / len(result)
+
+    @classmethod
+    def from_units(cls, models):
+        if any(isinstance(model.encoder_layer, nn.ModuleList) for model in models):
+            raise ValueError(f"The length of all `models` must be 1.")
+        cls.length = len(models)
+        new_model = cls(models[0].config)
+        new_model.position_ids = models[0].position_ids
+        new_model.sos_embed = models[0].sos_embed
+        new_model.null_embed = models[0].null_embed
+
+        def copy_params(a, b):
+            for pa, pb in zip(a.parameters(), b.parameters()):
+                pa.data = pb.data
+
+        copy_params(new_model.projection, models[0].projection)
+        if cls.length == 1:
+            copy_params(new_model.position_embedding, models[0].position_embedding)
+            copy_params(new_model.encoder_layer, models[0].encoder_layer)
+            copy_params(new_model.final_layer_norm, models[0].final_layer_norm)
+        else:
+            for i, model in enumerate(models):
+                copy_params(new_model.position_embedding[i], model.position_embedding)
+                copy_params(new_model.encoder_layer[i], model.encoder_layer)
+                copy_params(new_model.final_layer_norm[i], model.final_layer_norm)
+        return new_model
+
+
+class CLIPTextDeprojectorMerge:
+    def __init__(self, models: List[CLIPTextDeprojector]):
+        if not models:
+            raise ValueError(f"At least one model must be provided.")
+        model = CLIPTextDeprojector(models[0].config)
+        state_dict = model.state_dict()
+        for key in state_dict:
+            state_sum = sum(m.state_dict()[key] for m in models)
+            state_dict[key] = state_sum / len(models)
+        model.load_state_dict(state_dict)
+        self.model = model
+
+    def Inference(self, embeds, **kwargs):
+        return self.model.Inference(embeds, **kwargs)
+
+
+class CLIPTextDeprojectorEnsemble2:
+    def __init__(self, models: List[CLIPTextDeprojector]):
+        if not models:
+            raise ValueError(f"At least one model must be provided.")
+        self.models = models
+
+    def call(self, embeds, prev_output, **kwargs):
+        result = sum(model(embeds, prev_output, **kwargs) for model in self.models)
+        return result / len(self.models)
+
+    def Inference(self, embeds, **kwargs):
+        for model in self.models:
+            model.eval()
+        seq_len = self.models[0].config.max_position_embeddings
+        result_len = 2
+        result = self.call(embeds, None, **kwargs)[:, :result_len, :]
+        while True:
+            result_len += 1
+            result = self.call(embeds, result, **kwargs)[:, :result_len, :]
+            if result_len == seq_len:
+                return result
 
 
 #
@@ -691,8 +860,6 @@ class TextModel(TextualInversionLoaderMixin):
             ) * last_hidden_state + mask * singleton_null_emb
 
         if self.mask_after_eos != 0.0:
-            print(attention_mask.shape)
-            print(last_hidden_state.shape)
             coeff = (
                 (
                     torch.ones(attention_mask.shape) * (1.0 - self.mask_after_eos)
@@ -702,7 +869,6 @@ class TextModel(TextualInversionLoaderMixin):
                 .repeat(1, 1, 768)
                 .to(self.target.device())
             )
-            print(coeff.shape)
             last_hidden_state = coeff * last_hidden_state
 
         return last_hidden_state, truncated, pooled_output, num_tokens
