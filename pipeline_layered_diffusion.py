@@ -395,11 +395,26 @@ class MLP3(nn.Module):
         return hidden_states
 
 
+class CLIPTextDeprojectorConfig(CLIPTextConfig):
+    model_type = "clip_text_deprojector_model"
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        if "ensemble_size" in kwargs:
+            self.ensemble_size = kwargs["ensemble_size"]
+        else:
+            Debug(
+                0,
+                "CLIPTextDeprojectorConfig.ensemble_size is not defined. Set 1 by default.",
+            )
+            self.ensemble_size = 1
+
+
 class CLIPTextDeprojectorBase(CLIPPreTrainedModel):
-    config_class = CLIPTextConfig
+    config_class = CLIPTextDeprojectorConfig
     _no_split_modules = ["CLIPEncoderLayer"]
 
-    def __init__(self, config: CLIPTextConfig):
+    def __init__(self, config: CLIPTextDeprojectorConfig):
         super().__init__(config)
 
     def _build_causal_attention_mask(self, bsz, seq_len, dtype):
@@ -469,73 +484,8 @@ class CLIPTextDeprojectorBase(CLIPPreTrainedModel):
         return result
 
 
-class CLIPTextDeprojectorSingle(CLIPTextDeprojectorBase):
-    """
-    This is deprecated.
-    """
-
-    def __init__(self, config: CLIPTextConfig):
-        super().__init__(config)
-        self.config = config
-        embed_dim = config.hidden_size
-
-        self.projection = nn.Linear(config.projection_dim, embed_dim, bias=False)
-        for param in self.projection.parameters():
-            param.requires_grad = False  # Fix the parameter of the projection layer.
-
-        self.register_buffer(
-            "position_ids", torch.arange(config.max_position_embeddings).expand((1, -1))
-        )
-        self.register_buffer("sos_embed", torch.zeros([embed_dim]))
-        self.register_buffer("null_embed", torch.zeros([embed_dim]))
-
-        self.position_embedding = nn.Embedding(
-            config.max_position_embeddings, embed_dim
-        )
-        self.encoder_layer = CLIPEncoderLayer(config)
-        self.final_layer_norm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
-
-        # self.expand = nn.Linear(embed_dim, embed_dim)  # * 2)
-        # self.expand_act = ACT2FN["quick_gelu"]
-
-    def forward(self, embeds, prev_output, **kwargs):
-        hidden_state = self.ConstructInput(embeds, prev_output, **kwargs)
-        bsz, seq_len, embed_dim = hidden_state.size()
-
-        attention_mask = None
-        causal_attention_mask = self._build_causal_attention_mask(
-            bsz, seq_len, hidden_state.dtype
-        ).to(hidden_state.device)
-
-        position_embeddings = self.position_embedding(self.position_ids)
-        hidden_state = hidden_state + position_embeddings
-
-        layer_outputs = self.encoder_layer(
-            hidden_state,
-            attention_mask,
-            causal_attention_mask,
-        )
-        output = self.final_layer_norm(layer_outputs[0])
-
-        sos_embeds = self.sos_embed.reshape([1, 1, embed_dim]).repeat([bsz, 1, 1])
-        return torch.cat([sos_embeds, output[:, 1:]], dim=1)
-
-    def Inference(self, embeds, **kwargs):
-        self.eval()
-        seq_len = self.config.max_position_embeddings
-        result_len = 2
-        result = self(embeds, None, **kwargs)[:, :result_len, :]
-        while True:
-            result_len += 1
-            result = self(embeds, result, **kwargs)[:, :result_len, :]
-            if result_len == seq_len:
-                return result
-
-
 class CLIPTextDeprojector(CLIPTextDeprojectorBase):
-    length = 4
-
-    def __init__(self, config: CLIPTextConfig):
+    def __init__(self, config: CLIPTextDeprojectorConfig):
         super().__init__(config)
         self.config = config
         embed_dim = config.hidden_size
@@ -550,8 +500,8 @@ class CLIPTextDeprojector(CLIPTextDeprojectorBase):
         for param in self.projection.parameters():
             param.requires_grad = False  # Fix the parameter of the projection layer.
 
-        if self.length == 1:
-            # Treat length == 1 specially due to a historical reason.
+        if config.ensemble_size == 1:
+            # Treat config.ensemble_size == 1 specially due to a historical reason.
             self.position_embedding = nn.Embedding(
                 config.max_position_embeddings, embed_dim
             )
@@ -561,16 +511,16 @@ class CLIPTextDeprojector(CLIPTextDeprojectorBase):
             self.position_embedding = nn.ModuleList(
                 [
                     nn.Embedding(config.max_position_embeddings, embed_dim)
-                    for _ in range(self.length)
+                    for _ in range(config.ensemble_size)
                 ]
             )
             self.encoder_layer = nn.ModuleList(
-                [CLIPEncoderLayer(config) for _ in range(self.length)]
+                [CLIPEncoderLayer(config) for _ in range(config.ensemble_size)]
             )
             self.final_layer_norm = nn.ModuleList(
                 [
                     nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
-                    for _ in range(self.length)
+                    for _ in range(config.ensemble_size)
                 ]
             )
 
@@ -630,8 +580,9 @@ class CLIPTextDeprojector(CLIPTextDeprojectorBase):
     def from_units(cls, models):
         if any(isinstance(model.encoder_layer, nn.ModuleList) for model in models):
             raise ValueError(f"The length of all `models` must be 1.")
-        cls.length = len(models)
-        new_model = cls(models[0].config)
+        new_config = copy.deepcopy(models[0].config)
+        new_config.ensemble_size = len(models)
+        new_model = cls(new_config)
         new_model.position_ids = models[0].position_ids
         new_model.sos_embed = models[0].sos_embed
         new_model.null_embed = models[0].null_embed
@@ -641,7 +592,7 @@ class CLIPTextDeprojector(CLIPTextDeprojectorBase):
                 pa.data = pb.data
 
         copy_params(new_model.projection, models[0].projection)
-        if cls.length == 1:
+        if new_config.ensemble_size == 1:
             copy_params(new_model.position_embedding, models[0].position_embedding)
             copy_params(new_model.encoder_layer, models[0].encoder_layer)
             copy_params(new_model.final_layer_norm, models[0].final_layer_norm)
