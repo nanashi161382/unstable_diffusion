@@ -14,7 +14,7 @@ from transformers import (
     CLIPTextConfig,
 )
 from transformers.activations import ACT2FN
-from transformers.models.clip.modeling_clip import CLIPEncoderLayer
+from transformers.models.clip.modeling_clip import CLIPEncoderLayer, CLIPMLP
 
 device = "cuda"
 
@@ -23,39 +23,23 @@ def Debug(_, txt):
     print(txt)
 
 
-class MLP3(nn.Module):
-    def __init__(self, hidden_size):
-        super().__init__()
-        intermediate_size = hidden_size * 4
-        self.activation_fn = ACT2FN["quick_gelu"]
-        self.fc1 = nn.Linear(hidden_size, intermediate_size)
-        self.dropout = nn.Dropout(0.02)
-        self.fc2 = nn.Linear(intermediate_size, intermediate_size)
-        self.fc3 = nn.Linear(intermediate_size, hidden_size)
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.fc1(hidden_states)
-        hidden_states = self.activation_fn(hidden_states)
-        hideen_states = self.dropout(hidden_states)
-        hidden_states = self.fc2(hidden_states)
-        hidden_states = self.activation_fn(hidden_states)
-        hidden_states = self.fc3(hidden_states)
-        return hidden_states
-
-
 class CLIPTextDeprojectorConfig(CLIPTextConfig):
     model_type = "clip_text_deprojector_model"
+    default_ensemble_size = 1
+    default_relative_to_null = True
+    default_apply_mlp_to_input = False
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        if "ensemble_size" in kwargs:
-            self.ensemble_size = kwargs["ensemble_size"]
-        else:
-            Debug(
-                0,
-                "CLIPTextDeprojectorConfig.ensemble_size is not defined. Set 1 by default.",
-            )
-            self.ensemble_size = 1
+        self.ensemble_size = kwargs.get(
+            "ensemble_size", self.__class__.default_ensemble_size
+        )
+        self.relative_to_null = kwargs.get(
+            "relative_to_null", self.__class__.default_relative_to_null
+        )
+        self.apply_mlp_to_input = kwargs.get(
+            "apply_mlp_to_input", self.__class__.default_apply_mlp_to_input
+        )
 
 
 class CLIPTextDeprojectorBase(CLIPPreTrainedModel):
@@ -74,15 +58,7 @@ class CLIPTextDeprojectorBase(CLIPPreTrainedModel):
         mask = mask.unsqueeze(1)  # expand mask
         return mask
 
-    def ConstructInput(
-        self,
-        embeds,
-        prev_output,
-        proj=False,
-        diff=True,
-        embed_second=True,
-        expand=False,
-    ):
+    def ConstructInput(self, embeds, prev_output, fn_to_input, proj=False):
         seq_len = self.config.max_position_embeddings
         bsz, embed_dim = embeds.size()
         device = embeds.device
@@ -91,32 +67,22 @@ class CLIPTextDeprojectorBase(CLIPPreTrainedModel):
         else:
             prev_len = prev_output.size()[1]
 
+        null_embeds = self.null_embed.reshape([1, 1, embed_dim]).repeat([bsz, 1, 1])
+
         if proj:
             embeds = self.projection(embeds)
         embeds = embeds.unsqueeze(1)
+        if self.config.relative_to_null:
+            embeds = embeds - null_embeds
 
-        if diff or embed_second or expand:
-            null_embeds = self.null_embed.reshape([1, 1, embed_dim]).repeat([bsz, 1, 1])
-
-        if expand:
-            if diff:
-                embeds = embeds - null_embeds
-            result = [self.expand_act(self.expand(embeds)), embeds]
-            # result = [self.expand_act(self.expand(embeds)).reshape([bsz, 2, embed_dim])]
-        elif embed_second:
-            if diff:
-                embeds = embeds - null_embeds
-            result = [null_embeds, embeds]
+        if fn_to_input:
+            result = [fn_to_input(embeds), embeds]
         else:
-            sos_embeds = self.sos_embed.reshape([1, 1, embed_dim]).repeat([bsz, 1, 1])
-            if diff:
-                sos_embeds = sos_embeds - null_embeds
-                embeds = embeds - null_embeds
-            result = [embeds, sos_embeds]
+            result = [null_embeds, embeds]
 
         result_len = 2
         if prev_len > 1:
-            if diff:
+            if self.config.relative_to_null:
                 prev_output = prev_output - null_embeds.repeat([1, prev_len, 1])
             result.append(prev_output[:, 1:, :])
             result_len += prev_len - 1
@@ -150,12 +116,18 @@ class CLIPTextDeprojector(CLIPTextDeprojectorBase):
 
         if config.ensemble_size == 1:
             # Treat config.ensemble_size == 1 specially due to a historical reason.
+            if self.config.apply_mlp_to_input:
+                self.mlp_to_input = CLIPMLP(config)
             self.position_embedding = nn.Embedding(
                 config.max_position_embeddings, embed_dim
             )
             self.encoder_layer = CLIPEncoderLayer(config)
             self.final_layer_norm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
         else:
+            if self.config.apply_mlp_to_input:
+                self.mlp_to_input = nn.ModuleList(
+                    [CLIPMLP(config) for _ in range(config.ensemble_size)]
+                )
             self.position_embedding = nn.ModuleList(
                 [
                     nn.Embedding(config.max_position_embeddings, embed_dim)
@@ -174,15 +146,27 @@ class CLIPTextDeprojector(CLIPTextDeprojectorBase):
 
     def forward(self, embeds, prev_outputs, **kwargs):
         if isinstance(self.encoder_layer, nn.ModuleList):
+            if self.config.apply_mlp_to_input:
+                mlp_to_input_fn = self.mlp_to_input
             position_embedding_fn = self.position_embedding
             encoder_layer_fn = self.encoder_layer
             final_layer_norm_fn = self.final_layer_norm
         else:
+            if self.config.apply_mlp_to_input:
+                mlp_to_input_fn = [self.mlp_to_input]
             position_embedding_fn = [self.position_embedding]
             encoder_layer_fn = [self.encoder_layer]
             final_layer_norm_fn = [self.final_layer_norm]
 
-        hidden_states = [self.ConstructInput(embeds, p, **kwargs) for p in prev_outputs]
+        if self.config.apply_mlp_to_input:
+            hidden_states = [
+                self.ConstructInput(embeds, p, fn, **kwargs)
+                for p, fn in zip(prev_outputs, mlp_to_input_fn)
+            ]
+        else:
+            hidden_states = [
+                self.ConstructInput(embeds, p, None, **kwargs) for p in prev_outputs
+            ]
         bsz, seq_len, embed_dim = hidden_states[0].size()
 
         attention_mask = None
@@ -202,7 +186,7 @@ class CLIPTextDeprojector(CLIPTextDeprojectorBase):
         sos_embeds = self.sos_embed.reshape([1, 1, embed_dim]).repeat([bsz, 1, 1])
         return [torch.cat([sos_embeds, o[:, 1:]], dim=1) for o in output]
 
-    def Inference(self, embeds, **kwargs):
+    def Inference(self, embeds, average_each_step=False, **kwargs):
         self.eval()
         ensemble_len = (
             len(self.encoder_layer)
@@ -211,15 +195,20 @@ class CLIPTextDeprojector(CLIPTextDeprojectorBase):
         )
         seq_len = self.config.max_position_embeddings
 
-        result = [None]
-        result_len = len(result)
-        result = result * ensemble_len
+        result = None
+        result_len = 1
         while result_len < seq_len:
+            if not isinstance(result, list):
+                result = [result] * ensemble_len
             result_len += 1
             result = self(embeds, result, **kwargs)
             result = [r[:, :result_len, :] for r in result]
+            if (ensemble_len > 1) and average_each_step:
+                result = sum(result) / len(result)
 
-        if ensemble_len == 1:
+        if not isinstance(result, list):
+            return result
+        elif ensemble_len == 1:
             return result[0]
         else:
             return sum(result) / len(result)
@@ -291,6 +280,11 @@ class TextModel:
         self.encoder = CLIPTextModelWithProjection.from_pretrained(
             path, local_files_only=False
         ).to(device)
+
+    def CleanUp(self):
+        self.encoder.to("cpu")
+        del self.tokenizer
+        del self.encoder
 
     def tokenize(self, text):
         return self.tokenizer(
@@ -626,6 +620,12 @@ class DataQueue:
     def Size(self):
         return len(self.ls)
 
+    def IsFull(self):
+        return self.Size() >= self.Capacity()
+
+    def Get(self):
+        return self.ls
+
     def Add(self, x):
         while self.IsFull():
             self.ls[0].CleanUp()
@@ -633,24 +633,70 @@ class DataQueue:
         self.ls.append(x.to(device))
         return self.IsFull()
 
+
+class RandomDataQueue:
+    def __init__(self, size, filenames):
+        self.size = size
+        self.filenames = filenames
+        self.Initialize()
+
+    def Initialize(self):
+        self.ls = []
+        self.used = []
+        self.available = list(range(len(self.filenames)))
+
+    def Capacity(self):
+        return self.size
+
+    def Size(self):
+        return len(self.ls)
+
     def IsFull(self):
         return self.Size() >= self.Capacity()
 
     def Get(self):
         return self.ls
 
+    def LoadToFull(self):
+        while not self.IsFull():
+            self.LoadOneRandomly()
 
-class DataSet:
-    def __init__(self, data, for_training, weight_mult=25, noise_std=0):
-        if isinstance(data, list):
-            self.data = data
+    def LoadOneRandomly(self):
+        available_idx = random.choice(range(len(self.available)))
+        idx = self.available[available_idx]
+
+        d = Data()
+        d.Load(self.filenames[idx])
+        self.ls.append(d.to(device))
+        self.used.append(idx)
+        del self.available[available_idx]
+
+    def PurgeOneRandomly(self):
+        used_idx = random.choice(range(self.used))
+        idx = self.used[used_idx]
+
+        self.ls[used_idx].CleanUp()
+        del self.ls[used_idx]
+        del self.used[used_idx]
+        if len(self.ls) == 0:
+            self.Initialize()
         else:
-            self.data = [data]
-        for d in self.data:
-            d.to(device)
+            self.available.append(idx)
+
+    def Reset(self):
+        for d in self.ls:
+            d.CleanUp()
+        self.Initialize()
+
+
+class DataSetBase:
+    def __init__(self, for_training, weight_mult=25, noise_std=0):
         self.for_training = for_training
         self.weight_mult = weight_mult
         self.noise_std = noise_std
+
+    def SetData(self, data):
+        self.data = data
 
     def __len__(self):
         return sum(len(d) for d in self.data)
@@ -694,6 +740,25 @@ class DataSet:
         # weights = torch.cat([torch.zeros(1), weights[1:]], dim=0)
         # weights = weights * (len(weights) / sum(weights))
         # return weights.to(device)
+
+
+class DataSet(DataSetBase):
+    def __init__(self, data, **kwargs):
+        super().__init__(**kwargs)
+        if not isinstance(data, list):
+            data = [data]
+        for d in data:
+            d.to(device)
+        self.SetData(data)
+
+
+class QueuedDataSet(DataSetBase):
+    def __init__(self, queue, **kwargs):
+        super().__init__(**kwargs)
+        self.queue = queue
+
+    def Update(self):
+        self.SetData(self.queue.Get())
 
 
 class Trainer:
