@@ -583,11 +583,15 @@ class CLIPTextDeprojector(CLIPTextDeprojectorBase):
 
         copy_params(new_model.projection, models[0].projection)
         if new_config.ensemble_size == 1:
+            if new_config.apply_mlp_to_input:
+                copy_params(new_model.mlp_to_input, models[0].mlp_to_input)
             copy_params(new_model.position_embedding, models[0].position_embedding)
             copy_params(new_model.encoder_layer, models[0].encoder_layer)
             copy_params(new_model.final_layer_norm, models[0].final_layer_norm)
         else:
             for i, model in enumerate(models):
+                if new_config.apply_mlp_to_input:
+                    copy_params(new_model.mlp_to_input[i], models[i].mlp_to_input)
                 copy_params(new_model.position_embedding[i], model.position_embedding)
                 copy_params(new_model.encoder_layer[i], model.encoder_layer)
                 copy_params(new_model.final_layer_norm[i], model.final_layer_norm)
