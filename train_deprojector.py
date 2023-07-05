@@ -230,11 +230,15 @@ class CLIPTextDeprojector(CLIPTextDeprojectorBase):
 
         copy_params(new_model.projection, models[0].projection)
         if new_config.ensemble_size == 1:
+            if new_config.apply_mlp_to_input:
+                copy_params(new_model.mlp_to_input, models[0].mlp_to_input)
             copy_params(new_model.position_embedding, models[0].position_embedding)
             copy_params(new_model.encoder_layer, models[0].encoder_layer)
             copy_params(new_model.final_layer_norm, models[0].final_layer_norm)
         else:
             for i, model in enumerate(models):
+                if new_config.apply_mlp_to_input:
+                    copy_params(new_model.mlp_to_input[i], models[i].mlp_to_input)
                 copy_params(new_model.position_embedding[i], model.position_embedding)
                 copy_params(new_model.encoder_layer[i], model.encoder_layer)
                 copy_params(new_model.final_layer_norm[i], model.final_layer_norm)
@@ -642,7 +646,7 @@ class RandomDataQueue:
 
     def Initialize(self):
         self.ls = []
-        self.used = []
+        self.using = []
         self.available = list(range(len(self.filenames)))
 
     def Capacity(self):
@@ -650,6 +654,9 @@ class RandomDataQueue:
 
     def Size(self):
         return len(self.ls)
+
+    def HasEnoughToLoad(self):
+        return len(self.available) >= self.size
 
     def IsFull(self):
         return self.Size() >= self.Capacity()
@@ -668,20 +675,23 @@ class RandomDataQueue:
         d = Data()
         d.Load(self.filenames[idx])
         self.ls.append(d.to(device))
-        self.used.append(idx)
+        self.using.append(idx)
         del self.available[available_idx]
 
     def PurgeOneRandomly(self):
-        used_idx = random.choice(range(self.used))
-        idx = self.used[used_idx]
+        using_idx = random.choice(range(self.using))
+        idx = self.using[using_idx]
 
-        self.ls[used_idx].CleanUp()
-        del self.ls[used_idx]
-        del self.used[used_idx]
-        if len(self.ls) == 0:
-            self.Initialize()
-        else:
-            self.available.append(idx)
+        self.ls[using_idx].CleanUp()
+        del self.ls[using_idx]
+        del self.using[using_idx]
+        return idx
+
+    def PurgeAll(self):
+        for d in self.ls:
+            d.CleanUp()
+        self.ls = []
+        self.using = []
 
     def Reset(self):
         for d in self.ls:
