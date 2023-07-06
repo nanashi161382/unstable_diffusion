@@ -58,7 +58,7 @@ class CLIPTextDeprojectorBase(CLIPPreTrainedModel):
         mask = mask.unsqueeze(1)  # expand mask
         return mask
 
-    def ConstructInput(self, embeds, prev_output, fn_to_input, proj=False):
+    def ConstructInput(self, embeds, prev_output, fn_to_input, from_projected=False):
         seq_len = self.config.max_position_embeddings
         bsz, embed_dim = embeds.size()
         device = embeds.device
@@ -69,7 +69,7 @@ class CLIPTextDeprojectorBase(CLIPPreTrainedModel):
 
         null_embeds = self.null_embed.reshape([1, 1, embed_dim]).repeat([bsz, 1, 1])
 
-        if proj:
+        if from_projected:
             embeds = self.projection(embeds)
         embeds = embeds.unsqueeze(1)
         if self.config.relative_to_null:
@@ -99,6 +99,8 @@ class CLIPTextDeprojectorBase(CLIPPreTrainedModel):
 
 
 class CLIPTextDeprojector(CLIPTextDeprojectorBase):
+    default_fuse = 0.0
+
     def __init__(self, config: CLIPTextDeprojectorConfig):
         super().__init__(config)
         self.config = config
@@ -186,32 +188,42 @@ class CLIPTextDeprojector(CLIPTextDeprojectorBase):
         sos_embeds = self.sos_embed.reshape([1, 1, embed_dim]).repeat([bsz, 1, 1])
         return [torch.cat([sos_embeds, o[:, 1:]], dim=1) for o in output]
 
-    def Inference(self, embeds, average_each_step=False, **kwargs):
+    def Inference(self, embeds, **kwargs):
         self.eval()
-        ensemble_len = (
-            len(self.encoder_layer)
-            if isinstance(self.encoder_layer, nn.ModuleList)
-            else 1
-        )
+        ensemble_len = self.config.ensemble_size
         seq_len = self.config.max_position_embeddings
 
         result = None
         result_len = 1
-        while result_len < seq_len:
-            if not isinstance(result, list):
-                result = [result] * ensemble_len
+        while True:
+            inference_input = self.PrepareInferenceInput(result, ensemble_len, **kwargs)
+            result = self(embeds, inference_input, **kwargs)
             result_len += 1
-            result = self(embeds, result, **kwargs)
+            if result_len >= seq_len:
+                break
             result = [r[:, :result_len, :] for r in result]
-            if (ensemble_len > 1) and average_each_step:
-                result = sum(result) / len(result)
 
-        if not isinstance(result, list):
-            return result
-        elif ensemble_len == 1:
+        if ensemble_len == 1:
             return result[0]
         else:
-            return sum(result) / len(result)
+            return sum(result) / ensemble_len
+
+    def PrepareInferenceInput(self, prev_output, ensemble_len, fuse=None, **kwargs):
+        if not isinstance(prev_output, list):
+            return [prev_output] * ensemble_len
+        if ensemble_len == 1:
+            return prev_output
+
+        if fuse is None:
+            fuse = self.__class__.default_fuse
+        if fuse == 0.0:
+            return prev_output
+
+        first = [o[:-1, :] for o in prev_output]
+        last = [o[-1:, :] for o in prev_output]
+        avg_last = sum(last) / ensemble_len
+        last = [(1.0 - fuse) * last_i + fuse * avg_last for last_i in last]
+        return [torch.cat([f, l], dim=0) for f, l in zip(first, last)]
 
     @classmethod
     def from_units(cls, models):
