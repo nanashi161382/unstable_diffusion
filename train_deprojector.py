@@ -58,45 +58,6 @@ class CLIPTextDeprojectorBase(CLIPPreTrainedModel):
         mask = mask.unsqueeze(1)  # expand mask
         return mask
 
-    def ConstructInput(self, embeds, prev_output, fn_to_input, from_projected=False):
-        seq_len = self.config.max_position_embeddings
-        bsz, embed_dim = embeds.size()
-        device = embeds.device
-        if prev_output is None:
-            prev_len = 0
-        else:
-            prev_len = prev_output.size()[1]
-
-        null_embeds = self.null_embed.reshape([1, 1, embed_dim]).repeat([bsz, 1, 1])
-
-        if from_projected:
-            embeds = self.projection(embeds)
-        embeds = embeds.unsqueeze(1)
-        if self.config.relative_to_null:
-            embeds = embeds - null_embeds
-
-        if fn_to_input:
-            result = [fn_to_input(embeds), embeds]
-        else:
-            result = [null_embeds, embeds]
-
-        result_len = 2
-        if prev_len > 1:
-            if self.config.relative_to_null:
-                prev_output = prev_output - null_embeds.repeat([1, prev_len, 1])
-            result.append(prev_output[:, 1:, :])
-            result_len += prev_len - 1
-
-        if result_len < seq_len:
-            result.append(
-                torch.zeros([bsz, seq_len - result_len, embed_dim]).to(device)
-            )
-        elif result_len > seq_len:
-            result[-1] = result[-1][:, : (seq_len - result_len), :]
-
-        result = torch.cat(result, dim=1)
-        return result
-
 
 class CLIPTextDeprojector(CLIPTextDeprojectorBase):
     default_fuse = 0.0
@@ -145,6 +106,45 @@ class CLIPTextDeprojector(CLIPTextDeprojectorBase):
                     for _ in range(config.ensemble_size)
                 ]
             )
+
+    def ConstructInput(self, embeds, prev_output, fn_to_input, from_projected=False):
+        seq_len = self.config.max_position_embeddings
+        bsz, embed_dim = embeds.size()
+        device = embeds.device
+        if prev_output is None:
+            prev_len = 0
+        else:
+            prev_len = prev_output.size()[1]
+
+        null_embeds = self.null_embed.reshape([1, 1, embed_dim]).repeat([bsz, 1, 1])
+
+        if from_projected:
+            embeds = self.projection(embeds)
+        embeds = embeds.unsqueeze(1)
+        if self.config.relative_to_null:
+            embeds = embeds - null_embeds
+
+        if fn_to_input:
+            result = [fn_to_input(embeds), embeds]
+        else:
+            result = [null_embeds, embeds]
+
+        result_len = 2
+        if prev_len > 1:
+            if self.config.relative_to_null:
+                prev_output = prev_output - null_embeds.repeat([1, prev_len, 1])
+            result.append(prev_output[:, 1:, :])
+            result_len += prev_len - 1
+
+        if result_len < seq_len:
+            result.append(
+                torch.zeros([bsz, seq_len - result_len, embed_dim]).to(device)
+            )
+        elif result_len > seq_len:
+            result[-1] = result[-1][:, : (seq_len - result_len), :]
+
+        result = torch.cat(result, dim=1)
+        return result
 
     def forward(self, embeds, prev_outputs, **kwargs):
         if isinstance(self.encoder_layer, nn.ModuleList):
