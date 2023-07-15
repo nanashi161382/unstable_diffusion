@@ -160,6 +160,7 @@ class CLIPTextDeprojector(CLIPTextDeprojectorBase):
 
     def AddPrevOutput(self, layer_output, prev_output):
         bsz, seq_len, embed_dim = layer_output.size()
+        device = layer_output.device
         if prev_output is None:
             prev_len = 0
         else:

@@ -379,7 +379,8 @@ class SharedTarget:
 class CLIPTextDeprojectorConfig(CLIPTextConfig):
     model_type = "clip_text_deprojector_model"
     default_ensemble_size = 1
-    default_relative_to_null = True
+    default_relative_to_null = False
+    default_relative_to_prev = False
     default_apply_mlp_to_input = False
 
     def __init__(self, **kwargs):
@@ -389,6 +390,9 @@ class CLIPTextDeprojectorConfig(CLIPTextConfig):
         )
         self.relative_to_null = kwargs.get(
             "relative_to_null", self.__class__.default_relative_to_null
+        )
+        self.relative_to_prev = kwargs.get(
+            "relative_to_prev", self.__class__.default_relative_to_prev
         )
         self.apply_mlp_to_input = kwargs.get(
             "apply_mlp_to_input", self.__class__.default_apply_mlp_to_input
@@ -484,20 +488,51 @@ class CLIPTextDeprojector(CLIPTextDeprojectorBase):
 
         result_len = 2
         if prev_len > 1:
-            if self.config.relative_to_null:
-                prev_output = prev_output - null_embeds.repeat([1, prev_len, 1])
-            result.append(prev_output[:, 1:, :])
+            prev_output = prev_output[:, 1:, :]
+            if self.config.relative_to_prev:
+                prev_output = prev_output - torch.cat(
+                    [
+                        null_embeds,
+                        prev_output[:, :-1, :],
+                    ],
+                    dim=1,
+                )
+            elif self.config.relative_to_null:
+                prev_output = prev_output - null_embeds.repeat([1, prev_len - 1, 1])
+            result.append(prev_output)
             result_len += prev_len - 1
 
-        if result_len < seq_len:
-            result.append(
-                torch.zeros([bsz, seq_len - result_len, embed_dim]).to(device)
-            )
-        elif result_len > seq_len:
-            result[-1] = result[-1][:, : (seq_len - result_len), :]
+        len_to_fill = seq_len - result_len
+        if len_to_fill > 0:
+            result.append(torch.zeros([bsz, len_to_fill, embed_dim]).to(device))
+        elif len_to_fill < 0:
+            result[-1] = result[-1][:, :len_to_fill, :]
 
         result = torch.cat(result, dim=1)
         return result
+
+    def AddPrevOutput(self, layer_output, prev_output):
+        bsz, seq_len, embed_dim = layer_output.size()
+        device = layer_output.device
+        if prev_output is None:
+            prev_len = 0
+        else:
+            prev_len = prev_output.size()[1]
+
+        base_output = [self.null_embed.reshape([1, 1, embed_dim]).repeat([bsz, 2, 1])]
+
+        len_to_fill = seq_len - prev_len - 1
+        if prev_len < 2:
+            base_output.append(torch.zeros([bsz, seq_len - 2, embed_dim]).to(device))
+        elif len_to_fill > 0:
+            base_output.append(prev_output[:, 1:, :])
+            base_output.append(torch.zeros([bsz, len_to_fill, embed_dim]).to(device))
+        elif len_to_fill == 0:
+            base_output.append(prev_output[:, 1:, :])
+        else:
+            base_output.append(prev_output[:, 1:len_to_fill, :])
+
+        return layer_output + torch.cat(base_output, dim=1)
 
     def forward(self, embeds, prev_outputs, **kwargs):
         if isinstance(self.encoder_layer, nn.ModuleList):
@@ -533,10 +568,15 @@ class CLIPTextDeprojector(CLIPTextDeprojectorBase):
         hidden_states = [hs + pe for hs, pe in zip(hidden_states, position_embeddings)]
 
         layer_outputs = [
-            fn(hs, attention_mask, causal_attention_mask)
+            fn(hs, attention_mask, causal_attention_mask)[0]
             for fn, hs in zip(encoder_layer_fn, hidden_states)
         ]
-        output = [fn(lo[0]) for fn, lo in zip(final_layer_norm_fn, layer_outputs)]
+        if self.config.relative_to_prev:
+            layer_outputs = [
+                self.AddPrevOutput(lo, po)
+                for lo, po in zip(layer_outputs, prev_outputs)
+            ]
+        output = [fn(lo) for fn, lo in zip(final_layer_norm_fn, layer_outputs)]
 
         sos_embeds = self.sos_embed.reshape([1, 1, embed_dim]).repeat([bsz, 1, 1])
         return [torch.cat([sos_embeds, o[:, 1:]], dim=1) for o in output]
