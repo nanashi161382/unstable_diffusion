@@ -848,6 +848,10 @@ class Trainer:
         state = torch.load(filename)
         self.optimizer.load_state_dict(state)
 
+    def UpdateLearningRate(self, learning_rate):
+        for g in self.optimizer.param_groups:
+            g["lr"] = learning_rate
+
     def regularize(self, pred, masks, weights):
         return self.regularize_1(pred, masks), self.regularize_2(pred, masks, weights)
 
