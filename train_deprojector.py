@@ -1,4 +1,3 @@
-import copy
 import csv
 import math
 import numpy as np
@@ -7,294 +6,9 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.utils.data.sampler import RandomSampler
-from transformers import (
-    CLIPTokenizer,
-    CLIPTextModelWithProjection,
-    CLIPPreTrainedModel,
-    CLIPTextConfig,
-)
-from transformers.activations import ACT2FN
-from transformers.models.clip.modeling_clip import CLIPEncoderLayer, CLIPMLP
+from transformers import CLIPTokenizer, CLIPTextModelWithProjection
 
 device = "cuda"
-
-
-def Debug(_, txt):
-    print(txt)
-
-
-class CLIPTextDeprojectorConfig(CLIPTextConfig):
-    model_type = "clip_text_deprojector_model"
-    default_ensemble_size = 1
-    default_relative_to_null = False
-    default_relative_to_prev = False
-    default_apply_mlp_to_input = False
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.ensemble_size = kwargs.get(
-            "ensemble_size", self.__class__.default_ensemble_size
-        )
-        self.relative_to_null = kwargs.get(
-            "relative_to_null", self.__class__.default_relative_to_null
-        )
-        self.relative_to_prev = kwargs.get(
-            "relative_to_prev", self.__class__.default_relative_to_prev
-        )
-        self.apply_mlp_to_input = kwargs.get(
-            "apply_mlp_to_input", self.__class__.default_apply_mlp_to_input
-        )
-
-
-class CLIPTextDeprojectorBase(CLIPPreTrainedModel):
-    config_class = CLIPTextDeprojectorConfig
-    _no_split_modules = ["CLIPEncoderLayer"]
-
-    def __init__(self, config: CLIPTextDeprojectorConfig):
-        super().__init__(config)
-
-    def _build_causal_attention_mask(self, bsz, seq_len, dtype):
-        # lazily create causal attention mask, with full attention between the vision tokens
-        # pytorch uses additive attention mask; fill with -inf
-        mask = torch.empty(bsz, seq_len, seq_len, dtype=dtype)
-        mask.fill_(torch.tensor(torch.finfo(dtype).min))
-        mask.triu_(1)  # zero out the lower diagonal
-        mask = mask.unsqueeze(1)  # expand mask
-        return mask
-
-
-class CLIPTextDeprojector(CLIPTextDeprojectorBase):
-    default_fuse = 0.0
-
-    def __init__(self, config: CLIPTextDeprojectorConfig):
-        super().__init__(config)
-        self.config = config
-        embed_dim = config.hidden_size
-
-        self.register_buffer(
-            "position_ids", torch.arange(config.max_position_embeddings).expand((1, -1))
-        )
-        self.register_buffer("sos_embed", torch.zeros([embed_dim]))
-        self.register_buffer("null_embed", torch.zeros([embed_dim]))
-
-        self.projection = nn.Linear(config.projection_dim, embed_dim, bias=False)
-        for param in self.projection.parameters():
-            param.requires_grad = False  # Fix the parameter of the projection layer.
-
-        if config.ensemble_size == 1:
-            # Treat config.ensemble_size == 1 specially due to a historical reason.
-            if self.config.apply_mlp_to_input:
-                self.mlp_to_input = CLIPMLP(config)
-            self.position_embedding = nn.Embedding(
-                config.max_position_embeddings, embed_dim
-            )
-            self.encoder_layer = CLIPEncoderLayer(config)
-            self.final_layer_norm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
-        else:
-            if self.config.apply_mlp_to_input:
-                self.mlp_to_input = nn.ModuleList(
-                    [CLIPMLP(config) for _ in range(config.ensemble_size)]
-                )
-            self.position_embedding = nn.ModuleList(
-                [
-                    nn.Embedding(config.max_position_embeddings, embed_dim)
-                    for _ in range(config.ensemble_size)
-                ]
-            )
-            self.encoder_layer = nn.ModuleList(
-                [CLIPEncoderLayer(config) for _ in range(config.ensemble_size)]
-            )
-            self.final_layer_norm = nn.ModuleList(
-                [
-                    nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
-                    for _ in range(config.ensemble_size)
-                ]
-            )
-
-    def ConstructInput(self, embeds, prev_output, fn_to_input, from_projected=False):
-        seq_len = self.config.max_position_embeddings
-        bsz, embed_dim = embeds.size()
-        device = embeds.device
-        if prev_output is None:
-            prev_len = 0
-        else:
-            prev_len = prev_output.size()[1]
-
-        null_embeds = self.null_embed.reshape([1, 1, embed_dim]).repeat([bsz, 1, 1])
-
-        if from_projected:
-            embeds = self.projection(embeds)
-        embeds = embeds.unsqueeze(1)
-        if self.config.relative_to_null:
-            embeds = embeds - null_embeds
-
-        if fn_to_input:
-            result = [fn_to_input(embeds), embeds]
-        else:
-            result = [null_embeds, embeds]
-
-        result_len = 2
-        if prev_len > 1:
-            prev_output = prev_output[:, 1:, :]
-            if self.config.relative_to_prev:
-                prev_output = prev_output - torch.cat(
-                    [
-                        null_embeds,
-                        prev_output[:, :-1, :],
-                    ],
-                    dim=1,
-                )
-            elif self.config.relative_to_null:
-                prev_output = prev_output - null_embeds.repeat([1, prev_len - 1, 1])
-            result.append(prev_output)
-            result_len += prev_len - 1
-
-        len_to_fill = seq_len - result_len
-        if len_to_fill > 0:
-            result.append(torch.zeros([bsz, len_to_fill, embed_dim]).to(device))
-        elif len_to_fill < 0:
-            result[-1] = result[-1][:, :len_to_fill, :]
-
-        result = torch.cat(result, dim=1)
-        return result
-
-    def AddPrevOutput(self, layer_output, prev_output):
-        bsz, seq_len, embed_dim = layer_output.size()
-        device = layer_output.device
-        if prev_output is None:
-            prev_len = 0
-        else:
-            prev_len = prev_output.size()[1]
-
-        base_output = [self.null_embed.reshape([1, 1, embed_dim]).repeat([bsz, 2, 1])]
-
-        len_to_fill = seq_len - prev_len - 1
-        if prev_len < 2:
-            base_output.append(torch.zeros([bsz, seq_len - 2, embed_dim]).to(device))
-        elif len_to_fill > 0:
-            base_output.append(prev_output[:, 1:, :])
-            base_output.append(torch.zeros([bsz, len_to_fill, embed_dim]).to(device))
-        elif len_to_fill == 0:
-            base_output.append(prev_output[:, 1:, :])
-        else:
-            base_output.append(prev_output[:, 1:len_to_fill, :])
-
-        return layer_output + torch.cat(base_output, dim=1)
-
-    def forward(self, embeds, prev_outputs, **kwargs):
-        if isinstance(self.encoder_layer, nn.ModuleList):
-            if self.config.apply_mlp_to_input:
-                mlp_to_input_fn = self.mlp_to_input
-            position_embedding_fn = self.position_embedding
-            encoder_layer_fn = self.encoder_layer
-            final_layer_norm_fn = self.final_layer_norm
-        else:
-            if self.config.apply_mlp_to_input:
-                mlp_to_input_fn = [self.mlp_to_input]
-            position_embedding_fn = [self.position_embedding]
-            encoder_layer_fn = [self.encoder_layer]
-            final_layer_norm_fn = [self.final_layer_norm]
-
-        if self.config.apply_mlp_to_input:
-            hidden_states = [
-                self.ConstructInput(embeds, p, fn, **kwargs)
-                for p, fn in zip(prev_outputs, mlp_to_input_fn)
-            ]
-        else:
-            hidden_states = [
-                self.ConstructInput(embeds, p, None, **kwargs) for p in prev_outputs
-            ]
-        bsz, seq_len, embed_dim = hidden_states[0].size()
-
-        attention_mask = None
-        causal_attention_mask = self._build_causal_attention_mask(
-            bsz, seq_len, hidden_states[0].dtype
-        ).to(hidden_states[0].device)
-
-        position_embeddings = [fn(self.position_ids) for fn in position_embedding_fn]
-        hidden_states = [hs + pe for hs, pe in zip(hidden_states, position_embeddings)]
-
-        layer_outputs = [
-            fn(hs, attention_mask, causal_attention_mask)[0]
-            for fn, hs in zip(encoder_layer_fn, hidden_states)
-        ]
-        if self.config.relative_to_prev:
-            layer_outputs = [
-                self.AddPrevOutput(lo, po)
-                for lo, po in zip(layer_outputs, prev_outputs)
-            ]
-        output = [fn(lo) for fn, lo in zip(final_layer_norm_fn, layer_outputs)]
-
-        sos_embeds = self.sos_embed.reshape([1, 1, embed_dim]).repeat([bsz, 1, 1])
-        return [torch.cat([sos_embeds, o[:, 1:]], dim=1) for o in output]
-
-    def Inference(self, embeds, **kwargs):
-        self.eval()
-        ensemble_len = self.config.ensemble_size
-        seq_len = self.config.max_position_embeddings
-
-        result = None
-        result_len = 1
-        while True:
-            inference_input = self.PrepareInferenceInput(result, ensemble_len, **kwargs)
-            result = self(embeds, inference_input, **kwargs)
-            result_len += 1
-            if result_len >= seq_len:
-                break
-            result = [r[:, :result_len, :] for r in result]
-
-        if ensemble_len == 1:
-            return result[0]
-        else:
-            return sum(result) / ensemble_len
-
-    def PrepareInferenceInput(self, prev_output, ensemble_len, fuse=None, **kwargs):
-        if not isinstance(prev_output, list):
-            return [prev_output] * ensemble_len
-        if ensemble_len == 1:
-            return prev_output
-
-        if fuse is None:
-            fuse = self.__class__.default_fuse
-        if fuse == 0.0:
-            return prev_output
-
-        first = [o[:-1, :] for o in prev_output]
-        last = [o[-1:, :] for o in prev_output]
-        avg_last = sum(last) / ensemble_len
-        last = [(1.0 - fuse) * last_i + fuse * avg_last for last_i in last]
-        return [torch.cat([f, l], dim=0) for f, l in zip(first, last)]
-
-    @classmethod
-    def from_units(cls, models):
-        if any(isinstance(model.encoder_layer, nn.ModuleList) for model in models):
-            raise ValueError(f"The length of all `models` must be 1.")
-        new_config = copy.deepcopy(models[0].config)
-        new_config.ensemble_size = len(models)
-        new_model = cls(new_config)
-        new_model.position_ids = models[0].position_ids
-        new_model.sos_embed = models[0].sos_embed
-        new_model.null_embed = models[0].null_embed
-
-        def copy_params(a, b):
-            for pa, pb in zip(a.parameters(), b.parameters()):
-                pa.data = pb.data
-
-        copy_params(new_model.projection, models[0].projection)
-        if new_config.ensemble_size == 1:
-            if new_config.apply_mlp_to_input:
-                copy_params(new_model.mlp_to_input, models[0].mlp_to_input)
-            copy_params(new_model.position_embedding, models[0].position_embedding)
-            copy_params(new_model.encoder_layer, models[0].encoder_layer)
-            copy_params(new_model.final_layer_norm, models[0].final_layer_norm)
-        else:
-            for i, model in enumerate(models):
-                if new_config.apply_mlp_to_input:
-                    copy_params(new_model.mlp_to_input[i], models[i].mlp_to_input)
-                copy_params(new_model.position_embedding[i], model.position_embedding)
-                copy_params(new_model.encoder_layer[i], model.encoder_layer)
-                copy_params(new_model.final_layer_norm[i], model.final_layer_norm)
-        return new_model
 
 
 def Offload(*ls):
@@ -723,12 +437,18 @@ class RandomDataQueue:
     def LoadOneRandomly(self):
         available_idx = random.choice(range(len(self.available)))
         idx = self.available[available_idx]
+        self.LoadOneSelected(idx)
 
+    def LoadOneSelected(self, idx):
         d = Data()
         d.Load(self.filenames[idx])
         self.ls.append(d.to(device))
         self.using.append(idx)
-        del self.available[available_idx]
+        for a_key, a_val in enumerate(self.available):
+            if a_val == idx:
+                del self.available[a_key]
+                return
+        raise ValueError(f"Idx {idx} not found in self.available {self.available}")
 
     def PurgeOneRandomly(self):
         using_idx = random.choice(range(self.using))
@@ -909,7 +629,8 @@ class Trainer:
         for i, (target, embeds, weights, masks) in enumerate(dl):
             weights = self.ReshapeWeights(weights, target.shape)
             self.optimizer.zero_grad()
-            [pred] = self.model(embeds, [target], **kwargs)
+            pred = self.model.RunForTraining(embeds, target, **kwargs)
+            # [pred] = self.model(embeds, [target], **kwargs)
             w_loss = self.criterion(weights * pred, weights * target)
             reg_loss = self.regularize(pred, masks, weights)
             total_loss = w_loss + sum(w * l for w, l in zip(self.reg_weight, reg_loss))
@@ -936,7 +657,8 @@ class Trainer:
             dl = DataLoader(self.test_ds, batch_size=len(self.test_ds))
             for target, embeds, weights, masks in dl:
                 weights = self.ReshapeWeights(weights, target.shape)
-                [pred] = self.model(embeds, [target], **kwargs)
+                pred = self.model.RunForTraining(embeds, target, **kwargs)
+                # [pred] = self.model(embeds, [target], **kwargs)
                 loss = self.criterion(pred, target).item()
                 w_loss = self.criterion(weights * pred, weights * target).item()
                 reg_loss = self.regularize(pred, masks, weights)
