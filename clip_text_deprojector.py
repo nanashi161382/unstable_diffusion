@@ -14,6 +14,7 @@ from transformers.models.clip.modeling_clip import (
 )
 import torch
 import torch.nn as nn
+from typing import Any, Optional, List, Union, Callable, Tuple, Dict
 
 #
 # -- Debug functions --
@@ -48,7 +49,7 @@ class CLIPTextDeprojectorVTConfig(CLIPTextConfig):
     default_use_individual_first_layer = False
     default_first_layer_dim = 768 * 1
     default_first_embed_layer_dim = 768 * 1
-    default_embeds_to_attention = False
+    default_embeds_in_attention = False
     default_num_mlp_layers = 1
     default_mlp_layer_dim = 768 * 4
     default_use_residual_connection = True
@@ -72,8 +73,8 @@ class CLIPTextDeprojectorVTConfig(CLIPTextConfig):
         self.first_embed_layer_dim = kwargs.get(
             "first_embed_layer_dim", self.__class__.default_first_embed_layer_dim
         )
-        self.embeds_to_attention = kwargs.get(
-            "embeds_to_attention", self.__class__.default_embeds_to_attention
+        self.embeds_in_attention = kwargs.get(
+            "embeds_in_attention", self.__class__.default_embeds_in_attention
         )
         self.num_mlp_layers = kwargs.get(
             "num_mlp_layers", self.__class__.default_num_mlp_layers
@@ -102,7 +103,28 @@ class CLIPTextDeprojectorVTBase(CLIPPreTrainedModel):
                 f"Parameter shape doesn't match: {p.data.shape} v.s. {d.shape}"
             )
         p.data = d
-        Debug(1, f"initialize parameter by pretrained: {p.shape}")
+
+    def ResizeAndInit(self, p, d):
+        psize = p.shape
+        dsize = d.shape
+        if psize == dsize:
+            p.data = d
+            return
+
+        msize = [min(ps, ds) for ps, ds in zip(psize, dsize)]
+        if len(psize) == 1:
+            p.data[: msize[0]] = d[: msize[0]]
+        elif len(psize) == 2:
+            p.data[: msize[0], : msize[1]] = d[: msize[0], : msize[1]]
+        elif len(psize) == 3:
+            p.data[: msize[0], : msize[1], : msize[2]] = d[
+                : msize[0], : msize[1], : msize[2]
+            ]
+        else:
+            raise ValueError(
+                f"CheckAndInitWithResize supports only 2-D parameters. Got {psize}"
+            )
+        return
 
 
 class CLIPTextDeprojectorVTMLPLayer(CLIPTextDeprojectorVTBase):
@@ -129,10 +151,10 @@ class CLIPTextDeprojectorVTMLPLayer(CLIPTextDeprojectorVTBase):
     def InitFromWeights(self, weights):
         self.CheckAndInit(self.norm.weight, weights["encoder_layer.layer_norm2.weight"])
         self.CheckAndInit(self.norm.bias, weights["encoder_layer.layer_norm2.bias"])
-        self.CheckAndInit(self.linear1.weight, weights["encoder_layer.mlp.fc1.weight"])
-        self.CheckAndInit(self.linear1.bias, weights["encoder_layer.mlp.fc1.bias"])
-        self.CheckAndInit(self.linear2.weight, weights["encoder_layer.mlp.fc2.weight"])
-        self.CheckAndInit(self.linear2.bias, weights["encoder_layer.mlp.fc2.bias"])
+        self.ResizeAndInit(self.linear1.weight, weights["encoder_layer.mlp.fc1.weight"])
+        self.ResizeAndInit(self.linear1.bias, weights["encoder_layer.mlp.fc1.bias"])
+        self.ResizeAndInit(self.linear2.weight, weights["encoder_layer.mlp.fc2.weight"])
+        self.ResizeAndInit(self.linear2.bias, weights["encoder_layer.mlp.fc2.bias"])
 
 
 class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
@@ -221,7 +243,6 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
 
         # LayerNorm and Linear.bias are initialized in the base class.
         super()._init_weights(module)
-        Debug(1, f"calling custom _init_weights for {module.__class__.__name__}")
 
         # Overwrite out_proj of CLIPAttention
         if isinstance(module, CLIPAttention):
@@ -260,14 +281,11 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
             )
 
         # First layer (vicinity)
-        embed_dim = self.config.hidden_size
-        first_layer_dim = self.config.first_layer_dim
-        out_proj = weights["encoder_layer.self_attn.out_proj.weight"]
-        out_proj = torch.cat([out_proj, self.linear2[0].weight[:, embed_dim:]], dim=1)
-        self.CheckAndInit(self.linear2[0].weight, out_proj)
+        self.ResizeAndInit(
+            self.linear2[0].weight, weights["encoder_layer.self_attn.out_proj.weight"]
+        )
         self.CheckAndInit(
-            self.linear2[0].bias,
-            weights["encoder_layer.self_attn.out_proj.bias"],
+            self.linear2[0].bias, weights["encoder_layer.self_attn.out_proj.bias"]
         )
 
         # CLIPAttention
@@ -352,11 +370,7 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
         device, dtype = embeds.device, embeds.dtype
         bsz, seq_len, embed_dim = states.shape
         zero_states = torch.zeros([bsz, 1, embed_dim], device=device)
-        if self.config.embeds_to_attention:
-            init_states = embeds.unsqueeze(1)
-        else:
-            init_states = zero_states
-        states = torch.cat([init_states, states], dim=1)
+        states = torch.cat([zero_states, states], dim=1)
         seq_len += 1
 
         if self.config.use_residual_connection:
@@ -366,17 +380,18 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
         if self.config.use_individual_first_layer:
             embeds_output = self.linear1_embeds[idx](embeds.unsqueeze(1))
             states_output = self.linear1[idx](states)
-            if self.config.embeds_to_attention:
-                zero_output = self.linear1[idx](zero_states)
-            else:
-                zero_output = states_output[:, :1, :]
+            zero_output = states_output[:, :1, :]
             first_output = [embeds_output.repeat([1, seq_len, 1]), states_output]
             for i in range(1, self.config.vicinity):
-                first_output.append(
-                    torch.cat(
-                        [zero_output.repeat([1, i, 1]), states_output[:, :-i, :]], dim=1
+                if i > seq_len:
+                    first_output.append(zero_output.repeat([1, seq_len, 1]))
+                else:
+                    first_output.append(
+                        torch.cat(
+                            [zero_output.repeat([1, i, 1]), states_output[:, :-i, :]],
+                            dim=1,
+                        )
                     )
-                )
             first_output = torch.cat(first_output, dim=2)
         else:
             if first_layer_dim > 0:
@@ -392,6 +407,8 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
             else:
                 first_output = torch.empty([bsz, seq_len, 0], device=device)
 
+        if self.config.embeds_in_attention:
+            states = torch.cat([embeds.unsqueeze(1), states[:, 1:, :]], dim=1)
         position_embedding = self.position_embedding[idx](
             self.position_ids[:, :seq_len]
         )
