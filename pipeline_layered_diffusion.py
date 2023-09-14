@@ -2748,7 +2748,7 @@ class LayeredDiffusionPipeline:
 
         # pipe = load_pipeline_from_original_stable_diffusion_ckpt(
         pipe = download_from_original_stable_diffusion_ckpt(
-            checkpoint_path=checkpoint_path,
+            checkpoint_path_or_dict=checkpoint_path,
             original_config_file=original_config_file,
             image_size=image_size,
             prediction_type=prediction_type,
