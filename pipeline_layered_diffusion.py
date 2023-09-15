@@ -372,7 +372,7 @@ class SharedTarget:
 #
 # --  TextModel - a wrapper to the CLIP tokenizer and the CLIP text encoder --
 #
-class TextModel(TextualInversionLoaderMixin):
+class TextModel:
     def __init__(self, tokenizer, text_encoder, device):
         """
         Args:
@@ -390,10 +390,16 @@ class TextModel(TextualInversionLoaderMixin):
         self.mask_after_eos = 0.0
         self.random_after_eos = 0.0
         self.null_emb_after_eos = 0.0
+        self.mixin = None
 
         # deprecated
         self.deprojector = None
         self.use_deprojector = False
+
+    def SetTextualInversion(self, mixin: TextualInversionLoaderMixin):
+        # TODO: this breaks the encapsulation law. TextualInversionLoaderMixin should be
+        # implemented by TextModel rather than the pipeline. Revisit the implementation later.
+        self.mixin = mixin
 
     def SetMaskAfterEOS(self, mask):
         """
@@ -464,10 +470,11 @@ class TextModel(TextualInversionLoaderMixin):
             )
         """
         max_length = self.max_length()
-        new_text = self.maybe_convert_prompt(text, self.tokenizer)
-        if new_text != text:
-            Debug(1, f"Prompt is converted by Textual Inversion: {new_text}")
-            text = new_text
+        if self.mixin:
+            new_text = self.mixin.maybe_convert_prompt(text, self.tokenizer)
+            if new_text != text:
+                Debug(1, f"Prompt is converted by Textual Inversion: {new_text}")
+                text = new_text
         text_inputs = self.tokenize(text)
         text_input_ids = text_inputs.input_ids
         attention_mask = text_inputs.attention_mask
@@ -2401,7 +2408,7 @@ class TextualInversion:
     def Keywords(self):
         return self.tokens
 
-    def Apply(self, mixin):
+    def Apply(self, mixin: TextualInversionLoaderMixin):
         for token, path, kwargs in zip(self.tokens, self.paths, self.kwargs_list):
             mixin.load_textual_inversion(path, token, **kwargs)
 
@@ -2774,7 +2781,7 @@ class LayeredDiffusionPipeline:
         self._SetOptions(pipe, use_xformers, device_type)
         self._SetPipeline(pipe)
         if embeddings:
-            embeddings.Apply(self.text_model)
+            embeddings.Apply(pipe)
         return self
 
     def CopyFrom(self, another):
@@ -2815,6 +2822,7 @@ class LayeredDiffusionPipeline:
         self.text_model = TextModel(
             pipe.tokenizer, pipe.text_encoder, self._device_type
         )
+        self.text_model.SetTextualInversion(pipe)
         self.image_model = ImageModel(pipe.vae, pipe.vae_scale_factor)
 
     def _ResetGenerator(self, rand_seed: Optional[int] = None):
