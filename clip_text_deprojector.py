@@ -49,9 +49,11 @@ class CLIPTextDeprojectorVTConfig(CLIPTextConfig):
     default_use_individual_first_layer = False
     default_first_layer_dim = 768 * 1
     default_first_embed_layer_dim = 768 * 1
+    default_first_embed_layer_dropout = 0.0
     default_embeds_in_attention = False
     default_num_mlp_layers = 1
     default_mlp_layer_dim = 768 * 4
+    default_mlp_dropout = 0.0
     default_use_residual_connection = True
 
     def __init__(self, **kwargs):
@@ -73,6 +75,10 @@ class CLIPTextDeprojectorVTConfig(CLIPTextConfig):
         self.first_embed_layer_dim = kwargs.get(
             "first_embed_layer_dim", self.__class__.default_first_embed_layer_dim
         )
+        self.first_embed_layer_dropout = kwargs.get(
+            "first_embed_layer_dropout",
+            self.__class__.default_first_embed_layer_dropout,
+        )
         self.embeds_in_attention = kwargs.get(
             "embeds_in_attention", self.__class__.default_embeds_in_attention
         )
@@ -82,6 +88,7 @@ class CLIPTextDeprojectorVTConfig(CLIPTextConfig):
         self.mlp_layer_dim = kwargs.get(
             "mlp_layer_dim", self.__class__.default_mlp_layer_dim
         )
+        self.mlp_dropout = kwargs.get("mlp_dropout", self.__class__.default_mlp_dropout)
         self.use_residual_connection = kwargs.get(
             "use_residual_connection", self.__class__.default_use_residual_connection
         )
@@ -136,12 +143,16 @@ class CLIPTextDeprojectorVTMLPLayer(CLIPTextDeprojectorVTBase):
         self.norm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
         self.linear1 = nn.Linear(embed_dim, config.mlp_layer_dim)
         self.linear2 = nn.Linear(config.mlp_layer_dim, embed_dim)
+        if config.mlp_dropout:
+            self.dropout = nn.Dropout(p=config.mlp_dropout)
 
     def forward(self, states):
         if self.config.use_residual_connection:
             residual = states
         states = self.norm(states)
         states = self.linear1(states)
+        if self.config.mlp_dropout:
+            states = self.dropout(states)
         states = self.activation_fn(states)
         states = self.linear2(states)
         if self.config.use_residual_connection:
@@ -158,6 +169,8 @@ class CLIPTextDeprojectorVTMLPLayer(CLIPTextDeprojectorVTBase):
 
 
 class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
+    default_fuse = 0.0
+
     def __init__(self, config: CLIPTextDeprojectorVTConfig):
         super().__init__(config)
         embed_dim = config.hidden_size
@@ -182,6 +195,10 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
                 nn.Linear(embed_dim, first_embed_layer_dim)
                 for _ in range(ensemble_size)
             )
+            if config.first_embed_layer_dropout:
+                self.linear1_embeds_dropout = nn.Dropout(
+                    p=config.first_embed_layer_dropout
+                )
             self.linear1 = nn.ModuleList(
                 nn.Linear(embed_dim, first_layer_dim) for _ in range(ensemble_size)
             )
@@ -379,6 +396,8 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
         first_layer_dim = self.config.first_layer_dim
         if self.config.use_individual_first_layer:
             embeds_output = self.linear1_embeds[idx](embeds.unsqueeze(1))
+            if self.config.first_embed_layer_dropout:
+                embeds_output = self.linear1_embeds_dropout(embeds_output)
             states_output = self.linear1[idx](states)
             zero_output = states_output[:, :1, :]
             first_output = [embeds_output.repeat([1, seq_len, 1]), states_output]
@@ -456,7 +475,10 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
         self.OffloadTensor(sos_embeds, states)
         return result
 
-    def Inference(self, embeds, from_projected=False, **kwargs):
+    def Inference(self, embeds, from_projected=False, fuse=None, **kwargs):
+        if fuse is None:
+            fuse = self.__class__.default_fuse
+
         self.eval()
         device = embeds.device
         bsz, embed_dim = embeds.shape
@@ -477,6 +499,7 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
         final_states = []
         for i in range(max_seq_len):
             output = [self(idx, embeds, states[idx]) for idx in range(ensemble_size)]
+            # clone() is needed here to discard intermediate computation results.
             last_states = [s[:, -1:, :].clone() for s in output]
             self.OffloadTensor(*output)
 
@@ -485,7 +508,11 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
             final_states.append(average_last_state)
 
             # Prepare for next token
-            # TODO: make use of average_last_state
+            if fuse != 0:
+                last_states = [
+                    (1.0 - fuse) * last_i + fuse * average_last_state
+                    for last_i in last_states
+                ]
             next_states = [
                 torch.cat([s, ls], dim=1) for s, ls in zip(states, last_states)
             ]
@@ -495,6 +522,7 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
             states = next_states
 
         sos_embeds = self.GetSOSEmb(bsz)
+        # clone() is needed here to discard intermediate computation results.
         result = torch.cat([sos_embeds] + final_states, dim=1).clone()
         self.OffloadTensor(sos_embeds)
         self.OffloadTensor(*states)
@@ -509,6 +537,75 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
             return ls[0]
         else:
             return sum(ls) / size
+
+    def Merge(self, vicinity=False, attention=False, mlp=False):
+        def avg(ls):
+            state_dict = ls[0].state_dict()
+            for key in state_dict:
+                state_sum = sum(m.state_dict()[key] for m in ls)
+                state_dict[key] = state_sum / len(ls)
+            for m in ls:
+                m.load_state_dict(state_dict)
+
+        if vicinity:
+            if self.config.use_individual_first_layer:
+                avg(self.linear1_embeds)
+            avg(self.linear1)
+            avg(self.linear2)
+        if attention:
+            avg(self.position_embedding)
+            avg(self.norm)
+            avg(self.self_attn)
+        if mlp:
+            avg(self.mlp_layers)
+            avg(self.final_norm)
+        return self
+
+    @classmethod
+    def from_units(cls, models):
+        if not models:
+            raise ValueError(f"At least one model must be provided.")
+        if any(model.config.ensemble_size > 1 for model in models):
+            raise ValueError(f"The length of all `models` must be 1.")
+        new_config = copy.deepcopy(models[0].config)
+        new_config.ensemble_size = len(models)
+
+        new_model = cls(new_config)
+        new_model.deprojection = models[0].deprojection
+        new_model.sos_embed = models[0].sos_embed
+        new_model.null_embed = models[0].null_embed
+
+        def copy_params(cls, a, b):
+            for pa, pb in zip(a.parameters(), b.parameters()):
+                pa.data = pb.data
+
+        for i, model in enumerate(models):
+            if new_config.use_individual_first_layer:
+                copy_params(new_model.linear1_embeds[i], model.linear1_embeds[0])
+            copy_params(new_model.linear1[i], model.linear1[0])
+            copy_params(new_model.linear2[i], model.linear2[0])
+            copy_params(new_model.position_embedding[i], model.position_embedding[0])
+            copy_params(new_model.norm[i], model.norm[0])
+            copy_params(new_model.self_attn[i], model.self_attn[0])
+            for j in range(new_config.num_mlp_layers):
+                copy_params(new_model.mlp_layers[i][j], model.mlp_layers[0][j])
+            copy_params(new_model.final_norm[i], model.final_norm[0])
+
+        return new_model
+
+    @classmethod
+    def merge_units(cls, models):
+        if not models:
+            raise ValueError(f"At least one model must be provided.")
+        if any(model.config.ensemble_size > 1 for model in models):
+            raise ValueError(f"The length of all `models` must be 1.")
+        model = cls(models[0].config)
+        state_dict = model.state_dict()
+        for key in state_dict:
+            state_sum = sum(m.state_dict()[key] for m in models)
+            state_dict[key] = state_sum / len(models)
+        model.load_state_dict(state_dict)
+        return model
 
 
 #
