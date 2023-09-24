@@ -45,9 +45,16 @@ class CLIPTextDeprojectorVTConfig(CLIPTextConfig):
 
     default_ensemble_size = 1
     default_relative_to_null = True
+    default_apply_norm_first = False
+    default_apply_norm_to_all = False
     default_vicinity = 2
+    default_use_mlp_first_layer = False
+    default_use_same_mlp_first_layer = False
     default_use_individual_first_layer = False
+    default_first_layer_activation = False
+    default_first_layer_residual_connection = False
     default_first_layer_dim = 768 * 1
+    default_first_embed_pre_layer_dim = 0
     default_first_embed_layer_dim = 768 * 1
     default_first_embed_layer_dropout = 0.0
     default_embeds_in_attention = False
@@ -64,13 +71,36 @@ class CLIPTextDeprojectorVTConfig(CLIPTextConfig):
         self.relative_to_null = kwargs.get(
             "relative_to_null", self.__class__.default_relative_to_null
         )
+        self.apply_norm_first = kwargs.get(
+            "apply_norm_first", self.__class__.default_apply_norm_first
+        )
+        self.apply_norm_to_all = kwargs.get(
+            "apply_norm_to_all", self.__class__.default_apply_norm_to_all
+        )
         self.vicinity = kwargs.get("vicinity", self.__class__.default_vicinity)
+        self.use_mlp_first_layer = kwargs.get(
+            "use_mlp_first_layer", self.__class__.default_use_mlp_first_layer
+        )
+        self.use_same_mlp_first_layer = kwargs.get(
+            "use_same_mlp_first_layer", self.__class__.default_use_same_mlp_first_layer
+        )
         self.use_individual_first_layer = kwargs.get(
             "use_individual_first_layer",
             self.__class__.default_use_individual_first_layer,
         )
+        self.first_layer_activation = kwargs.get(
+            "first_layer_activation", self.__class__.default_first_layer_activation
+        )
+        self.first_layer_residual_connection = kwargs.get(
+            "first_layer_residual_connection",
+            self.__class__.default_first_layer_residual_connection,
+        )
         self.first_layer_dim = kwargs.get(
             "first_layer_dim", self.__class__.default_first_layer_dim
+        )
+        self.first_embed_pre_layer_dim = kwargs.get(
+            "first_embed_pre_layer_dim",
+            self.__class__.default_first_embed_pre_layer_dim,
         )
         self.first_embed_layer_dim = kwargs.get(
             "first_embed_layer_dim", self.__class__.default_first_embed_layer_dim
@@ -171,6 +201,68 @@ class CLIPTextDeprojectorVTMLPLayer(CLIPTextDeprojectorVTBase):
 class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
     default_fuse = 0.0
 
+    def CreateMLPFirstLayer(self, config, embed_dim, ensemble_size):
+        first_layer_dim = config.first_layer_dim
+        first_embed_layer_dim = config.first_embed_layer_dim
+        use_same_mlp_first_layer = config.use_same_mlp_first_layer
+
+        if first_embed_layer_dim and (not use_same_mlp_first_layer):
+            self.linear1_embeds1 = nn.ModuleList(
+                nn.Linear(embed_dim, first_embed_layer_dim)
+                for _ in range(ensemble_size)
+            )
+            self.linear1_embeds2 = nn.ModuleList(
+                nn.Linear(first_embed_layer_dim, embed_dim)
+                for _ in range(ensemble_size)
+            )
+
+        if first_layer_dim:
+            self.linear1_states1 = nn.ModuleList(
+                nn.Linear(embed_dim, first_layer_dim) for _ in range(ensemble_size)
+            )
+            self.linear1_states2 = nn.ModuleList(
+                nn.Linear(first_layer_dim, embed_dim) for _ in range(ensemble_size)
+            )
+
+        return embed_dim * (1 + config.vicinity)
+
+    def CreateIndividualFirstLayer(self, config, embed_dim, ensemble_size):
+        first_layer_dim = config.first_layer_dim
+        first_embed_pre_layer_dim = config.first_embed_pre_layer_dim
+        first_embed_layer_dim = config.first_embed_layer_dim
+        if first_embed_pre_layer_dim:
+            self.linear_pre_embeds = nn.ModuleList(
+                nn.Linear(embed_dim, first_embed_pre_layer_dim)
+                for _ in range(ensemble_size)
+            )
+            self.linear1_embeds = nn.ModuleList(
+                nn.Linear(first_embed_pre_layer_dim, first_embed_layer_dim)
+                for _ in range(ensemble_size)
+            )
+        else:
+            self.linear1_embeds = nn.ModuleList(
+                nn.Linear(embed_dim, first_embed_layer_dim)
+                for _ in range(ensemble_size)
+            )
+        if config.first_embed_layer_dropout:
+            self.linear1_embeds_dropout = nn.Dropout(p=config.first_embed_layer_dropout)
+        self.linear1 = nn.ModuleList(
+            nn.Linear(embed_dim, first_layer_dim) for _ in range(ensemble_size)
+        )
+        first_intermediate_dim = (
+            first_embed_layer_dim + first_layer_dim * config.vicinity
+        )
+        return first_intermediate_dim
+
+    def CreateCombinedFirstLayer(self, config, embed_dim, ensemble_size):
+        first_layer_dim = config.first_layer_dim
+        input_dim = embed_dim * (1 + config.vicinity)
+        self.linear1 = nn.ModuleList(
+            nn.Linear(input_dim, first_layer_dim) for _ in range(ensemble_size)
+        )
+        first_intermediate_dim = first_layer_dim
+        return first_intermediate_dim
+
     def __init__(self, config: CLIPTextDeprojectorVTConfig):
         super().__init__(config)
         embed_dim = config.hidden_size
@@ -187,30 +279,20 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
         self.register_buffer("null_embed", torch.empty([embed_dim]))
 
         # First layer
-        first_layer_dim = config.first_layer_dim
         self.activation_fn = ACT2FN[config.hidden_act]
-        if config.use_individual_first_layer:
-            first_embed_layer_dim = config.first_embed_layer_dim
-            self.linear1_embeds = nn.ModuleList(
-                nn.Linear(embed_dim, first_embed_layer_dim)
-                for _ in range(ensemble_size)
+        if config.use_mlp_first_layer:
+            first_intermediate_dim = self.CreateMLPFirstLayer(
+                config, embed_dim, ensemble_size
             )
-            if config.first_embed_layer_dropout:
-                self.linear1_embeds_dropout = nn.Dropout(
-                    p=config.first_embed_layer_dropout
-                )
-            self.linear1 = nn.ModuleList(
-                nn.Linear(embed_dim, first_layer_dim) for _ in range(ensemble_size)
-            )
-            first_intermediate_dim = (
-                first_embed_layer_dim + first_layer_dim * config.vicinity
+        elif config.use_individual_first_layer:
+            first_intermediate_dim = self.CreateIndividualFirstLayer(
+                config, embed_dim, ensemble_size
             )
         else:
-            input_dim = embed_dim * (1 + config.vicinity)
-            self.linear1 = nn.ModuleList(
-                nn.Linear(input_dim, first_layer_dim) for _ in range(ensemble_size)
+            first_intermediate_dim = self.CreateCombinedFirstLayer(
+                config, embed_dim, ensemble_size
             )
-            first_intermediate_dim = first_layer_dim
+
         self.linear2 = nn.ModuleList(
             nn.Linear(first_intermediate_dim + embed_dim, embed_dim)
             for _ in range(ensemble_size)
@@ -286,8 +368,28 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
             # first_layer_dim = module.config.first_layer_dim
             embed_dim = module.config.hidden_size
             fc_std = embed_dim**-0.5 * factor
-            for m in module.linear1:
-                torch.nn.init.normal_(m.weight, std=fc_std)
+            if module.config.use_mlp_first_layer:
+                if module.config.first_embed_layer_dim and (
+                    not module.config.use_same_mlp_first_layer
+                ):
+                    for m in module.linear1_embeds1:
+                        nn.init.normal_(m.weight, std=fc_std)
+                    for m in module.linear1_embeds2:
+                        nn.init.normal_(m.weight, std=fc_std)
+                if module.config.first_layer_dim:
+                    for m in module.linear1_states1:
+                        nn.init.normal_(m.weight, std=fc_std)
+                    for m in module.linear1_states2:
+                        nn.init.normal_(m.weight, std=fc_std)
+            else:
+                if module.config.use_individual_first_layer:
+                    if module.config.first_embed_pre_layer_dim:
+                        for m in module.linear_pre_embeds:
+                            torch.nn.init.normal_(m.weight, std=fc_std)
+                    for m in module.linear1_embeds:
+                        torch.nn.init.normal_(m.weight, std=fc_std)
+                for m in module.linear1:
+                    torch.nn.init.normal_(m.weight, std=fc_std)
             for m in module.linear2:
                 torch.nn.init.normal_(m.weight, std=fc_std)
 
@@ -379,10 +481,133 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
             bsz, 1, tgt_len, tgt_len + past_key_values_length
         )
 
+    def ApplyMLPFirstLayer(self, idx, embeds, states, bsz, seq_len, embed_dim, device):
+        first_layer_dim = self.config.first_layer_dim
+        first_embed_layer_dim = self.config.first_embed_layer_dim
+        use_same_mlp_first_layer = self.config.use_same_mlp_first_layer
+
+        if use_same_mlp_first_layer:
+            if first_layer_dim:
+                all_states = torch.cat([embeds, states], dim=1)
+                all_states_output = all_states
+                all_states_output = self.linear1_states1[idx](all_states_output)
+                all_states_output = self.activation_fn(all_states_output)
+                all_states_output = self.linear1_states2[idx](all_states_output)
+                all_states_output = all_states_output + all_states
+                embeds_output = all_states_output[:, :1, :]
+                states_output = all_states_output[:, 1:, :]
+            else:
+                embeds_output = embeds
+                states_output = states
+        else:
+            embeds_output = embeds
+            if first_embed_layer_dim:
+                embeds_output = self.linear1_embeds1[idx](embeds_output)
+                embeds_output = self.activation_fn(embeds_output)
+                embeds_output = self.linear1_embeds2[idx](embeds_output)
+                embeds_output = embeds_output + embeds
+            states_output = states
+            if first_layer_dim:
+                states_output = self.linear1_states1[idx](states_output)
+                states_output = self.activation_fn(states_output)
+                states_output = self.linear1_states2[idx](states_output)
+                states_output = states_output + states
+
+        zero_output = states_output[:, :1, :]
+        first_output = [embeds_output.repeat([1, seq_len, 1]), states_output]
+        for i in range(1, self.config.vicinity):
+            zero_states = torch.zeros([bsz, i, embed_dim], device=device)
+            if i > seq_len:
+                first_output.append(zero_output.repeat([1, seq_len, 1]))
+            else:
+                first_output.append(
+                    torch.cat(
+                        [zero_output.repeat([1, i, 1]), states_output[:, :-i, :]], dim=1
+                    )
+                )
+        first_output = torch.cat(first_output, dim=2)
+        return first_output.clone()
+
+    def ApplyIndividualFirstLayer(
+        self, idx, embeds, states, bsz, seq_len, embed_dim, device
+    ):
+        first_layer_dim = self.config.first_layer_dim
+
+        if self.config.first_embed_pre_layer_dim:
+            embeds_output = self.linear_pre_embeds[idx](embeds)
+            embeds_output = self.activation_fn(embeds_output)
+            embeds_output = self.linear1_embeds[idx](embeds_output)
+        else:
+            embeds_output = self.linear1_embeds[idx](embeds)
+
+        if self.config.first_embed_layer_dropout:
+            embeds_output = self.linear1_embeds_dropout(embeds_output)
+
+        states_output = self.linear1[idx](states)
+
+        # states[0] is a zero tensor.
+        zero_states = states[:, :1, :]
+        zero_output = states_output[:, :1, :]
+
+        # TODO: make sure first_embed_layer_dim is an integer multiple of embed_dim.
+        embeds_dim_mult = self.config.first_embed_layer_dim // embed_dim
+        first_input = [
+            embeds.repeat([1, seq_len, embeds_dim_mult]),
+            states,
+        ]
+        first_output = [embeds_output.repeat([1, seq_len, 1]), states_output]
+        for i in range(1, self.config.vicinity):
+            if i > seq_len:
+                first_input.append(zero_states.repeat([1, seq_len, 1]))
+                first_output.append(zero_output.repeat([1, seq_len, 1]))
+            else:
+                first_input.append(
+                    torch.cat([zero_states.repeat([1, i, 1]), states[:, :-i, :]], dim=1)
+                )
+                first_output.append(
+                    torch.cat(
+                        [zero_output.repeat([1, i, 1]), states_output[:, :-i, :]], dim=1
+                    )
+                )
+        first_output = torch.cat(first_output, dim=2)
+
+        if self.config.first_layer_activation:
+            first_output = self.activation_fn(first_output)
+        if self.config.first_layer_residual_connection:
+            first_input = torch.cat(first_input, dim=2)  # = first layer residual
+            first_output = first_output + first_input
+
+        return first_output.clone()
+
+    def ApplyCombinedFirstLayer(
+        self, idx, embeds, states, bsz, seq_len, embed_dim, device
+    ):
+        first_layer_dim = self.config.first_layer_dim
+        if first_layer_dim > 0:
+            first_input = [embeds.repeat([1, seq_len, 1]), states]
+            for i in range(1, self.config.vicinity):
+                zero_states = torch.zeros([bsz, i, embed_dim], device=device)
+                first_input.append(torch.cat([zero_states, states[:, :-i, :]], dim=1))
+            first_input = torch.cat(first_input, dim=2)
+            first_output = self.linear1[idx](first_input)
+            first_output = self.activation_fn(first_output)
+        else:
+            first_output = torch.empty([bsz, seq_len, 0], device=device)
+        return first_output
+
     def forward(self, idx, embeds, states, **kwargs):
         if self.config.relative_to_null:
             embeds = embeds - self.null_embed
             states = states - self.null_embed
+        embeds = embeds.unsqueeze(1)
+        if self.config.apply_norm_first:
+            if self.config.apply_norm_to_all:
+                all_states = torch.cat([embeds, states], dim=1)
+                all_states = self.norm[idx](all_states)
+                embeds = all_states[:, :1, :]
+                states = all_states[:, 1:, :]
+            else:
+                states = self.norm[idx](states)
 
         device, dtype = embeds.device, embeds.dtype
         bsz, seq_len, embed_dim = states.shape
@@ -393,45 +618,28 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
         if self.config.use_residual_connection:
             residual = states
 
-        first_layer_dim = self.config.first_layer_dim
-        if self.config.use_individual_first_layer:
-            embeds_output = self.linear1_embeds[idx](embeds.unsqueeze(1))
-            if self.config.first_embed_layer_dropout:
-                embeds_output = self.linear1_embeds_dropout(embeds_output)
-            states_output = self.linear1[idx](states)
-            zero_output = states_output[:, :1, :]
-            first_output = [embeds_output.repeat([1, seq_len, 1]), states_output]
-            for i in range(1, self.config.vicinity):
-                if i > seq_len:
-                    first_output.append(zero_output.repeat([1, seq_len, 1]))
-                else:
-                    first_output.append(
-                        torch.cat(
-                            [zero_output.repeat([1, i, 1]), states_output[:, :-i, :]],
-                            dim=1,
-                        )
-                    )
-            first_output = torch.cat(first_output, dim=2)
+        if self.config.use_mlp_first_layer:
+            first_output = self.ApplyMLPFirstLayer(
+                idx, embeds, states, bsz, seq_len, embed_dim, device
+            )
+        elif self.config.use_individual_first_layer:
+            first_output = self.ApplyIndividualFirstLayer(
+                idx, embeds, states, bsz, seq_len, embed_dim, device
+            )
         else:
-            if first_layer_dim > 0:
-                first_input = [embeds.unsqueeze(1).repeat([1, seq_len, 1]), states]
-                for i in range(1, self.config.vicinity):
-                    zero_states = torch.zeros([bsz, i, embed_dim], device=device)
-                    first_input.append(
-                        torch.cat([zero_states, states[:, :-i, :]], dim=1)
-                    )
-                first_input = torch.cat(first_input, dim=2)
-                first_output = self.linear1[idx](first_input)
-                first_output = self.activation_fn(first_output)
-            else:
-                first_output = torch.empty([bsz, seq_len, 0], device=device)
+            first_output = self.ApplyCombinedFirstLayer(
+                idx, embeds, states, bsz, seq_len, embed_dim, device
+            )
 
         if self.config.embeds_in_attention:
-            states = torch.cat([embeds.unsqueeze(1), states[:, 1:, :]], dim=1)
+            states = torch.cat([embeds, states[:, 1:, :]], dim=1)
         position_embedding = self.position_embedding[idx](
             self.position_ids[:, :seq_len]
         )
-        attention_input = self.norm[idx](states + position_embedding)
+        if self.config.apply_norm_first:
+            attention_input = states + position_embedding
+        else:
+            attention_input = self.norm[idx](states + position_embedding)
         attention_mask = None
         causal_attention_mask = self._make_causal_mask(bsz, seq_len, dtype, device)
         attention_output = self.self_attn[idx](
@@ -548,9 +756,18 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
                 m.load_state_dict(state_dict)
 
         if vicinity:
-            if self.config.use_individual_first_layer:
-                avg(self.linear1_embeds)
-            avg(self.linear1)
+            if self.config.use_mlp_first_layer:
+                if not self.config.use_same_mlp_first_layer:
+                    avg(self.linear1_embeds1)
+                    avg(self.linear1_embeds2)
+                avg(self.linear1_states1)
+                avg(self.linear1_states2)
+            else:
+                if self.config.use_individual_first_layer:
+                    if self.config.first_embed_pre_layer_dim:
+                        avg(self.linear_pre_embeds)
+                    avg(self.linear1_embeds)
+                avg(self.linear1)
             avg(self.linear2)
         if attention:
             avg(self.position_embedding)
@@ -580,9 +797,20 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
                 pa.data = pb.data
 
         for i, model in enumerate(models):
-            if new_config.use_individual_first_layer:
-                copy_params(new_model.linear1_embeds[i], model.linear1_embeds[0])
-            copy_params(new_model.linear1[i], model.linear1[0])
+            if new_config.use_mlp_first_layer:
+                if not new_config.use_same_mlp_first_layer:
+                    copy_params(new_model1.linear1_embeds1[i], model.linear1_embeds1[0])
+                    copy_params(new_model1.linear1_embeds2[i], model.linear1_embeds2[0])
+                copy_params(new_model1.linear1_states1[i], model.linear1_states1[0])
+                copy_params(new_model1.linear1_states2[i], model.linear1_states2[0])
+            else:
+                if new_config.use_individual_first_layer:
+                    if new_config.first_embed_pre_layer_dim:
+                        copy_params(
+                            new_model.linear_pre_embeds[i], model.linear_pre_embeds[0]
+                        )
+                    copy_params(new_model.linear1_embeds[i], model.linear1_embeds[0])
+                copy_params(new_model.linear1[i], model.linear1[0])
             copy_params(new_model.linear2[i], model.linear2[0])
             copy_params(new_model.position_embedding[i], model.position_embedding[0])
             copy_params(new_model.norm[i], model.norm[0])
