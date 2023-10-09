@@ -57,11 +57,14 @@ class CLIPTextDeprojectorVTConfig(CLIPTextConfig):
     default_first_embed_pre_layer_dim = 0
     default_first_embed_layer_dim = 768 * 1
     default_first_embed_layer_dropout = 0.0
+    defailt_require_grad_in_attention = False
+    default_use_full_attention = False
     default_embeds_in_attention = False
     default_num_mlp_layers = 1
     default_mlp_layer_dim = 768 * 4
     default_mlp_dropout = 0.0
     default_use_residual_connection = True
+    default_use_embeds_for_residual_connection = False
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -109,6 +112,13 @@ class CLIPTextDeprojectorVTConfig(CLIPTextConfig):
             "first_embed_layer_dropout",
             self.__class__.default_first_embed_layer_dropout,
         )
+        self.require_grad_in_attention = kwargs.get(
+            "require_grad_in_attention",
+            self.__class__.default_require_grad_in_attention,
+        )
+        self.use_full_attention = kwargs.get(
+            "use_full_attention", self.__class__.default_use_full_attention
+        )
         self.embeds_in_attention = kwargs.get(
             "embeds_in_attention", self.__class__.default_embeds_in_attention
         )
@@ -121,6 +131,10 @@ class CLIPTextDeprojectorVTConfig(CLIPTextConfig):
         self.mlp_dropout = kwargs.get("mlp_dropout", self.__class__.default_mlp_dropout)
         self.use_residual_connection = kwargs.get(
             "use_residual_connection", self.__class__.default_use_residual_connection
+        )
+        self.use_embeds_for_residual_connection = kwargs.get(
+            "use_embeds_for_residual_connection",
+            self.__class__.default_use_embeds_for_residual_connection,
         )
 
 
@@ -310,10 +324,16 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
         self.self_attn = nn.ModuleList(
             CLIPAttention(config) for _ in range(ensemble_size)
         )
-        # Fix out_proj parameters
-        for attn in self.self_attn:
-            for p in attn.parameters():
-                p.requires_grad = False
+        if not config.require_grad_in_attention:
+            # Fix all parameters (to preserve a bug)
+            for attn in self.self_attn:
+                for p in attn.parameters():
+                    p.requires_grad = False
+        elif not config.use_full_attention:
+            # Fix out_proj parameters
+            for attn in self.self_attn:
+                for p in attn.out_proj.parameters():
+                    p.requires_grad = False
 
         # MLP layers
         self.mlp_layers = nn.ModuleList(
@@ -345,9 +365,10 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
 
         # Overwrite out_proj of CLIPAttention
         if isinstance(module, CLIPAttention):
-            embed_dim = module.config.hidden_size
-            self.CheckAndInit(module.out_proj.weight, torch.eye(embed_dim))
-            module.out_proj.bias.data.zero_()
+            if not module.config.use_full_attention:
+                embed_dim = module.config.hidden_size
+                self.CheckAndInit(module.out_proj.weight, torch.eye(embed_dim))
+                module.out_proj.bias.data.zero_()
 
         # Similar to CLIPMLP
         if isinstance(module, CLIPTextDeprojectorVTMLPLayer):
@@ -400,12 +421,15 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
             )
 
         # First layer (vicinity)
-        self.ResizeAndInit(
-            self.linear2[0].weight, weights["encoder_layer.self_attn.out_proj.weight"]
-        )
-        self.CheckAndInit(
-            self.linear2[0].bias, weights["encoder_layer.self_attn.out_proj.bias"]
-        )
+        if not self.config.use_full_attention:
+            self.ResizeAndInit(
+                self.linear2[0].weight,
+                weights["encoder_layer.self_attn.out_proj.weight"],
+            )
+            self.CheckAndInit(
+                self.linear2[0].bias,
+                weights["encoder_layer.self_attn.out_proj.bias"],
+            )
 
         # CLIPAttention
         self.CheckAndInit(
@@ -436,6 +460,15 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
             self.self_attn[0].v_proj.bias,
             weights["encoder_layer.self_attn.v_proj.bias"],
         )
+        if self.config.use_full_attention:
+            self.CheckAndInit(
+                self.self_attn[0].v_proj.weight,
+                weights["encoder_layer.self_attn.out_proj.weight"],
+            )
+            self.CheckAndInit(
+                self.self_attn[0].v_proj.bias,
+                weights["encoder_layer.self_attn.out_proj.bias"],
+            )
 
         # MLP layers
         for l in self.mlp_layers[0]:
@@ -616,7 +649,12 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
         seq_len += 1
 
         if self.config.use_residual_connection:
-            residual = states
+            if self.config.use_embeds_for_residual_connection:
+                residual = embeds.repeat([1, seq_len, 1])
+            else:
+                residual = states
+        if self.config.use_full_attention:
+            attention_residual = states
 
         if self.config.use_mlp_first_layer:
             first_output = self.ApplyMLPFirstLayer(
@@ -645,10 +683,12 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
         attention_output = self.self_attn[idx](
             attention_input, attention_mask, causal_attention_mask
         )[0]
+        if self.config.use_full_attention:
+            attention_output = attention_output + attention_residual
 
         states = self.linear2[idx](torch.cat([attention_output, first_output], dim=2))
         if self.config.use_residual_connection:
-            states = states + residual
+            states = (states + residual).clone()
 
         for layer in self.mlp_layers[idx]:
             states = layer(states)
