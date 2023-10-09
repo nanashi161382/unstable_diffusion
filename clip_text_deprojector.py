@@ -57,7 +57,7 @@ class CLIPTextDeprojectorVTConfig(CLIPTextConfig):
     default_first_embed_pre_layer_dim = 0
     default_first_embed_layer_dim = 768 * 1
     default_first_embed_layer_dropout = 0.0
-    defailt_require_grad_in_attention = False
+    default_require_grad_in_attention = False
     default_use_full_attention = False
     default_embeds_in_attention = False
     default_num_mlp_layers = 1
