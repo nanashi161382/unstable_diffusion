@@ -51,6 +51,7 @@ class CLIPTextDeprojectorVTConfig(CLIPTextConfig):
     default_use_mlp_first_layer = False
     default_use_same_mlp_first_layer = False
     default_use_individual_first_layer = False
+    default_no_first_embed_layer = False
     default_first_layer_activation = False
     default_first_layer_residual_connection = False
     default_first_layer_dim = 768 * 1
@@ -59,6 +60,7 @@ class CLIPTextDeprojectorVTConfig(CLIPTextConfig):
     default_first_embed_layer_dropout = 0.0
     default_require_grad_in_attention = False
     default_use_full_attention = False
+    default_use_regular_attention_residual_connection = False
     default_embeds_in_attention = False
     default_num_mlp_layers = 1
     default_mlp_layer_dim = 768 * 4
@@ -91,6 +93,9 @@ class CLIPTextDeprojectorVTConfig(CLIPTextConfig):
             "use_individual_first_layer",
             self.__class__.default_use_individual_first_layer,
         )
+        self.no_first_embed_layer = kwargs.get(
+            "no_first_embed_layer", self.__class__.default_no_first_embed_layer
+        )
         self.first_layer_activation = kwargs.get(
             "first_layer_activation", self.__class__.default_first_layer_activation
         )
@@ -118,6 +123,10 @@ class CLIPTextDeprojectorVTConfig(CLIPTextConfig):
         )
         self.use_full_attention = kwargs.get(
             "use_full_attention", self.__class__.default_use_full_attention
+        )
+        self.use_regular_attention_residual_connection = kwargs.get(
+            "use_regular_attention_residual_connection",
+            self.__class__.default_use_regular_attention_residual_connection,
         )
         self.embeds_in_attention = kwargs.get(
             "embeds_in_attention", self.__class__.default_embeds_in_attention
@@ -219,8 +228,13 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
         first_layer_dim = config.first_layer_dim
         first_embed_layer_dim = config.first_embed_layer_dim
         use_same_mlp_first_layer = config.use_same_mlp_first_layer
+        use_first_embed_layer = not config.no_first_embed_layer
 
-        if first_embed_layer_dim and (not use_same_mlp_first_layer):
+        if (
+            use_first_embed_layer
+            and first_embed_layer_dim
+            and (not use_same_mlp_first_layer)
+        ):
             self.linear1_embeds1 = nn.ModuleList(
                 nn.Linear(embed_dim, first_embed_layer_dim)
                 for _ in range(ensemble_size)
@@ -238,7 +252,10 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
                 nn.Linear(first_layer_dim, embed_dim) for _ in range(ensemble_size)
             )
 
-        return embed_dim * (1 + config.vicinity)
+        if use_first_embed_layer:
+            return embed_dim * (1 + config.vicinity)
+        else:
+            return embed_dim * config.vicinity
 
     def CreateIndividualFirstLayer(self, config, embed_dim, ensemble_size):
         first_layer_dim = config.first_layer_dim
@@ -282,6 +299,8 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
         embed_dim = config.hidden_size
         ensemble_size = config.ensemble_size
         max_seq_len = config.max_position_embeddings - 1
+        if config.embeds_in_attention:
+            max_seq_len += 1
 
         # Position_ids is not saved.
         self.position_ids = torch.arange(max_seq_len).expand((1, -1))
@@ -291,26 +310,6 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
         )
         self.register_buffer("sos_embed", torch.empty([embed_dim]))
         self.register_buffer("null_embed", torch.empty([embed_dim]))
-
-        # First layer
-        self.activation_fn = ACT2FN[config.hidden_act]
-        if config.use_mlp_first_layer:
-            first_intermediate_dim = self.CreateMLPFirstLayer(
-                config, embed_dim, ensemble_size
-            )
-        elif config.use_individual_first_layer:
-            first_intermediate_dim = self.CreateIndividualFirstLayer(
-                config, embed_dim, ensemble_size
-            )
-        else:
-            first_intermediate_dim = self.CreateCombinedFirstLayer(
-                config, embed_dim, ensemble_size
-            )
-
-        self.linear2 = nn.ModuleList(
-            nn.Linear(first_intermediate_dim + embed_dim, embed_dim)
-            for _ in range(ensemble_size)
-        )
 
         # Attention layer
         self.position_embedding = nn.ModuleList(
@@ -334,6 +333,27 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
             for attn in self.self_attn:
                 for p in attn.out_proj.parameters():
                     p.requires_grad = False
+
+        # Vicinity layer (= First layer)
+        self.activation_fn = ACT2FN[config.hidden_act]
+        if config.use_mlp_first_layer:
+            first_intermediate_dim = self.CreateMLPFirstLayer(
+                config, embed_dim, ensemble_size
+            )
+        elif config.use_individual_first_layer:
+            first_intermediate_dim = self.CreateIndividualFirstLayer(
+                config, embed_dim, ensemble_size
+            )
+        else:
+            first_intermediate_dim = self.CreateCombinedFirstLayer(
+                config, embed_dim, ensemble_size
+            )
+
+        # Second layer
+        self.linear2 = nn.ModuleList(
+            nn.Linear(first_intermediate_dim + embed_dim, embed_dim)
+            for _ in range(ensemble_size)
+        )
 
         # MLP layers
         self.mlp_layers = nn.ModuleList(
@@ -518,6 +538,7 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
         first_layer_dim = self.config.first_layer_dim
         first_embed_layer_dim = self.config.first_embed_layer_dim
         use_same_mlp_first_layer = self.config.use_same_mlp_first_layer
+        use_first_embed_layer = not self.config.no_first_embed_layer
 
         if use_same_mlp_first_layer:
             if first_layer_dim:
@@ -547,7 +568,10 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
                 states_output = states_output + states
 
         zero_output = states_output[:, :1, :]
-        first_output = [embeds_output.repeat([1, seq_len, 1]), states_output]
+        if use_first_embed_layer:
+            first_output = [embeds_output.repeat([1, seq_len, 1]), states_output]
+        else:
+            first_output = [states_output]
         for i in range(1, self.config.vicinity):
             zero_states = torch.zeros([bsz, i, embed_dim], device=device)
             if i > seq_len:
@@ -633,6 +657,10 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
             embeds = embeds - self.null_embed
             states = states - self.null_embed
         embeds = embeds.unsqueeze(1)
+        device, dtype = embeds.device, embeds.dtype
+        bsz, seq_len, embed_dim = states.shape
+
+        # Input Normalization
         if self.config.apply_norm_first:
             if self.config.apply_norm_to_all:
                 all_states = torch.cat([embeds, states], dim=1)
@@ -642,57 +670,74 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
             else:
                 states = self.norm[idx](states)
 
-        device, dtype = embeds.device, embeds.dtype
-        bsz, seq_len, embed_dim = states.shape
+        # Expand the hidden states with zeros to the left
         zero_states = torch.zeros([bsz, 1, embed_dim], device=device)
         states = torch.cat([zero_states, states], dim=1)
         seq_len += 1
 
+        # Residual Connection
         if self.config.use_residual_connection:
             if self.config.use_embeds_for_residual_connection:
                 residual = embeds.repeat([1, seq_len, 1])
             else:
                 residual = states
+
+        # Self Attention
+        attn_len = seq_len
+        attention_input = states
         if self.config.use_full_attention:
-            attention_residual = states
-
-        if self.config.use_mlp_first_layer:
-            first_output = self.ApplyMLPFirstLayer(
-                idx, embeds, states, bsz, seq_len, embed_dim, device
-            )
-        elif self.config.use_individual_first_layer:
-            first_output = self.ApplyIndividualFirstLayer(
-                idx, embeds, states, bsz, seq_len, embed_dim, device
-            )
-        else:
-            first_output = self.ApplyCombinedFirstLayer(
-                idx, embeds, states, bsz, seq_len, embed_dim, device
-            )
-
+            if self.config.use_regular_attention_residual_connection:
+                attention_residual = residual
+            else:
+                attention_residual = attention_input
         if self.config.embeds_in_attention:
-            states = torch.cat([embeds, states[:, 1:, :]], dim=1)
+            attention_input = torch.cat([embeds, attention_input], dim=1)
+            attn_len += 1
         position_embedding = self.position_embedding[idx](
-            self.position_ids[:, :seq_len]
+            self.position_ids[:, :attn_len]
         )
-        if self.config.apply_norm_first:
-            attention_input = states + position_embedding
-        else:
-            attention_input = self.norm[idx](states + position_embedding)
+        attention_input = attention_input + position_embedding
+        if not self.config.apply_norm_first:
+            # Not normalized yet
+            attention_input = self.norm[idx](attention_input)
         attention_mask = None
-        causal_attention_mask = self._make_causal_mask(bsz, seq_len, dtype, device)
+        causal_attention_mask = self._make_causal_mask(bsz, attn_len, dtype, device)
         attention_output = self.self_attn[idx](
             attention_input, attention_mask, causal_attention_mask
         )[0]
+        if self.config.embeds_in_attention:
+            attention_output = attention_output[:, 1:, :]
         if self.config.use_full_attention:
             attention_output = attention_output + attention_residual
+            if self.config.use_regular_attention_residual_connection:
+                residual = attention_output
 
-        states = self.linear2[idx](torch.cat([attention_output, first_output], dim=2))
+        # Vicinity (= First Layer, linear1)
+        if self.config.use_mlp_first_layer:
+            vicinity_output = self.ApplyMLPFirstLayer(
+                idx, embeds, states, bsz, seq_len, embed_dim, device
+            )
+        elif self.config.use_individual_first_layer:
+            vicinity_output = self.ApplyIndividualFirstLayer(
+                idx, embeds, states, bsz, seq_len, embed_dim, device
+            )
+        else:
+            vicinity_output = self.ApplyCombinedFirstLayer(
+                idx, embeds, states, bsz, seq_len, embed_dim, device
+            )
+
+        # Second Layer (= linear2)
+        states = self.linear2[idx](
+            torch.cat([attention_output, vicinity_output], dim=2)
+        )
         if self.config.use_residual_connection:
             states = (states + residual).clone()
 
+        # MLP Layers
         for layer in self.mlp_layers[idx]:
             states = layer(states)
 
+        # Final Norm
         return self.final_norm[idx](states)
 
     def OffloadTensor(self, *ts):
