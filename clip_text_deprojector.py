@@ -43,6 +43,7 @@ def Debug(level: int, title: str, obj=None):
 class CLIPTextDeprojectorVTConfig(CLIPTextConfig):
     model_type = "clip_text_deprojector_vt_model"
 
+    default_squashed = False
     default_ensemble_size = 1
     default_relative_to_null = True
     default_apply_norm_first = False
@@ -70,6 +71,7 @@ class CLIPTextDeprojectorVTConfig(CLIPTextConfig):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self.squashed = kwargs.get("squashed", self.__class__.default_squashed)
         self.ensemble_size = kwargs.get(
             "ensemble_size", self.__class__.default_ensemble_size
         )
@@ -146,6 +148,11 @@ class CLIPTextDeprojectorVTConfig(CLIPTextConfig):
             self.__class__.default_use_embeds_for_residual_connection,
         )
 
+        if self.squashed and self.use_full_attention:
+            raise ValueError(
+                "squashed and use_full_attention can't be set True simultaneously."
+            )
+
 
 class CLIPTextDeprojectorVTBase(CLIPPreTrainedModel):
     config_class = CLIPTextDeprojectorVTConfig
@@ -200,16 +207,12 @@ class CLIPTextDeprojectorVTMLPLayer(CLIPTextDeprojectorVTBase):
             self.dropout = nn.Dropout(p=config.mlp_dropout)
 
     def forward(self, states):
-        if self.config.use_residual_connection:
-            residual = states
         states = self.norm(states)
         states = self.linear1(states)
         if self.config.mlp_dropout:
             states = self.dropout(states)
         states = self.activation_fn(states)
         states = self.linear2(states)
-        if self.config.use_residual_connection:
-            states = states + residual
         return states
 
     def InitFromWeights(self, weights):
@@ -223,6 +226,8 @@ class CLIPTextDeprojectorVTMLPLayer(CLIPTextDeprojectorVTBase):
 
 class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
     default_fuse = 0.0
+    learn_only_uninitialized = False
+    dont_learn_attention = False
 
     def CreateMLPFirstLayer(self, config, embed_dim, ensemble_size):
         first_layer_dim = config.first_layer_dim
@@ -323,13 +328,19 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
         self.self_attn = nn.ModuleList(
             CLIPAttention(config) for _ in range(ensemble_size)
         )
-        if not config.require_grad_in_attention:
-            # Fix all parameters (to preserve a bug)
-            for attn in self.self_attn:
-                for p in attn.parameters():
-                    p.requires_grad = False
-        elif not config.use_full_attention:
-            # Fix out_proj parameters
+        if (
+            self.__class__.learn_only_uninitialized
+            or self.__class__.dont_learn_attention
+            or (not config.require_grad_in_attention)
+        ):
+            # Don't learn all parameters
+            for p in self.self_attn.parameters():
+                p.requires_grad = False
+            if self.config.squashed:
+                for attn in self.self_attn:
+                    attn.out_proj.bias.requires_grad = True
+        elif (not config.use_full_attention) and (not self.config.squashed):
+            # Don't learn out_proj parameters
             for attn in self.self_attn:
                 for p in attn.out_proj.parameters():
                     p.requires_grad = False
@@ -350,10 +361,16 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
             )
 
         # Second layer
-        self.linear2 = nn.ModuleList(
-            nn.Linear(first_intermediate_dim + embed_dim, embed_dim)
-            for _ in range(ensemble_size)
-        )
+        if self.config.squashed:
+            self.linear2 = nn.ModuleList(
+                nn.Linear(first_intermediate_dim, embed_dim, bias=False)
+                for _ in range(ensemble_size)
+            )
+        else:
+            self.linear2 = nn.ModuleList(
+                nn.Linear(first_intermediate_dim + embed_dim, embed_dim)
+                for _ in range(ensemble_size)
+            )
 
         # MLP layers
         self.mlp_layers = nn.ModuleList(
@@ -363,6 +380,10 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
             )
             for _ in range(ensemble_size)
         )
+        if self.__class__.learn_only_uninitialized:
+            # Don't learn all parameters
+            for p in self.mlp_layers.parameters():
+                p.requires_grad = False
 
         # Final normalizer
         self.final_norm = nn.ModuleList(
@@ -440,8 +461,8 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
                 f"ensemble_size must be 1 for training: {self.config.ensemble_size}"
             )
 
-        # First layer (vicinity)
-        if not self.config.use_full_attention:
+        # Second layer (= linear2)
+        if (not self.config.use_full_attention) and (not self.config.squashed):
             self.ResizeAndInit(
                 self.linear2[0].weight,
                 weights["encoder_layer.self_attn.out_proj.weight"],
@@ -480,7 +501,7 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
             self.self_attn[0].v_proj.bias,
             weights["encoder_layer.self_attn.v_proj.bias"],
         )
-        if self.config.use_full_attention:
+        if self.config.use_full_attention or self.config.squashed:
             self.CheckAndInit(
                 self.self_attn[0].v_proj.weight,
                 weights["encoder_layer.self_attn.out_proj.weight"],
@@ -727,15 +748,22 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
             )
 
         # Second Layer (= linear2)
-        states = self.linear2[idx](
-            torch.cat([attention_output, vicinity_output], dim=2)
-        )
+        if self.config.squashed:
+            states = attention_output + self.linear2[idx](vicinity_output)
+        else:
+            states = self.linear2[idx](
+                torch.cat([attention_output, vicinity_output], dim=2)
+            )
         if self.config.use_residual_connection:
             states = (states + residual).clone()
 
         # MLP Layers
         for layer in self.mlp_layers[idx]:
+            if self.config.use_residual_connection:
+                residual = states
             states = layer(states)
+            if self.config.use_residual_connection:
+                states = states + residual
 
         # Final Norm
         return self.final_norm[idx](states)
