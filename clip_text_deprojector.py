@@ -38,6 +38,550 @@ def Debug(level: int, title: str, obj=None):
 
 
 #
+# -- Multi-layer Vicinity-Transformer model --
+#
+class CLIPTextDeprojectorMvtConfig(CLIPTextConfig):
+    model_type = "clip_text_deprojector_mvt_model"
+
+    default_ensemble_size = 1
+    default_vicinity = 2
+    default_vicinity_res_plus_embeds = False
+    default_all_in_vicinity = False
+    default_use_vicinity_mlp = False
+    default_vicinity_act = ""
+    default_use_vicinity_gate = False
+    default_num_vt_layers = 1
+    default_mlp_layer_dim = 768 * 4
+    default_use_old_norm = True
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.ensemble_size = kwargs.get(
+            "ensemble_size", self.__class__.default_ensemble_size
+        )
+        self.vicinity = kwargs.get("vicinity", self.__class__.default_vicinity)
+        self.vicinity_res_plus_embeds = kwargs.get(
+            "vicinity_res_plus_embeds", self.__class__.default_vicinity_res_plus_embeds
+        )
+        self.all_in_vicinity = kwargs.get(
+            "all_in_vicinity", self.__class__.default_all_in_vicinity
+        )
+        self.use_vicinity_mlp = kwargs.get(
+            "use_vicinity_mlp", self.__class__.default_use_vicinity_mlp
+        )
+        self.vicinity_act = kwargs.get(
+            "vicinity_act", self.__class__.default_vicinity_act
+        )
+        self.use_vicinity_gate = kwargs.get(
+            "use_vicinity_gate", self.__class__.default_use_vicinity_gate
+        )
+        self.num_vt_layers = kwargs.get(
+            "num_vt_layers", self.__class__.default_num_vt_layers
+        )
+        self.mlp_layer_dim = kwargs.get(
+            "mlp_layer_dim", self.__class__.default_mlp_layer_dim
+        )
+        self.use_old_norm = kwargs.get(
+            "use_old_norm", self.__class__.default_use_old_norm
+        )
+
+
+class CLIPTextDeprojectorMvtBase(CLIPPreTrainedModel):
+    config_class = CLIPTextDeprojectorMvtConfig
+
+    def __init__(self, config: CLIPTextDeprojectorMvtConfig):
+        super().__init__(config)
+        self.embed_dim = config.hidden_size
+
+    def Assign(self, p, d):
+        if p.shape != d.shape:
+            raise ValueError(f"Parameter shape doesn't match: {p.shape} v.s. {d.shape}")
+        p.data = d
+
+    def ForceAssign(self, p, d):
+        psize = p.shape
+        dsize = d.shape
+        if psize == dsize:
+            p.data = d
+            return
+
+        msize = [min(ps, ds) for ps, ds in zip(psize, dsize)]
+        if len(psize) == 1:
+            p.data[: msize[0]] = d[: msize[0]]
+        elif len(psize) == 2:
+            p.data[: msize[0], : msize[1]] = d[: msize[0], : msize[1]]
+        elif len(psize) == 3:
+            p.data[: msize[0], : msize[1], : msize[2]] = d[
+                : msize[0], : msize[1], : msize[2]
+            ]
+        else:
+            raise ValueError(f"ForceAssign supports up to 3D parameters. Got {psize}")
+
+
+class CLIPTextDeprojectorMvtMLP(CLIPTextDeprojectorMvtBase):
+    def __init__(self, config: CLIPTextDeprojectorMvtConfig):
+        super().__init__(config)
+        embed_dim = self.embed_dim
+
+        self.activation_fn = ACT2FN[config.hidden_act]
+        self.norm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
+        self.linear1 = nn.Linear(embed_dim, config.mlp_layer_dim)
+        self.linear2 = nn.Linear(config.mlp_layer_dim, embed_dim)
+
+    def InitWeights(self):
+        # Same as CLIPMLP
+        factor = self.config.initializer_factor
+        in_proj_std = (
+            (self.embed_dim**-0.5)
+            * ((2 * self.config.num_vt_layers) ** -0.5)
+            * factor
+        )
+        fc_std = (2 * self.embed_dim) ** -0.5 * factor
+        nn.init.normal_(self.linear1.weight, std=fc_std)
+        nn.init.normal_(self.linear2.weight, std=in_proj_std)
+
+    def LoadWeights(self, weights, prefix):
+        self.Assign(self.norm.weight, weights[prefix + "layer_norm2.weight"])
+        self.Assign(self.norm.bias, weights[prefix + "layer_norm2.bias"])
+        self.ForceAssign(self.linear1.weight, weights[prefix + "mlp.fc1.weight"])
+        self.ForceAssign(self.linear1.bias, weights[prefix + "mlp.fc1.bias"])
+        self.ForceAssign(self.linear2.weight, weights[prefix + "mlp.fc2.weight"])
+        self.ForceAssign(self.linear2.bias, weights[prefix + "mlp.fc2.bias"])
+
+    def forward(self, states):
+        residual = states
+        states = self.norm(states)
+        states = self.linear1(states)
+        states = self.activation_fn(states)
+        states = self.linear2(states)
+        return states + residual
+
+
+class CLIPTextDeprojectorMvtVicinity(CLIPTextDeprojectorMvtBase):
+    def __init__(self, config: CLIPTextDeprojectorMvtConfig):
+        super().__init__(config)
+
+        linear_input_size = 1 + self.config.vicinity
+        if config.all_in_vicinity:
+            linear_input_size += 1
+
+        if config.use_vicinity_mlp:
+            self.InitMLP(config, linear_input_size)
+        else:
+            self.InitLinear(config, linear_input_size)
+
+    def InitLinear(self, config, linear_input_size):
+        embed_dim = self.embed_dim
+        bias = False
+        if config.vicinity_act:
+            self.activation_fn = ACT2FN[config.vicinity_act]
+            bias = True
+        if config.use_vicinity_gate:
+            bias = True
+
+        self.linear = nn.Linear(embed_dim * linear_input_size, embed_dim, bias=bias)
+        if config.use_vicinity_gate:
+            self.gate_linear = nn.Linear(
+                embed_dim * (2 + self.config.vicinity), embed_dim
+            )
+            self.gate_activation_fn = ACT2FN["sigmoid"]
+
+    def InitMLP(self, config, linear_input_size):
+        embed_dim = self.embed_dim
+        self.activation_fn = ACT2FN[config.hidden_act]
+        self.linear1 = nn.Linear(embed_dim * linear_input_size, embed_dim)
+        self.linear2 = nn.Linear(embed_dim, embed_dim)
+
+    def InitWeights(self):
+        # Same as CLIPAttention.out_proj
+        factor = self.config.initializer_factor
+        fc_std = (self.embed_dim**-0.5) * factor
+        if self.config.use_vicinity_mlp:
+            nn.init.normal_(self.linear1.weight, std=fc_std)
+            nn.init.normal_(self.linear2.weight, std=fc_std)
+        else:
+            nn.init.normal_(self.linear.weight, std=fc_std)
+            if self.config.use_vicinity_gate:
+                nn.init.normal_(self.gate_linear.weight, std=fc_std)
+
+    def LoadWeights(self, weights, prefix):
+        # Do nothing
+        pass
+
+    def forward(self, states, vicinity):
+        residual = states
+
+        if self.config.vicinity_res_plus_embeds:
+            residual = residual + vicinity[:, :, : self.embed_dim]
+
+        combined_vicinity = None
+        if self.config.all_in_vicinity or self.config.use_vicinity_gate:
+            combined_vicinity = torch.cat([states, vicinity], dim=2)
+        if self.config.all_in_vicinity:
+            vicinity = combined_vicinity
+
+        if self.config.use_vicinity_mlp:
+            vicinity = self.RunMLP(vicinity)
+        else:
+            vicinity = self.RunLinear(vicinity, combined_vicinity)
+
+        return vicinity + residual
+
+    def RunLinear(self, vicinity, combined_vicinity):
+        vicinity = self.linear(vicinity)
+        if self.config.vicinity_act:
+            vicinity = self.activation_fn(vicinity)
+
+        if self.config.use_vicinity_gate:
+            gate = self.gate_linear(combined_vicinity)
+            gate = self.gate_activation_fn(gate)
+            vicinity = gate * vicinity
+
+        return vicinity
+
+    def RunMLP(self, vicinity):
+        vicinity = self.linear1(vicinity)
+        vicinity = self.activation_fn(vicinity)
+        vicinity = self.linear2(vicinity)
+        return vicinity
+
+    @classmethod
+    def MakeInput(cls, config, embeds, states, zeros, seq_len):
+        inputs = [embeds.repeat([1, seq_len, 1])]
+        for shift in range(config.vicinity):
+            zero_len = shift + 2
+            if zero_len > seq_len:
+                inputs.append(zeros.repeat([1, seq_len, 1]))
+            elif shift == 0:
+                inputs.append(torch.cat([zeros.repeat([1, 2, 1]), states], dim=1))
+            else:
+                inputs.append(
+                    torch.cat(
+                        [zeros.repeat([1, zero_len, 1]), states[:, :-shift, :]], dim=1
+                    )
+                )
+        return torch.cat(inputs, dim=2)
+
+
+class CLIPTextDeprojectorMvtLayer(CLIPTextDeprojectorMvtBase):
+    def __init__(
+        self, config: CLIPTextDeprojectorMvtConfig, reverse_idx: int, is_first: bool
+    ):
+        super().__init__(config)
+        self.reverse_idx = reverse_idx
+        self.apply_norm = config.use_old_norm or (not is_first)
+        embed_dim = self.embed_dim
+
+        if self.apply_norm:
+            self.norm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
+        self.attn = CLIPAttention(config)
+        self.vicinity = CLIPTextDeprojectorMvtVicinity(config)
+        self.mlp = CLIPTextDeprojectorMvtMLP(config)
+
+    def LoadWeights(self, weights):
+        orig_layer_idx = self.config.num_hidden_layers - self.reverse_idx - 1
+        prefix = f"text_model.encoder.layers.{orig_layer_idx}."
+
+        self.vicinity.LoadWeights(weights, prefix)
+        self.mlp.LoadWeights(weights, prefix)
+
+        # attn
+        self.Assign(
+            self.attn.k_proj.weight, weights[prefix + "self_attn.k_proj.weight"]
+        )
+        self.Assign(self.attn.k_proj.bias, weights[prefix + "self_attn.k_proj.bias"])
+        self.Assign(
+            self.attn.v_proj.weight, weights[prefix + "self_attn.v_proj.weight"]
+        )
+        self.Assign(self.attn.v_proj.bias, weights[prefix + "self_attn.v_proj.bias"])
+        self.Assign(
+            self.attn.q_proj.weight, weights[prefix + "self_attn.q_proj.weight"]
+        )
+        self.Assign(self.attn.q_proj.bias, weights[prefix + "self_attn.q_proj.bias"])
+        self.Assign(
+            self.attn.out_proj.weight, weights[prefix + "self_attn.out_proj.weight"]
+        )
+        self.Assign(
+            self.attn.out_proj.bias, weights[prefix + "self_attn.out_proj.bias"]
+        )
+
+        # norm
+        if self.apply_norm:
+            if self.config.use_old_norm:
+                if self.reverse_idx == 0:
+                    norm_prefix = "text_model.final_layer_norm."
+                else:
+                    norm_prefix = (
+                        f"text_model.encoder.layers.{orig_layer_idx + 1}.layer_norm1."
+                    )
+            else:
+                norm_prefix = f"{prefix}layer_norm1."
+            self.Assign(self.norm.weight, weights[norm_prefix + "weight"])
+            self.Assign(self.norm.bias, weights[norm_prefix + "bias"])
+
+    # Copied from transformers.models.bart.modeling_bart._make_causal_mask
+    def _make_causal_mask(
+        self,
+        bsz,
+        tgt_len,
+        dtype: torch.dtype,
+        device: torch.device,
+        past_key_values_length: int = 0,
+    ):
+        """
+        Make causal mask used for bi-directional self-attention.
+        """
+        # shape = (bsz, 1, tgt_len, tgt_len)
+        # ex) shape = (2, 1, 4, 4)
+        # [[[[0, min, min, min],
+        #    [0,   0, min, min],
+        #    [0,   0,   0, min],
+        #    [0,   0,   0,   0]],
+        #   [[0, min, min, min],
+        #    [0,   0, min, min],
+        #    [0,   0,   0, min],
+        #    [0,   0,   0,   0]]]]
+        mask = torch.full((tgt_len, tgt_len), torch.finfo(dtype).min, device=device)
+        mask_cond = torch.arange(mask.size(-1), device=device)
+        mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
+        mask = mask.to(dtype)
+
+        if past_key_values_length > 0:
+            zero_pads = torch.zeros(
+                tgt_len, past_key_values_length, dtype=dtype, device=device
+            )
+            mask = torch.cat([zero_pads, mask], dim=-1)
+        return mask[None, None, :, :].expand(
+            bsz, 1, tgt_len, tgt_len + past_key_values_length
+        )
+
+    def ApplyAttn(self, states):
+        device, dtype = states.device, states.dtype
+        bsz, seq_len, _ = states.shape
+
+        residual = states
+        if (not self.config.use_old_norm) and self.apply_norm:
+            states = self.norm(states)
+        mask = None
+        causal_mask = self._make_causal_mask(bsz, seq_len, dtype, device)
+        states = self.attn(states, mask, causal_mask)[0]
+        return states + residual
+
+    def forward(self, states, vicinity):
+        states = self.ApplyAttn(states)
+        states = self.vicinity(states, vicinity).clone()
+        states = self.mlp(states)
+        if self.config.use_old_norm and self.apply_norm:
+            states = self.norm(states)
+        return states.clone()
+
+
+class CLIPTextDeprojectorMvtModel(CLIPTextDeprojectorMvtBase):
+    def __init__(self, config: CLIPTextDeprojectorMvtConfig):
+        super().__init__(config)
+        max_seq_len = config.max_position_embeddings
+
+        # Position_ids is not saved.
+        self.position_ids = torch.arange(max_seq_len).expand((1, -1))
+
+        self.position_embedding = nn.Embedding(max_seq_len, self.embed_dim)
+        self.norm = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
+        self.layers = nn.ModuleList(
+            CLIPTextDeprojectorMvtLayer(
+                config, config.num_vt_layers - idx - 1, idx == 0
+            )
+            for idx in range(config.num_vt_layers)
+        )
+        if not config.use_old_norm:
+            self.final_norm = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
+
+    def to(self, *args, **kwargs):
+        super().to(*args, **kwargs)
+        self.position_ids = self.position_ids.to(*args, **kwargs)
+        return self
+
+    def LoadWeights(self, weights):
+        self.position_embedding.data = weights[
+            "text_model.embeddings.position_embedding.weight"
+        ]
+        for layer in self.layers:
+            layer.LoadWeights(weights)
+
+        # norm
+        orig_layer_idx = self.config.num_hidden_layers - self.config.num_vt_layers
+        prefix = f"text_model.encoder.layers.{orig_layer_idx}."
+        self.Assign(self.norm.weight, weights[prefix + "layer_norm1.weight"])
+        self.Assign(self.norm.bias, weights[prefix + "layer_norm1.bias"])
+        if not self.config.use_old_norm:
+            prefix = "text_model.final_layer_norm."
+            self.Assign(self.final_norm.weight, weights[prefix + "weight"])
+            self.Assign(self.final_norm.bias, weights[prefix + "bias"])
+
+    def Initialize(self, embeds, states):
+        embeds = embeds.unsqueeze(1)
+        all_states = torch.cat([embeds, states[:, :-1, :]], dim=1)
+        all_states = self.norm(all_states)
+        embeds = all_states[:, :1, :]
+        states = all_states[:, 1:, :]
+        zeros = torch.zeros_like(embeds)
+
+        input_states = torch.cat([embeds, zeros, states], dim=1)
+        position_embedding = self.position_embedding(
+            self.position_ids[:, : input_states.shape[1]]
+        )
+        input_states = input_states + position_embedding
+
+        seq_len = input_states.shape[1]
+        vicinity = CLIPTextDeprojectorMvtVicinity.MakeInput(
+            self.config, embeds, states, zeros, seq_len
+        )
+
+        return input_states, vicinity
+
+    def forward(self, embeds, states):
+        states, vicinity = self.Initialize(embeds, states)
+        for layer in self.layers:
+            states = layer(states, vicinity)
+        states = states[:, 1:, :]
+        if not self.config.use_old_norm:
+            states = self.final_norm(states)
+        return states
+
+
+class CLIPTextDeprojectorMvt(CLIPTextDeprojectorMvtBase):
+    default_fuse = 0.0
+
+    def __init__(self, config: CLIPTextDeprojectorMvtConfig):
+        super().__init__(config)
+        embed_dim = self.embed_dim
+
+        self.register_buffer(
+            "deprojection", torch.empty([embed_dim, config.projection_dim])
+        )
+        self.register_buffer("sos_embed", torch.empty([embed_dim]))
+        self.models = nn.ModuleList(
+            CLIPTextDeprojectorMvtModel(config) for _ in range(config.ensemble_size)
+        )
+
+    def to(self, *args, **kwargs):
+        self.deprojection.to(*args, **kwargs)
+        self.sos_embed.to(*args, **kwargs)
+        for model in self.models:
+            model.to(*args, **kwargs)
+        return self
+
+    def _init_weights(self, module):
+        # CLIPPreTrainedModel has _init_weights() for CLIP modules.
+        # This is called by model.from_pretrained().
+        # You can also call model.init_weights() to invoke this manually.
+
+        # CLIPAttention, LayerNorm and Linear.bias are initialized in the base class.
+        super()._init_weights(module)
+
+        if isinstance(module, CLIPTextDeprojectorMvtMLP):
+            module.InitWeights()
+        elif isinstance(module, CLIPTextDeprojectorMvtVicinity):
+            module.InitWeights()
+
+    def LoadWeights(self, weights):
+        for model in self.models:
+            model.LoadWeights(weights)
+
+    def forward(self, embeds, states):
+        return [model(embeds, s) for model, s in zip(self.models, states)]
+
+    def GetSOSEmb(self, bsz):
+        return self.sos_embed.view([1, 1, -1]).repeat([bsz, 1, 1])
+
+    def average(self, ls, size):
+        if size == 1:
+            return ls[0]
+        else:
+            return sum(ls) / size
+
+    def OffloadTensor(self, *ts):
+        for t in ts:
+            t.to("cpu")
+        torch.cuda.empty_cache()
+
+    def Deproject(self, embeds):
+        return nn.functional.linear(embeds, self.deprojection, None)
+
+    def RunForTraining(self, embeds, final_states, **kwargs):
+        if self.config.ensemble_size > 1:
+            raise ValueError(
+                f"ensemble_size must be 1 for training: {self.config.ensemble_size}"
+            )
+        bsz, embed_dim = embeds.shape
+        if embed_dim != self.config.hidden_size:
+            raise ValueError(
+                f"Dimension of `embeds` must match the model's dimension."
+                f" embeds.shape = {embeds.shape}"
+            )
+        states = final_states[:, 1:, :]  # Ignore SOS token
+        states = self(embeds, [states])[0]
+
+        sos_embeds = self.GetSOSEmb(bsz).to(states.device)
+        result = torch.cat([sos_embeds, states], dim=1).clone()
+        self.OffloadTensor(sos_embeds, states)
+        return result
+
+    def Inference(self, embeds, from_projected=False, fuse=None, **kwargs):
+        if fuse is None:
+            fuse = self.__class__.default_fuse
+
+        self.eval()
+        device = embeds.device
+        bsz, embed_dim = embeds.shape
+        ensemble_size = self.config.ensemble_size
+        max_seq_len = self.config.max_position_embeddings - 1
+        if embed_dim != self.config.hidden_size:
+            raise ValueError(
+                f"Dimension of `embeds` must match the model's dimension."
+                f" embeds.shape = {embeds.shape}"
+            )
+        if from_projected:
+            embeds = self.Deproject(embeds)
+
+        states = [
+            torch.empty([bsz, 1, embed_dim], device=device)
+            for _ in range(ensemble_size)
+        ]
+        final_states = []
+        for i in range(max_seq_len):
+            output = self(embeds, states)
+            # clone() is needed here to discard intermediate computation results.
+            last_states = [s[:, -1:, :].clone() for s in output]
+            self.OffloadTensor(*output)
+
+            # Take average for final states
+            average_last_state = self.average(last_states, ensemble_size)
+            final_states.append(average_last_state)
+
+            # Prepare for next token
+            if fuse != 0:
+                last_states = [
+                    (1.0 - fuse) * last_i + fuse * average_last_state
+                    for last_i in last_states
+                ]
+            next_states = [
+                torch.cat([s, ls], dim=1).clone() for s, ls in zip(states, last_states)
+            ]
+            self.OffloadTensor(*states)
+            self.OffloadTensor(*last_states)
+
+            states = next_states
+
+        sos_embeds = self.GetSOSEmb(bsz).to(device)
+        # clone() is needed here to discard intermediate computation results.
+        result = torch.cat([sos_embeds] + final_states, dim=1).clone()
+        self.OffloadTensor(sos_embeds)
+        self.OffloadTensor(*states)
+        self.OffloadTensor(*final_states)
+        return result
+
+
+#
 # -- Vicinity-Transformer model --
 #
 class CLIPTextDeprojectorVTConfig(CLIPTextConfig):
@@ -68,6 +612,7 @@ class CLIPTextDeprojectorVTConfig(CLIPTextConfig):
     default_mlp_dropout = 0.0
     default_use_residual_connection = True
     default_use_embeds_for_residual_connection = False
+    default_use_final_vicinity = False
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -146,6 +691,9 @@ class CLIPTextDeprojectorVTConfig(CLIPTextConfig):
         self.use_embeds_for_residual_connection = kwargs.get(
             "use_embeds_for_residual_connection",
             self.__class__.default_use_embeds_for_residual_connection,
+        )
+        self.use_final_vicinity = kwargs.get(
+            "use_final_vicinity", self.__class__.default_use_final_vicinity
         )
 
         if self.squashed and self.use_full_attention:
@@ -385,6 +933,13 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
             for p in self.mlp_layers.parameters():
                 p.requires_grad = False
 
+        # Final vicinity layer
+        if self.config.use_final_vicinity:
+            self.final_linear = nn.ModuleList(
+                nn.Linear(first_intermediate_dim, embed_dim, bias=False)
+                for _ in range(ensemble_size)
+            )
+
         # Final normalizer
         self.final_norm = nn.ModuleList(
             nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
@@ -454,6 +1009,9 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
                     torch.nn.init.normal_(m.weight, std=fc_std)
             for m in module.linear2:
                 torch.nn.init.normal_(m.weight, std=fc_std)
+            if module.config.use_final_vicinity:
+                for m in module.final_linear:
+                    torch.nn.init.normal_(m.weight, std=fc_std)
 
     def InitFromWeights(self, weights):
         if self.config.ensemble_size > 1:
@@ -555,6 +1113,23 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
             bsz, 1, tgt_len, tgt_len + past_key_values_length
         )
 
+    def MakeVicinityInput(self, embeds, states, seq_len):
+        if embeds is None:
+            inputs = []
+        else:
+            inputs = [embeds.repeat([1, seq_len, 1])]
+        inputs.append(states)
+
+        zeros = states[:, :1, :]
+        for i in range(1, self.config.vicinity):
+            if i > seq_len:
+                inputs.append(zeros.repeat([1, seq_len, 1]))
+            else:
+                inputs.append(
+                    torch.cat([zeros.repeat([1, i, 1]), states[:, :-i, :]], dim=1)
+                )
+        return torch.cat(inputs, dim=2)
+
     def ApplyMLPFirstLayer(self, idx, embeds, states, bsz, seq_len, embed_dim, device):
         first_layer_dim = self.config.first_layer_dim
         first_embed_layer_dim = self.config.first_embed_layer_dim
@@ -588,23 +1163,10 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
                 states_output = self.linear1_states2[idx](states_output)
                 states_output = states_output + states
 
-        zero_output = states_output[:, :1, :]
         if use_first_embed_layer:
-            first_output = [embeds_output.repeat([1, seq_len, 1]), states_output]
+            return self.MakeVicinityInput(embeds_output, states_output, seq_len)
         else:
-            first_output = [states_output]
-        for i in range(1, self.config.vicinity):
-            zero_states = torch.zeros([bsz, i, embed_dim], device=device)
-            if i > seq_len:
-                first_output.append(zero_output.repeat([1, seq_len, 1]))
-            else:
-                first_output.append(
-                    torch.cat(
-                        [zero_output.repeat([1, i, 1]), states_output[:, :-i, :]], dim=1
-                    )
-                )
-        first_output = torch.cat(first_output, dim=2)
-        return first_output.clone()
+            return self.MakeVicinityInput(None, states_output, seq_len)
 
     def ApplyIndividualFirstLayer(
         self, idx, embeds, states, bsz, seq_len, embed_dim, device
@@ -765,6 +1327,12 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
             if self.config.use_residual_connection:
                 states = states + residual
 
+        # Final vicinity layer
+        if self.config.use_final_vicinity:
+            states = states + self.final_linear[idx](
+                self.MakeVicinityInput(embeds, states, seq_len)
+            )
+
         # Final Norm
         return self.final_norm[idx](states)
 
@@ -888,6 +1456,7 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
             avg(self.self_attn)
         if mlp:
             avg(self.mlp_layers)
+            avg(self.final_linear)
             avg(self.final_norm)
         return self
 
@@ -930,6 +1499,8 @@ class CLIPTextDeprojectorVT(CLIPTextDeprojectorVTBase):
             copy_params(new_model.self_attn[i], model.self_attn[0])
             for j in range(new_config.num_mlp_layers):
                 copy_params(new_model.mlp_layers[i][j], model.mlp_layers[0][j])
+            if new_config.use_final_vicinity:
+                copy_params(new_model.final_linear[i], model.final_linear[0])
             copy_params(new_model.final_norm[i], model.final_norm[0])
 
         return new_model
