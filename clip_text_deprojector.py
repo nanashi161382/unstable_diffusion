@@ -119,11 +119,9 @@ class CLIPTextDeprojectorEnsemble(CLIPPreTrainedModel):
             for _ in range(ensemble_size)
         ]
         final_states = []
+        context = None
         for i in range(max_seq_len):
-            output = self(embeds, states)
-            # clone() is needed here to discard intermediate computation results.
-            last_states = [s[:, -1:, :].clone() for s in output]
-            self.OffloadTensor(*output)
+            last_states, context = self.InferenceStep(embeds, states, context)
 
             # Take average for final states
             average_last_state = self.average(last_states, ensemble_size)
@@ -151,6 +149,13 @@ class CLIPTextDeprojectorEnsemble(CLIPPreTrainedModel):
         self.OffloadTensor(*final_states)
         return result
 
+    def InferenceStep(self, embeds, states, context):
+        output = self(embeds, states)
+        # clone() is needed here to discard intermediate computation results.
+        last_states = [s[:, -1:, :].clone() for s in output]
+        self.OffloadTensor(*output)
+        return last_states, context
+
 
 #
 # -- LSTM model --
@@ -162,11 +167,13 @@ class CLIPTextDeprojectorLSTMConfig(CLIPTextConfig):
     default_lstm_hidden_size = 768 * 1
     default_use_extra = False
     default_use_extra_scale = False
+    default_use_extra_norm = False
     default_use_extra_linear = True
     default_use_hidden_0 = True
     default_use_context_0 = False
     default_use_state_0 = False
     default_use_sos = False
+    default_use_out_norm = False
     default_use_out_scale = False
     default_use_out_proj = False
     default_use_out_extended_proj = False
@@ -186,6 +193,9 @@ class CLIPTextDeprojectorLSTMConfig(CLIPTextConfig):
         self.use_extra_scale = kwargs.get(
             "use_extra_scale", self.__class__.default_use_extra_scale
         )
+        self.use_extra_norm = kwargs.get(
+            "use_extra_norm", self.__class__.default_use_extra_norm
+        )
         self.use_extra_linear = kwargs.get(
             "use_extra_linear", self.__class__.default_use_extra_linear
         )
@@ -197,6 +207,9 @@ class CLIPTextDeprojectorLSTMConfig(CLIPTextConfig):
         )
         self.use_state_0 = kwargs.get("use_state_0", self.__class__.default_use_state_0)
         self.use_sos = kwargs.get("use_sos", self.__class__.default_use_sos)
+        self.use_out_norm = kwargs.get(
+            "use_out_norm", self.__class__.default_use_out_norm
+        )
         self.use_out_scale = kwargs.get(
             "use_out_scale", self.__class__.default_use_out_scale
         )
@@ -216,6 +229,7 @@ class CLIPTextDeprojectorLSTMModel(CLIPPreTrainedModel):
     config_class = CLIPTextDeprojectorLSTMConfig
     freeze_attn = False
     freeze_mlp = False
+    freeze_final_norm = False
 
     def __init__(self, config: CLIPTextDeprojectorLSTMConfig):
         super().__init__(config)
@@ -234,15 +248,19 @@ class CLIPTextDeprojectorLSTMModel(CLIPPreTrainedModel):
                 self.context_proj = nn.Linear(embed_dim, hidden_dim)
         if config.use_out_scale:
             self.out_scale = nn.Parameter(torch.tensor(1.0))
-        if config.use_out_extended_proj:
+        elif config.use_out_extended_proj:
             self.out_proj = nn.Linear(embed_dim * 2, embed_dim)
         elif config.use_out_proj:
             self.out_proj = nn.Linear(embed_dim, embed_dim)
+        if config.use_out_norm:
+            self.out_norm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
         if config.use_extra:
             if config.use_extra_scale:
                 self.extra_scale = nn.Parameter(torch.tensor(1.0))
             if config.use_extra_linear:
                 self.embed_proj = nn.Linear(embed_dim, embed_dim)
+            if config.use_extra_norm:
+                self.embed_norm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
         if config.use_attention:
             # Position_ids is not saved.
             self.position_ids = torch.arange(max_seq_len).expand((1, -1))
@@ -259,6 +277,9 @@ class CLIPTextDeprojectorLSTMModel(CLIPPreTrainedModel):
                 for p in self.mlp.parameters():
                     p.requires_grad = False
         self.final_norm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
+        if self.__class__.freeze_final_norm:
+            for p in self.final_norm.parameters():
+                p.requires_grad = False
 
     def to(self, *args, **kwargs):
         super().to(*args, **kwargs)
@@ -348,13 +369,35 @@ class CLIPTextDeprojectorLSTMModel(CLIPPreTrainedModel):
         states = self.attn(states, mask, causal_mask)[0]
         return states
 
-    def forward(self, embeds, states, first_state):
-        device, dtype = states.device, states.dtype
-        bsz, seq_len, embed_dim = states.shape
-        hidden_dim = self.config.lstm_hidden_size
+    def ApplyLSTM(self, embeds, states, h_c):
+        residual = states
+        states, h_c = self.lstm(states, h_c)
+        if self.config.use_out_scale:
+            states = self.out_scale * states
+        elif self.config.use_out_extended_proj:
+            states = self.out_proj(torch.cat([states, residual], dim=2))
+        elif self.config.use_out_proj:
+            states = self.out_proj(states)
+        if self.config.use_out_norm:
+            states = self.out_norm(states)
+        states = states + residual
 
-        states = torch.cat([first_state, states], dim=1)
-        seq_len += 1
+        if self.config.use_extra:
+            embeds_output = embeds.unsqueeze(1)
+            if self.config.use_extra_linear:
+                embeds_output = embeds_output + self.embed_proj(embeds_output)
+            if self.config.use_extra_norm:
+                embeds_output = self.embed_norm(embeds_output)
+            if self.config.use_extra_scale:
+                states = self.extra_scale * states
+            states = states + embeds_output
+
+        return states, h_c
+
+    def InitializeHandC(self, embeds):
+        device, dtype = embeds.device, embeds.dtype
+        bsz, embed_dim = embeds.shape
+        hidden_dim = self.config.lstm_hidden_size
 
         if self.config.use_hidden_0:
             hidden = embeds.unsqueeze(0)
@@ -368,25 +411,25 @@ class CLIPTextDeprojectorLSTMModel(CLIPPreTrainedModel):
         else:
             context = torch.zeros([1, bsz, hidden_dim], dtype=dtype, device=device)
 
-        residual = states
-        states, _ = self.lstm(states, (hidden, context))
-        if self.config.use_out_extended_proj:
-            states = self.out_proj(torch.cat([states, residual], dim=2))
-        elif self.config.use_out_proj:
-            states = self.out_proj(states)
-        if self.config.use_out_scale:
-            states = self.out_scale * states
-        states = states + residual
+        return hidden, context
 
-        if self.config.use_extra:
-            embeds_output = embeds.unsqueeze(1)
-            if self.config.use_extra_linear:
-                embeds_output = embeds_output + self.embed_proj(embeds_output)
-            if self.config.use_extra_scale:
-                states = self.extra_scale * states
-            states = states + embeds_output
+    def forward(self, embeds, states, first_state, last_state, h_c):
+        states = torch.cat([first_state, states], dim=1)
+        if h_c is None:
+            h_c = self.InitializeHandC(embeds)
+
+        if last_state is None:
+            states, h_c = self.ApplyLSTM(embeds, states, h_c)
+        else:
+            last_state, h_c = self.ApplyLSTM(embeds, last_state, h_c)
+            states = last_state
+            # TODO: only works when use_attention is false.
+            if self.config.use_attention:
+                raise NotImplementedError()
 
         if self.config.use_attention:
+            seq_len = states.shape[1]
+
             residual = states
             position_embedding = self.position_embedding(self.position_ids[:, :seq_len])
             states = states + position_embedding
@@ -401,11 +444,14 @@ class CLIPTextDeprojectorLSTMModel(CLIPPreTrainedModel):
             states = states + residual
 
         states = self.final_norm(states)
-        return states
+        return states, h_c
 
 
 class CLIPTextDeprojectorLSTM(CLIPTextDeprojectorEnsemble):
     config_class = CLIPTextDeprojectorLSTMConfig
+
+    incremental = True
+    discard_states = False
 
     def __init__(self, config: CLIPTextDeprojectorLSTMConfig):
         super().__init__(config)
@@ -431,16 +477,69 @@ class CLIPTextDeprojectorLSTM(CLIPTextDeprojectorEnsemble):
             model.LoadWeights(weights)
 
     def forward(self, embeds, states):
-        states0 = states[0]
-        device, dtype = states0.device, states0.dtype
-        bsz, seq_len, embed_dim = states0.shape
+        first_state = self.GetFirstState(embeds)
+        return [
+            self.ApplyModel(model, embeds, s, first_state)
+            for model, s in zip(self.models, states)
+        ]
+
+    def ApplyModel(self, model, embeds, states, first_state):
+        if not self.__class__.discard_states:
+            return model(embeds, states, first_state, None, None)[0]
+
+        bsz, seq_len, embed_dim = states.shape
+        output = torch.empty([bsz, 0, embed_dim], device=states.device)
+        last_state = first_state
+        context = None
+        for _ in range(seq_len + 1):
+            last_state, context = model(
+                embeds, output, first_state, last_state, context
+            )
+            output = torch.cat([output, last_state.clone()], dim=1)
+        return output
+
+    def InferOnlyLast(self, embeds, states, context):
+        first_state = self.GetFirstState(embeds)
+
+        output_states = []
+        output_context = []
+        for i, model in enumerate(self.models):
+            if states[i].shape[1] == 0:
+                last_state = first_state
+            else:
+                last_state = states[i][:, -1:, :]
+            s, c = model(
+                embeds,
+                states[i],
+                first_state,
+                last_state,
+                None if context is None else context[i],
+            )
+            output_states.append(s)
+            output_context.append(c)
+
+        return output_states, output_context
+
+    def GetFirstState(self, embeds):
+        device, dtype = embeds.device, embeds.dtype
+        bsz, embed_dim = embeds.shape
+
         if self.config.use_state_0:
-            first_state = embeds.unsqueeze(1)
+            return embeds.unsqueeze(1)
         if self.config.use_sos:
-            first_state = self.GetSOSEmb(bsz, device)
-        else:
-            first_state = torch.zeros(bsz, 1, embed_dim, dtype=dtype, device=device)
-        return [model(embeds, s, first_state) for model, s in zip(self.models, states)]
+            return self.GetSOSEmb(bsz, device)
+        return torch.zeros(bsz, 1, embed_dim, dtype=dtype, device=device)
+
+    def InferenceStep(self, embeds, states, context):
+        if self.__class__.incremental:
+            last_states, context = self.InferOnlyLast(embeds, states, context)
+            return [ls.clone() for ls in last_states], context
+
+        output = self(embeds, states)
+        # clone() is needed here to discard intermediate computation results.
+        last_states = [s[:, -1:, :].clone() for s in output]
+        self.OffloadTensor(*output)
+        return last_states, context
 
 
 #
