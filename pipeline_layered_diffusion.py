@@ -390,6 +390,7 @@ class TextModel:
         self.mask_after_eos = 0.0
         self.random_after_eos = 0.0
         self.null_emb_after_eos = 0.0
+        self.mutation = None
         self.mixin = None
 
         # deprecated
@@ -418,6 +419,12 @@ class TextModel:
         Experimental. Remove later.
         """
         self.null_emb_after_eos = mask
+
+    def SetMutation(self, mutation):
+        """
+        Experimental. Remove later.
+        """
+        self.mutation = mutation
 
     def SetDeprojector(self, deprojector):
         # deprecated
@@ -560,6 +567,9 @@ class TextModel:
                 .to(self.target.device())
             )
             last_hidden_state = coeff * last_hidden_state
+
+        if self.mutation:
+            last_hidden_state = self.mutation(last_hidden_state, num_tokens)
 
         return last_hidden_state, truncated, pooled_output, num_tokens
 
@@ -805,8 +815,9 @@ class GeneralizedStrength:
 # -- Encoding is a class that defines how to encode a prompt --
 #
 class StandardEncoding:
-    def __init__(self, text: Optional[str] = None):
+    def __init__(self, text: Optional[str] = None, is_masked: bool = False):
         self._text = text
+        self._is_masked = is_masked
 
     def IsTerminated(self):
         return True
@@ -826,8 +837,10 @@ class StandardEncoding:
     def Encode(
         self, text_model: TextModel, text: str, default_encoding  #: StandardEncoding
     ):
-        emb = text_model.EncodeText(text, fail_on_truncation=True)[0]
-        return emb
+        emb = text_model.EncodeText(text, fail_on_truncation=True)
+        if self._is_masked:
+            return emb[0], emb[3]
+        return emb[0]
 
 
 class ConstEncoding(StandardEncoding):
@@ -1831,14 +1844,43 @@ class Prompts:
         )
         return index
 
+    def _GetEmbedding(self, te, remaining):
+        emb = te.GetEmbedding(remaining)
+        if isinstance(emb, tuple):
+            return emb
+        return emb, emb.shape[1]
+
     def PredictResiduals(
         self, scheduler, unet, controlnet, latents, timestep, remaining: float
     ):
         model_input = torch.cat(latents)
         model_input = scheduler.Get().scale_model_input(model_input, timestep)
-        text_embeddings = torch.cat(
-            [te.GetEmbedding(remaining) for te in self._prompts]
+        text_embeddings, num_tokens = list(
+            zip(*(self._GetEmbedding(te, remaining) for te in self._prompts))
         )
+        if min(num_tokens) == 77:
+            text_embeddings = torch.cat(text_embeddings, dim=0)
+            attention_mask = None
+        else:
+            max_num_tokens = max(num_tokens)  # 64
+            if max_num_tokens < 77:
+                text_embeddings = torch.cat(
+                    [te[:, :max_num_tokens] for te in text_embeddings], dim=0
+                )
+            attention_mask = [
+                torch.cat(
+                    [torch.ones(1, nt), torch.zeros(1, max_num_tokens - nt)],
+                    dim=1,
+                )
+                for nt in num_tokens
+            ]
+            attention_mask = torch.cat(attention_mask, dim=0).to(
+                device=model_input.device,
+                # dtype=torch.float16,  # model_input.dtype,
+            )
+            # Debug(1, "text_embeddings.shape", text_embeddings.shape)
+            # Debug(1, "attention_mask.shape", attention_mask.shape)
+
         if controlnet:
             down_block_residuals, mid_block_residuals = controlnet(
                 model_input, timestep, text_embeddings
@@ -1849,6 +1891,7 @@ class Prompts:
             model_input,
             timestep,
             encoder_hidden_states=text_embeddings,
+            encoder_attention_mask=attention_mask,
             down_block_additional_residuals=down_block_residuals,
             mid_block_additional_residual=mid_block_residuals,
         ).sample
