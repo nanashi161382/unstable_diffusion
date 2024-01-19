@@ -93,8 +93,7 @@ class CLIPTextDeprojectorEnsemble(CLIPPreTrainedModel):
         states = self(embeds, [states])[0]
 
         sos_embeds = self.GetSOSEmb(bsz, states.device)
-        result = torch.cat([sos_embeds, states], dim=1).clone()
-        self.OffloadTensor(sos_embeds, states)
+        result = torch.cat([sos_embeds, states], dim=1)
         return result
 
     def Inference(self, embeds, from_projected=False, fuse=None, **kwargs):
@@ -164,7 +163,31 @@ class CLIPTextDeprojectorLSTMConfig(CLIPTextConfig):
     model_type = "clip_text_deprojector_lstm_model"
 
     default_ensemble_size = 1
-    default_lstm_hidden_size = 768 * 1
+    default_use_model3 = False
+    default_num_layers = 2
+    default_add_embed_once = False
+    default_add_embed_at = -1
+    default_use_x_norm = True
+    default_combined_x_norm = False
+    default_x_residual = True
+    default_h0_residual = False
+    default_h0_excl_residual = False
+    default_x_out_residual = False
+    default_states_proj = False
+    default_out_proj = False
+    default_vicinity_mode = False
+    default_additional_mlp = False
+
+    default_lstm_hidden_size = 768 * 0
+    default_use_mlp = False
+
+    default_use_model2 = False
+    default_lstm_hidden_with_residual = False
+    default_mlp_intermediate_dim = 0
+    default_use_c_norm = True
+    default_use_h_norm = True
+    default_use_global_state_norm = False
+
     default_use_extra = False
     default_use_extra_scale = False
     default_use_extra_norm = False
@@ -178,7 +201,6 @@ class CLIPTextDeprojectorLSTMConfig(CLIPTextConfig):
     default_use_out_proj = False
     default_use_out_extended_proj = False
     default_use_attention = False
-    default_use_mlp = False
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -186,9 +208,54 @@ class CLIPTextDeprojectorLSTMConfig(CLIPTextConfig):
         self.ensemble_size = kwargs.get(
             "ensemble_size", self.__class__.default_ensemble_size
         )
+        self.use_model3 = kwargs.get("use_model3", self.__class__.default_use_model3)
+        self.num_layers = kwargs.get("num_layers", self.__class__.default_num_layers)
+        self.add_embed_once = kwargs.get(
+            "add_embed_once", self.__class__.default_add_embed_once
+        )
+        self.add_embed_at = kwargs.get(
+            "add_embed_at", self.__class__.default_add_embed_at
+        )
+        self.use_x_norm = kwargs.get("use_x_norm", self.__class__.default_use_x_norm)
+        self.combined_x_norm = kwargs.get(
+            "combined_x_norm", self.__class__.default_combined_x_norm
+        )
+        self.x_residual = kwargs.get("x_residual", self.__class__.default_x_residual)
+        self.h0_residual = kwargs.get("h0_residual", self.__class__.default_h0_residual)
+        self.h0_excl_residual = kwargs.get(
+            "h0_excl_residual", self.__class__.default_h0_excl_residual
+        )
+        self.x_out_residual = kwargs.get(
+            "x_out_residual", self.__class__.default_x_out_residual
+        )
+        self.states_proj = kwargs.get("states_proj", self.__class__.default_states_proj)
+        self.out_proj = kwargs.get("out_proj", self.__class__.default_out_proj)
+        self.vicinity_mode = kwargs.get(
+            "vicinity_mode", self.__class__.default_vicinity_mode
+        )
+        self.additional_mlp = kwargs.get(
+            "additional_mlp", self.__class__.default_additional_mlp
+        )
+
         self.lstm_hidden_size = kwargs.get(
             "lstm_hidden_size", self.__class__.default_lstm_hidden_size
         )
+        self.use_mlp = kwargs.get("use_mlp", self.__class__.default_use_mlp)
+        self.mlp_intermediate_dim = kwargs.get(
+            "mlp_intermediate_dim", self.__class__.default_mlp_intermediate_dim
+        )
+
+        self.use_model2 = kwargs.get("use_model2", self.__class__.default_use_model2)
+        self.lstm_hidden_with_residual = kwargs.get(
+            "lstm_hidden_with_residual",
+            self.__class__.default_lstm_hidden_with_residual,
+        )
+        self.use_c_norm = kwargs.get("use_c_norm", self.__class__.default_use_c_norm)
+        self.use_h_norm = kwargs.get("use_h_norm", self.__class__.default_use_h_norm)
+        self.use_global_state_norm = kwargs.get(
+            "use_global_state_norm", self.__class__.default_use_global_state_norm
+        )
+
         self.use_extra = kwargs.get("use_extra", self.__class__.default_use_extra)
         self.use_extra_scale = kwargs.get(
             "use_extra_scale", self.__class__.default_use_extra_scale
@@ -222,7 +289,390 @@ class CLIPTextDeprojectorLSTMConfig(CLIPTextConfig):
         self.use_attention = kwargs.get(
             "use_attention", self.__class__.default_use_attention
         )
-        self.use_mlp = kwargs.get("use_mlp", self.__class__.default_use_mlp)
+
+
+class CLIPTextDeprojectorLSTMModel3Layer(CLIPPreTrainedModel):
+    config_class = CLIPTextDeprojectorLSTMConfig
+
+    def __init__(self, config: CLIPTextDeprojectorLSTMConfig, index: int):
+        super().__init__(config)
+        self.index = index
+        self.embed_dim = config.hidden_size
+        embed_dim = self.embed_dim
+        hidden_dim = config.lstm_hidden_size
+        self.use_proj = (hidden_dim > 0) and (not config.vicinity_mode)
+        if hidden_dim == 0:
+            hidden_dim = embed_dim
+        self.long_residual = self.use_proj and (not config.out_proj)
+        self.states_proj = self.long_residual and config.states_proj
+
+        if self.use_proj:
+            self.h0_linear = nn.Linear(embed_dim, hidden_dim)
+
+        if self.states_proj:
+            self.states_linear = nn.Linear(embed_dim, embed_dim)
+
+        if config.vicinity_mode:
+            input_dim = embed_dim * 2
+        else:
+            input_dim = embed_dim
+        self.lstm = nn.LSTMCell(input_dim, hidden_dim)
+        if config.use_x_norm:
+            if config.combined_x_norm:
+                self.x_norm = nn.LayerNorm(input_dim, eps=config.layer_norm_eps)
+            else:
+                self.x_norm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
+        self.c_norm = nn.LayerNorm(hidden_dim, eps=config.layer_norm_eps)
+        self.h_norm = nn.LayerNorm(hidden_dim, eps=config.layer_norm_eps)
+
+        if config.vicinity_mode:
+            self.lstm_linear = nn.Linear(hidden_dim, embed_dim)
+            self.vicinity_linear = nn.Linear(embed_dim, embed_dim)
+        elif config.out_proj:
+            self.x_out_linear = nn.Linear(hidden_dim, embed_dim)
+            self.lstm_linear = nn.Linear(embed_dim, embed_dim)
+        else:
+            self.lstm_linear = nn.Linear(hidden_dim, embed_dim)
+
+        add_embed_at = config.add_embed_at
+        if add_embed_at < 0:
+            add_embed_at += config.num_layers
+        self.apply_embed_linear = (not config.add_embed_once) or (index == add_embed_at)
+        if self.apply_embed_linear:
+            self.embed_linear = nn.Linear(embed_dim, embed_dim)
+
+        self.additional_mlp = config.additional_mlp and (
+            config.mlp_intermediate_dim > 0
+        )
+        if self.additional_mlp:
+            if config.use_mlp:
+                raise NotImplementedError("additional_mlp with use_mlp")
+
+            self.mlp_linear1 = nn.Linear(embed_dim, config.mlp_intermediate_dim)
+            self.mlp_linear2 = nn.Linear(config.mlp_intermediate_dim, embed_dim)
+            self.mlp_act = ACT2FN[config.hidden_act]
+
+        if config.use_mlp:
+            if config.vicinity_mode:
+                raise NotImplementedError("mlp with vicinity_mode")
+            if not self.apply_embed_linear:
+                raise NotImplementedError("without embed linear")
+
+            if self.states_proj:
+                mlp_dim = embed_dim * 3
+            else:
+                mlp_dim = embed_dim * 2
+            self.mlp_linear = nn.Linear(mlp_dim, embed_dim)
+            self.mlp_act = ACT2FN[config.hidden_act]
+
+    def ZerosForLSTM(self, embeds, hidden_dim):
+        bsz = embeds.shape[0]
+        return torch.zeros(
+            [bsz, hidden_dim],
+            dtype=embeds.dtype,
+            layout=embeds.layout,
+            device=embeds.device,
+        )
+
+    def H0(self, embeds):
+        if self.config.vicinity_mode:
+            return self.ZerosForLSTM(embeds, self.config.lstm_hidden_size)
+        if self.use_proj:
+            return self.h0_linear(embeds)
+        return embeds
+
+    def C0(self, embeds):
+        if self.config.vicinity_mode:
+            return self.ZerosForLSTM(embeds, self.config.lstm_hidden_size)
+        if self.use_proj:
+            return self.ZerosForLSTM(embeds, self.config.lstm_hidden_size)
+        return torch.zeros_like(embeds)
+
+    def ApplyLSTM(self, embeds, state_i, h_c_h0):
+        h, c, h0 = h_c_h0
+        x = state_i
+        x_residual = x
+
+        if self.config.use_x_norm and (not self.config.combined_x_norm):
+            x = self.x_norm(x)
+        if self.config.vicinity_mode:
+            x = torch.cat([x, embeds], dim=1)
+        if self.config.use_x_norm and (self.config.combined_x_norm):
+            x = self.x_norm(x)
+
+        h, c = self.lstm(x, (h, c))
+        c = self.c_norm(c)
+        h = self.h_norm(h)
+
+        if self.config.x_residual:
+            h = h + x_residual
+        if self.config.h0_residual:
+            h = h + h0
+        o = h
+        if self.config.out_proj:
+            o = self.x_out_linear(o)
+        if self.config.h0_excl_residual:
+            h = h + h0
+        if self.config.x_out_residual:
+            o = o + x_residual
+        return o.unsqueeze(1), (h, c, h0)
+
+    def forward(self, embeds, states, h_c_h0):
+        if h_c_h0 is None:
+            h0 = self.H0(embeds)
+            h_c_h0 = (h0, self.C0(embeds), h0)
+
+        if self.config.vicinity_mode:
+            vicinity = states
+
+        if self.long_residual and (not self.config.vicinity_mode):
+            residual = states
+
+        seq_len = states.shape[1]
+        if seq_len == 1:
+            states, h_c_h0 = self.ApplyLSTM(embeds, states[:, 0, :], h_c_h0)
+        else:
+            next_states = []
+            for i in range(states.shape[1]):
+                state_i, h_c_h0 = self.ApplyLSTM(embeds, states[:, i, :], h_c_h0)
+                next_states.append(state_i)
+            states = torch.cat(next_states, dim=1)
+
+        if not self.config.use_mlp:
+            if self.config.vicinity_mode:
+                if self.embed_dim == self.config.lstm_hidden_size:
+                    states = self.lstm_linear(states) + states
+                else:
+                    states = self.lstm_linear(states)
+                states = states + self.vicinity_linear(vicinity) + vicinity
+            else:
+                if self.states_proj:
+                    residual = self.states_linear(residual)
+                elif not self.long_residual:
+                    residual = states
+                states = self.lstm_linear(states) + residual
+
+            if self.apply_embed_linear:
+                embeds = self.embed_linear(embeds) + embeds
+                embeds = embeds.unsqueeze(1).repeat([1, seq_len, 1])
+                states = states + embeds
+
+            if self.additional_mlp:
+                residual = states
+                states = self.mlp_linear1(states)
+                states = self.mlp_act(states)
+                states = self.mlp_linear2(states)
+                states = states + residual
+
+            return states, h_c_h0
+
+        # if use_mlp
+        embeds = self.embed_linear(embeds) + embeds
+        embeds = embeds.unsqueeze(1).repeat([1, seq_len, 1])
+        mlp_states = [embeds]
+
+        if self.states_proj:
+            mlp_states += [self.lstm_linear(states), self.states_linear(residual)]
+        else:
+            if not self.long_residual:
+                residual = states
+            mlp_states += [self.lstm_linear(states)]
+
+        mlp_states = torch.cat(mlp_states, dim=2)
+        mlp_states = self.mlp_act(mlp_states)
+        states = self.mlp_linear(mlp_states) + residual
+
+        return states, h_c_h0
+
+
+class CLIPTextDeprojectorLSTMModel3(CLIPPreTrainedModel):
+    config_class = CLIPTextDeprojectorLSTMConfig
+    freeze_final_norm = True
+
+    def __init__(self, config: CLIPTextDeprojectorLSTMConfig):
+        super().__init__(config)
+        self.embed_dim = config.hidden_size
+        embed_dim = self.embed_dim
+
+        self.layers = nn.ModuleList(
+            CLIPTextDeprojectorLSTMModel3Layer(config, i)
+            for i in range(config.num_layers)
+        )
+
+        self.final_norm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
+        if self.__class__.freeze_final_norm:
+            for p in self.final_norm.parameters():
+                p.requires_grad = False
+
+    def to(self, *args, **kwargs):
+        super().to(*args, **kwargs)
+        return self
+
+    def InitWeights(self):
+        pass
+
+    def MayAddWeight(self, k, v, weights, prefix):
+        if k.startswith(prefix):
+            weights[k[len(prefix) :]] = v
+
+    def LoadWeights(self, weights):
+        final_norm_weights = {}
+        for k, v in weights.items():
+            self.MayAddWeight(k, v, final_norm_weights, "text_model.final_layer_norm.")
+        self.final_norm.load_state_dict(final_norm_weights)
+
+    def forward(self, embeds, states, first_state, last_state, cont):
+        if cont is None:
+            cont = [None] * self.config.num_layers
+
+        if last_state is None:
+            # for whole states
+            states = torch.cat([first_state, states], dim=1)
+        else:
+            # only for last_state
+            states = last_state
+
+        for i, (layer, h_c) in enumerate(zip(self.layers, cont)):
+            states, h_c = layer(embeds, states, h_c)
+            cont[i] = h_c
+
+        return self.final_norm(states), cont
+
+
+class CLIPTextDeprojectorLSTMModel2(CLIPPreTrainedModel):
+    config_class = CLIPTextDeprojectorLSTMConfig
+    freeze_final_norm = True
+
+    def __init__(self, config: CLIPTextDeprojectorLSTMConfig):
+        super().__init__(config)
+        self.embed_dim = config.hidden_size
+        embed_dim = self.embed_dim
+        hidden_dim = config.lstm_hidden_size
+        self.use_proj = hidden_dim > 0
+        if not self.use_proj:
+            hidden_dim = embed_dim
+
+        if config.use_global_state_norm:
+            self.global_state_norm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
+
+        self.lstm = nn.LSTMCell(embed_dim, hidden_dim)
+        if config.use_c_norm:
+            self.c_norm = nn.LayerNorm(hidden_dim, eps=config.layer_norm_eps)
+        if config.use_h_norm:
+            self.h_norm = nn.LayerNorm(hidden_dim, eps=config.layer_norm_eps)
+
+        if self.use_proj:
+            self.lstm_in_linear = nn.Linear(embed_dim, hidden_dim)
+        self.embed_linear = nn.Linear(embed_dim, embed_dim)
+        self.lstm_linear = nn.Linear(hidden_dim, embed_dim)
+
+        if config.mlp_intermediate_dim > 0:
+            self.mlp_norm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
+            self.mlp_fc1 = nn.Linear(embeds, config.mlp_intermediate_dim)
+            self.mlp_fc2 = nn.Linear(config.mlp_intermediate_dim, embed_dim)
+            self.mlp_act = ACT2FN[config.hidden_act]
+
+        self.final_norm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
+        if self.__class__.freeze_final_norm:
+            for p in self.final_norm.parameters():
+                p.requires_grad = False
+
+    def to(self, *args, **kwargs):
+        super().to(*args, **kwargs)
+        return self
+
+    def InitWeights(self):
+        pass
+
+    def MayAddWeight(self, k, v, weights, prefix):
+        if k.startswith(prefix):
+            weights[k[len(prefix) :]] = v
+
+    def LoadWeights(self, weights):
+        final_norm_weights = {}
+        for k, v in weights.items():
+            self.MayAddWeight(k, v, final_norm_weights, "text_model.final_layer_norm.")
+        self.final_norm.load_state_dict(final_norm_weights)
+
+    def ApplyMLP(self, states):
+        states = self.mlp_norm(states)
+        states = self.mlp_fc1(states)
+        states = self.mlp_act(states)
+        states = self.mlp_fc2(states)
+        return states
+
+    def ApplyLSTM(self, state_i, h_c):
+        residual = state_i
+
+        hidden, context = self.lstm(state_i, h_c)
+        if self.config.use_c_norm:
+            context = self.c_norm(context)
+        if self.config.use_h_norm:
+            hidden = self.h_norm(hidden)
+
+        if self.use_proj:
+            next_state = hidden.unsqueeze(1)
+            if self.config.lstm_hidden_with_residual:
+                hidden = hidden + self.lstm_in_linear(residual)
+            return next_state, (hidden, context)
+
+        state_i = hidden + residual
+        if self.config.lstm_hidden_with_residual:
+            h_c = (state_i, context)
+        else:
+            h_c = (hidden, context)
+
+        return state_i.unsqueeze(1), h_c
+
+    def InitializeHandC(self, embeds):
+        device, dtype = embeds.device, embeds.dtype
+        bsz, embed_dim = embeds.shape
+        if self.use_proj:
+            hidden_dim = self.config.lstm_hidden_size
+        else:
+            hidden_dim = embed_dim
+
+        context = torch.zeros([bsz, hidden_dim], dtype=dtype, device=device)
+
+        if self.use_proj:
+            return self.lstm_in_linear(embeds), context
+        return embeds, context
+
+    def forward(self, embeds, states, first_state, last_state, h_c):
+        if h_c is None:
+            h_c = self.InitializeHandC(embeds)
+
+        if last_state is None:
+            # for whole states
+            states = torch.cat([first_state, states], dim=1)
+            if self.config.use_global_state_norm:
+                states = self.global_state_norm(states)
+            residual = states
+            next_states = []
+            for i in range(states.shape[1]):
+                state_i, h_c = self.ApplyLSTM(states[:, i, :], h_c)
+                next_states.append(state_i)
+            states = torch.cat(next_states, dim=1)
+        else:
+            # only for last_state
+            states = last_state
+            if self.config.use_global_state_norm:
+                states = self.global_state_norm(states)
+            residual = states
+            states, h_c = self.ApplyLSTM(states[:, 0, :], h_c)
+
+        if not self.use_proj:
+            residual = states
+
+        embeds = self.embed_linear(embeds) + embeds
+        embeds = embeds.unsqueeze(1).repeat([1, states.shape[1], 1])
+        states = self.lstm_linear(states) + residual
+        states = states + embeds
+
+        if self.config.mlp_intermediate_dim > 0:
+            states = self.ApplyMLP(states) + states
+
+        return self.final_norm(states), h_c
 
 
 class CLIPTextDeprojectorLSTMModel(CLIPPreTrainedModel):
@@ -457,8 +907,14 @@ class CLIPTextDeprojectorLSTM(CLIPTextDeprojectorEnsemble):
         super().__init__(config)
         embed_dim = self.embed_dim
 
+        if config.use_model3:
+            model_class = CLIPTextDeprojectorLSTMModel3
+        elif config.use_model2:
+            model_class = CLIPTextDeprojectorLSTMModel2
+        else:
+            model_class = CLIPTextDeprojectorLSTMModel
         self.models = nn.ModuleList(
-            CLIPTextDeprojectorLSTMModel(config) for _ in range(config.ensemble_size)
+            model_class(config) for _ in range(config.ensemble_size)
         )
 
     def to(self, *args, **kwargs):
@@ -469,7 +925,9 @@ class CLIPTextDeprojectorLSTM(CLIPTextDeprojectorEnsemble):
 
     def _init_weights(self, module):
         super()._init_weights(module)
-        if isinstance(module, CLIPTextDeprojectorLSTMModel):
+        if (isinstance(module, CLIPTextDeprojectorLSTMModel)) or (
+            isinstance(module, CLIPTextDeprojectorLSTMModel2)
+        ):
             module.InitWeights()
 
     def LoadWeights(self, weights):
@@ -495,7 +953,8 @@ class CLIPTextDeprojectorLSTM(CLIPTextDeprojectorEnsemble):
             last_state, context = model(
                 embeds, output, first_state, last_state, context
             )
-            output = torch.cat([output, last_state.clone()], dim=1)
+            # last_state = last_state.clone()
+            output = torch.cat([output, last_state], dim=1)
         return output
 
     def InferOnlyLast(self, embeds, states, context):
