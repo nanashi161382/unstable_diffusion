@@ -472,10 +472,14 @@ class RandomDataQueue:
 
 
 class DataSetBase:
-    def __init__(self, for_training, weight_mult=25, noise_std=0):
+    mask_as_weight = False
+    reverse_masked_tokens = False
+    only_after_eos = False
+    weight_mult = 25
+    noise_std = 0.0
+
+    def __init__(self, for_training):
         self.for_training = for_training
-        self.weight_mult = weight_mult
-        self.noise_std = noise_std
 
     def SetData(self, data):
         self.data = data
@@ -485,13 +489,11 @@ class DataSetBase:
 
     def __getitem__(self, index):
         embeds, _, last_state, mask = self.GetData(index)
-        embeds = self.AddNoise(embeds, self.noise_std)
+        embeds = self.AddNoise(embeds)
         return (
-            last_state,
+            self.ModifyLastState(last_state, mask),
             embeds,  # torch.cat([embeds.unsqueeze(0), last_state], dim=0)[:-1, :],
-            self.ComputeWeightsForTraining(mask)
-            if self.for_training
-            else self.ComputeWeightsForTest(mask),
+            self.ComputeWeights(mask),
             mask.to(device),
         )
 
@@ -503,25 +505,60 @@ class DataSetBase:
             offset += len(d)
         raise ValueError(f"index out of range: {index}")
 
-    def AddNoise(self, t, std):
+    def AddNoise(self, t):
+        std = self.__class__.noise_std
         return t if std == 0 else t + torch.normal(0, std, t.shape).to(t.device)
 
-    def ComputeWeightsForTraining(self, weights):
-        mult = math.sqrt(self.weight_mult)
-        weights = torch.ones(76) + (mult - 1) * weights[1:]
-        weights = torch.cat([torch.zeros(1), weights], dim=0)
-        weights = weights * (len(weights) / sum(weights))
-        return weights.to(device)
+    def ModifyLastState(self, last_state, mask):
+        if self.__class__.only_after_eos:
+            mask_len = int(sum(mask).item())
+            return torch.cat(
+                [
+                    last_state[:1],
+                    last_state[mask_len - 1 :],
+                    last_state[1 : mask_len - 1],
+                ],
+                dim=0,
+            )
 
-    def ComputeWeightsForTest(self, weights):
-        mult = math.sqrt(self.weight_mult)
-        weights = torch.ones(76) + (mult - 1) * weights[1:]
+        if self.__class__.reverse_masked_tokens:
+            mask_len = int(sum(mask).item())
+            return torch.cat(
+                [
+                    last_state[:1],
+                    torch.flip(last_state[1:mask_len], dims=[0]),
+                    last_state[mask_len:],
+                ],
+                dim=0,
+            )
+
+        return last_state
+
+    def ComputeWeights(self, mask):
+        if self.for_training:
+            # Do the same for training and test
+            pass
+
+        if self.__class__.only_after_eos:
+            seq_len = mask.shape[0]
+            mask_len = int(sum(mask).item())
+            return torch.cat(
+                [
+                    torch.zeros(1),
+                    torch.ones(seq_len - mask_len + 1),
+                    torch.zeros(mask_len - 2),
+                ],
+                dim=0,
+            ).to(device)
+
+        if self.__class__.mask_as_weight:
+            return torch.cat([torch.zeros(1), mask[1:]], dim=0).to(device)
+
+        mult = math.sqrt(self.__class__.weight_mult)
+        weights = torch.ones(76) + (mult - 1) * mask[1:]
         weights = torch.cat([torch.zeros(1), weights], dim=0)
         weights = weights * (len(weights) / sum(weights))
         return weights.to(device)
-        # weights = torch.cat([torch.zeros(1), weights[1:]], dim=0)
-        # weights = weights * (len(weights) / sum(weights))
-        # return weights.to(device)
 
 
 class DataSet(DataSetBase):
