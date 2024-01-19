@@ -1858,15 +1858,16 @@ class Prompts:
         text_embeddings, num_tokens = list(
             zip(*(self._GetEmbedding(te, remaining) for te in self._prompts))
         )
-        if min(num_tokens) == 77:
-            text_embeddings = torch.cat(text_embeddings, dim=0)
-            attention_mask = None
-        else:
-            max_num_tokens = max(num_tokens)  # 64
-            if max_num_tokens < 77:
-                text_embeddings = torch.cat(
-                    [te[:, :max_num_tokens] for te in text_embeddings], dim=0
-                )
+        min_num_tokens, max_num_tokens = min(num_tokens), max(num_tokens)
+        text_embeddings = torch.cat(
+            [
+                te[:, :max_num_tokens] if te.shape[1] > max_num_tokens else te
+                for te in text_embeddings
+            ],
+            dim=0,
+        )
+        attention_mask = None
+        if min_num_tokens < max_num_tokens:
             attention_mask = [
                 torch.cat(
                     [torch.ones(1, nt), torch.zeros(1, max_num_tokens - nt)],
@@ -1878,8 +1879,6 @@ class Prompts:
                 device=model_input.device,
                 # dtype=torch.float16,  # model_input.dtype,
             )
-            # Debug(1, "text_embeddings.shape", text_embeddings.shape)
-            # Debug(1, "attention_mask.shape", attention_mask.shape)
 
         if controlnet:
             down_block_residuals, mid_block_residuals = controlnet(
