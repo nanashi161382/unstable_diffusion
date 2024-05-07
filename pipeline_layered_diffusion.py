@@ -488,7 +488,7 @@ class TextModel:
         truncated = False
 
         if text_inputs.num_truncated_tokens > 0:
-            removed_text = self.decode_tokens(tokenized.overflowing_tokens)
+            removed_text = self.decode_tokens(text_inputs.overflowing_tokens)
             if fail_on_truncation:
                 raise ValueError(
                     f"The following part of your input was truncated because CLIP can only"
