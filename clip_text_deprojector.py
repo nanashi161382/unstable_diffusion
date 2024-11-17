@@ -1,5 +1,6 @@
 import copy
 from collections import deque
+import math
 from transformers import (
     CLIPPreTrainedModel,
     CLIPTextConfig,
@@ -38,28 +39,59 @@ def Debug(level: int, title: str, obj=None):
 
 
 #
-# -- Ensemble base --
+# -- Concat model --
 #
-class CLIPTextDeprojectorEnsemble(CLIPPreTrainedModel):
-    default_fuse = 0.0
+class CLIPTextDeprojectorConcat:
+    def __init__(self, model1, len1, model2, len2):
+        self.model1 = model1
+        self.len1 = len1
+        self.model2 = model2
+        self.len2 = len2
 
+    def to(self, *args, **kwargs):
+        self.model1.to(*args, **kwargs)
+        self.model2.to(*args, **kwargs)
+        return self
+
+    def Deproject(self, embeds):
+        return self.model1.Deproject(embeds)
+
+    def Inference(self, embeds, from_projected=False, fuse=None, **kwargs):
+        result1 = self.model1.Inference(embeds, from_projected, fuse, **kwargs)
+        result2 = self.model2.Inference(embeds, from_projected, fuse, **kwargs)
+        return torch.cat(
+            [result1[:, : self.len1, :], result2[:, 1 : self.len2 + 1, :]], dim=1
+        )
+
+
+#
+# -- Base --
+#
+class CLIPTextDeprojectorModel(CLIPPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
-        self.embed_dim = config.hidden_size
-        embed_dim = self.embed_dim
+        self.embed_size = config.hidden_size
+        self.seq_len = config.max_position_embeddings
+
+    def OffloadTensor(self, *ts):
+        for t in ts:
+            t.to("cpu")
+        torch.cuda.empty_cache()
+
+
+class CLIPTextDeprojectorBase(CLIPTextDeprojectorModel):
+    def __init__(self, config):
+        super().__init__(config)
 
         self.register_buffer(
-            "deprojection", torch.empty([embed_dim, config.projection_dim])
+            "deprojection", torch.empty([self.embed_size, config.projection_dim])
         )
-        self.register_buffer("sos_embed", torch.empty([embed_dim]))
+        self.register_buffer("sos_embed", torch.empty([self.embed_size]))
 
     def to(self, *args, **kwargs):
         self.deprojection.to(*args, **kwargs)
         self.sos_embed.to(*args, **kwargs)
         return self
-
-    def forward(self, embeds, states):
-        raise NotImplementedError()
 
     def GetSOSEmb(self, bsz, device):
         return self.sos_embed.view([1, 1, -1]).repeat([bsz, 1, 1]).to(device)
@@ -67,16 +99,597 @@ class CLIPTextDeprojectorEnsemble(CLIPPreTrainedModel):
     def Deproject(self, embeds):
         return nn.functional.linear(embeds, self.deprojection, None)
 
+    def RunForTraining(self, embeds, final_states, **kwargs):
+        raise NotImplementedError()
+
+    def Inference(self, embeds, from_projected=False, **kwargs):
+        raise NotImplementedError()
+
+
+class ElementWiseLinear(CLIPTextDeprojectorModel):
+    def __init__(self, config, f_size):
+        super().__init__(config)
+        self.weight = nn.Parameter(torch.ones(f_size))
+        self.bias = nn.Parameter(torch.zeros(f_size))
+
+    def forward(self, x):
+        return (self.weight * x) + self.bias
+
+
+#
+# -- VRNN (Vicinity RNN) model --
+#
+class CLIPTextDeprojectorVRNNConfig(CLIPTextConfig):
+    model_type = "clip_text_deprojector_vrnn_model"
+
+    default_residual = False
+    default_detach_all = False
+    default_detach_s2 = False
+
+    default_m1_norm = False
+    default_m1_vicinity = 1
+    default_m1_split = False
+    default_m1_type = "linear"
+    default_m1_f_size = 64
+    default_m1_p_size = 3
+    default_m1_layers = 1
+
+    default_m2_use_s2 = False
+    default_m2_norm = False
+    default_m2_vicinity = 1
+    default_m2_type = "linear"
+    default_m2_f_size = 64
+    default_m2_p_size = 3
+    default_m2_layers = 1
+    default_m2_ex_split = False
+    default_m2_ex_type = "same"
+    default_m2_ex_f_size = 64
+    default_m2_ex_p_size = 3
+
+    default_channel_act = "gelu"
+    default_channel_ewl = False
+    default_channel_ewl2 = True
+
+    # deprecated
+    default_m1_channel = False
+    default_m1_mlp = False
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        c = self.__class__
+
+        self.residual = kwargs.get("residual", c.default_residual)
+        self.detach_all = kwargs.get("detach_all", c.default_detach_all)
+        self.detach_s2 = kwargs.get("detach_s2", c.default_detach_s2)
+
+        self.m1_norm = kwargs.get("m1_norm", c.default_m1_norm)
+        self.m1_vicinity = kwargs.get("m1_vicinity", c.default_m1_vicinity)
+        self.m1_split = kwargs.get("m1_split", c.default_m1_split)
+        self.m1_type = kwargs.get("m1_type", c.default_m1_type)
+        self.m1_f_size = kwargs.get("m1_f_size", c.default_m1_f_size)
+        self.m1_p_size = kwargs.get("m1_p_size", c.default_m1_p_size)
+        self.m1_layers = kwargs.get("m1_layers", c.default_m1_layers)
+
+        self.m2_use_s2 = kwargs.get("m2_use_s2", c.default_m2_use_s2)
+        self.m2_norm = kwargs.get("m2_norm", c.default_m2_norm)
+        self.m2_vicinity = kwargs.get("m2_vicinity", c.default_m2_vicinity)
+        self.m2_type = kwargs.get("m2_type", c.default_m2_type)
+        self.m2_f_size = kwargs.get("m2_f_size", c.default_m2_f_size)
+        self.m2_p_size = kwargs.get("m2_p_size", c.default_m2_p_size)
+        self.m2_layers = kwargs.get("m2_layers", c.default_m2_layers)
+        self.m2_ex_split = kwargs.get("m2_ex_split", c.default_m2_ex_split)
+        self.m2_ex_type = kwargs.get("m2_ex_type", c.default_m2_ex_type)
+        self.m2_ex_f_size = kwargs.get("m2_ex_f_size", c.default_m2_ex_f_size)
+        self.m2_ex_p_size = kwargs.get("m2_ex_p_size", c.default_m2_ex_p_size)
+
+        self.channel_act = kwargs.get("channel_act", c.default_channel_act)
+        self.channel_ewl = kwargs.get("channel_ewl", c.default_channel_ewl)
+        self.channel_ewl2 = kwargs.get("channel_ewl2", c.default_channel_ewl2)
+
+        # deprecated
+        self.m1_channel = kwargs.get("m1_channel", c.default_m1_channel)
+        self.m1_mlp = kwargs.get("m1_mlp", c.default_m1_mlp)
+        if self.m1_channel:
+            self.m1_type = "channel"
+        elif self.m1_mlp:
+            self.m1_type = "mlp"
+
+
+class CLIPTextDeprojectorVRNN(CLIPTextDeprojectorBase):
+    config_class = CLIPTextDeprojectorVRNNConfig
+
+    freeze_final_norm = True
+
+    def __init__(self, config: CLIPTextDeprojectorVRNNConfig):
+        super().__init__(config)
+        embed_size = self.embed_size
+        self.detach_s2 = config.detach_s2
+        self.detach_all = config.detach_all
+
+        self.model1 = CLIPTextDeprojectorVRNN_1(config)
+        self.model2 = CLIPTextDeprojectorVRNN_2(config)
+
+        self.final_norm = nn.LayerNorm(embed_size, eps=config.layer_norm_eps)
+        if self.__class__.freeze_final_norm:
+            for p in self.final_norm.parameters():
+                p.requires_grad = False
+
+    def to(self, *args, **kwargs):
+        super().to(*args, **kwargs)
+        self.model1.to(*args, **kwargs)
+        self.model2.to(*args, **kwargs)
+        self.final_norm.to(*args, **kwargs)
+        return self
+
+    def MayAddWeight(self, k, v, weights, prefix):
+        if k.startswith(prefix):
+            weights[k[len(prefix) :]] = v
+
+    def LoadWeights(self, weights):
+        final_norm_weights = {}
+        for k, v in weights.items():
+            self.MayAddWeight(k, v, final_norm_weights, "text_model.final_layer_norm.")
+        self.final_norm.load_state_dict(final_norm_weights)
+
+    def RunForTraining(self, embeds, final_states, **kwargs):
+        return self.Inference(embeds)
+
+    def Inference(self, embeds, from_projected=False, **kwargs):
+        device = embeds.device
+        bsz = embeds.shape[0]
+
+        if from_projected:
+            embeds = self.Deproject(embeds)
+
+        embeds = embeds.unsqueeze(1)
+        states = self.model1(embeds)
+        states = [self.final_norm(s) for s in states]
+        if self.detach_all:
+            final_states = states
+            states = [s.detach() for s in states]
+
+        s2 = states[0]
+        if self.detach_s2 and not self.detach_all:
+            s2 = s2.detach()
+
+        while len(states) < (self.seq_len - 1):
+            sn = self.model2(s2, states)
+            sn = self.final_norm(sn)
+            if self.detach_all:
+                final_states.append(sn)
+                states.append(sn.detach())
+            else:
+                states.append(sn)
+
+        if not self.detach_all:
+            final_states = states
+        return torch.cat([self.GetSOSEmb(bsz, device)] + final_states, dim=1).clone()
+
+
+class CLIPTextDeprojectorVRNN_Model(CLIPTextDeprojectorModel):
+    def __init__(
+        self,
+        config: CLIPTextDeprojectorVRNNConfig,
+        norm,
+        vicinity,
+        type,
+        f_size,
+        p_size,
+        layers,
+        ex_type=None,
+        ex_f_size=None,
+        ex_p_size=None,
+    ):
+        super().__init__(config)
+        self.use_residual = config.residual
+        self.use_norm = norm
+        self.vicinity = vicinity
+
+        self.type = type
+        self.f_size = f_size
+        self.p_size = p_size
+
+        if ex_type and (ex_type != "same"):
+            self.ex_type = ex_type
+            self.ex_f_size = ex_f_size
+            self.ex_p_size = ex_p_size
+        else:
+            self.ex_type = type
+            self.ex_f_size = f_size
+            self.ex_p_size = p_size
+
+        if layers < 1:
+            raise ValueError(f"{layers=} should be more than 0.")
+        self.layers = layers
+        self.extra_layers = self.layers - 1
+
+    def CreateLayer(self, config, in_size, out_size, extra=False, split=False):
+        if extra:
+            n_type = self.ex_type
+            f_size = self.ex_f_size
+            p_size = self.ex_p_size
+        else:
+            n_type = self.type
+            f_size = self.f_size
+            p_size = self.p_size
+
+        match n_type:
+            case "channel":
+                return CLIPTextDeprojectorVRNN_Channelled(
+                    config, f_size, in_size, out_size
+                )
+            case "mlp":
+                return CLIPTextDeprojectorVRNN_MLP(
+                    config, f_size, in_size, out_size, split=split
+                )
+            case "lorl":
+                return CLIPTextDeprojectorVRNN_LowRankLinear(
+                    config, f_size, in_size, out_size
+                )
+            case "pool":
+                return CLIPTextDeprojectorVRNN_PoolMLP(
+                    config, p_size, f_size, in_size, out_size
+                )
+            case _:
+                return CLIPTextDeprojectorVRNN_Linear(
+                    config, in_size, out_size, split=split
+                )
+
+    def RunLayer(self, results, impl, norm, residual):
+        if norm:
+            results = [norm[i](r) for i, r in enumerate(results)]
+        results = impl(results)
+        if residual:
+            results = [r + res for r, res in zip(results, residual)]
+        return results
+
+
+class CLIPTextDeprojectorVRNN_1(CLIPTextDeprojectorVRNN_Model):
+    def __init__(self, config: CLIPTextDeprojectorVRNNConfig):
+        super().__init__(
+            config,
+            config.m1_norm,
+            config.m1_vicinity,
+            config.m1_type,
+            config.m1_f_size,
+            config.m1_p_size,
+            config.m1_layers,
+        )
+        if self.use_norm:
+            self.norm = nn.LayerNorm(self.embed_size, eps=config.layer_norm_eps)
+        self.impl = self.CreateLayer(config, 1, self.vicinity, split=config.m1_split)
+
+        if self.extra_layers > 0:
+            if self.use_norm:
+                self.extra_norm = nn.ModuleList(
+                    nn.ModuleList(
+                        nn.LayerNorm(self.embed_size, eps=config.layer_norm_eps)
+                        for _ in range(self.vicinity)
+                    )
+                    for _ in range(self.extra_layers)
+                )
+            self.extra_impl = nn.ModuleList(
+                self.CreateLayer(
+                    config,
+                    self.vicinity,
+                    self.vicinity,
+                    extra=True,
+                    split=config.m1_split,
+                )
+                for _ in range(self.extra_layers)
+            )
+
+    def forward(self, embeds):
+        residual = [embeds] * self.vicinity if self.use_residual else None
+        norm = [self.norm] if self.use_norm else None
+        results = self.RunLayer([embeds], self.impl, norm, residual)
+
+        for i in range(self.extra_layers):
+            residual = results if self.use_residual else None
+            norm = self.extra_norm[i] if self.use_norm else None
+            results = self.RunLayer(results, self.extra_impl[i], norm, residual)
+
+        return results
+
+
+class CLIPTextDeprojectorVRNN_2(CLIPTextDeprojectorVRNN_Model):
+    def __init__(self, config: CLIPTextDeprojectorVRNNConfig):
+        super().__init__(
+            config,
+            config.m2_norm,
+            config.m2_vicinity,
+            config.m2_type,
+            config.m2_f_size,
+            config.m2_p_size,
+            config.m2_layers,
+            config.m2_ex_type,
+            config.m2_ex_f_size,
+            config.m2_ex_p_size,
+        )
+        self.use_s2 = config.m2_use_s2
+
+        mult = self.vicinity
+        if self.use_s2:
+            mult += 1
+
+        self.impl = self.CreateLayer(config, mult, 1)
+
+        if self.use_norm:
+            # [0] for the last layer
+            # [n] for the (n-1)th layer
+            self.norm = nn.ModuleList(
+                nn.ModuleList(
+                    nn.LayerNorm(self.embed_size, eps=config.layer_norm_eps)
+                    for _ in range(mult)
+                )
+                for _ in range(self.layers)
+            )
+
+        if self.extra_layers > 0:
+            self.extra_impl = nn.ModuleList(
+                self.CreateLayer(
+                    config, mult, mult, extra=True, split=config.m2_ex_split
+                )
+                for _ in range(self.extra_layers)
+            )
+
+    def MakeInput(self, states):
+        if self.vicinity <= len(states):
+            return states[-self.vicinity :]
+
+        return [
+            torch.zeros_like(states[0]) for _ in range(self.vicinity - len(states))
+        ] + states
+
+    def forward(self, s2, states):
+        states = self.MakeInput(states)
+        if self.use_s2:
+            states = [s2] + states
+
+        for i in range(self.extra_layers):
+            residual = states if self.use_residual else None
+            norm = self.norm[i + 1] if self.use_norm else None
+            states = self.RunLayer(states, self.extra_impl[i], norm, residual)
+
+        residual = states[-1:] if self.use_residual else None
+        norm = self.norm[0] if self.use_norm else None
+        return self.RunLayer(states, self.impl, norm, residual)[0]
+
+
+class CLIPTextDeprojectorVRNN_Linear(CLIPTextDeprojectorModel):
+    def __init__(
+        self,
+        config: CLIPTextDeprojectorVRNNConfig,
+        input_mult,
+        output_mult,
+        split=False,
+    ):
+        super().__init__(config)
+        self.input_mult = input_mult
+        self.output_mult = output_mult
+        self.split = split
+
+        if split and (input_mult == output_mult):
+            self.fc = nn.ModuleList(
+                nn.Linear(self.embed_size, self.embed_size) for _ in range(input_mult)
+            )
+        else:
+            self.fc = nn.Linear(
+                self.embed_size * input_mult, self.embed_size * output_mult
+            )
+
+    def forward(self, states):
+        if self.split:
+            return [self.fc[i](s) for i, s in enumerate(states)]
+
+        if len(states) == 1:
+            states = states[0]
+        else:
+            states = torch.cat(states, dim=2)
+
+        states = self.fc(states)
+        if self.output_mult == 1:
+            return [states]
+        states = states.view(states.shape[:-1] + (-1, self.embed_size))
+        return [states[:, :, i, :] for i in range(self.output_mult)]
+
+
+class CLIPTextDeprojectorVRNN_Channelled(CLIPTextDeprojectorModel):
+    def __init__(
+        self,
+        config: CLIPTextDeprojectorVRNNConfig,
+        f_size,
+        input_mult,
+        output_mult,
+    ):
+        super().__init__(config)
+        if f_size < 1:
+            raise ValueError(f"{f_size=} should be more than 0.")
+
+        self.output_mult = output_mult
+        self.use_ewl1 = config.channel_ewl
+        self.use_ewl2 = config.channel_ewl and config.channel_ewl2
+
+        self.act = ACT2FN[config.channel_act]
+        self.fc0 = nn.ModuleList(
+            nn.Linear(1, f_size, bias=False) for _ in range(input_mult)
+        )
+        self.fc1 = nn.ModuleList(
+            nn.Linear(self.embed_size, f_size) for _ in range(input_mult)
+        )
+        self.fc2 = nn.Linear(f_size * input_mult, output_mult)
+
+        if self.use_ewl1:
+            self.ewl1 = nn.ModuleList(
+                ElementWiseLinear(config, self.embed_size) for _ in range(input_mult)
+            )
+        if self.use_ewl2:
+            self.ewl2 = nn.ModuleList(
+                ElementWiseLinear(config, self.embed_size) for _ in range(input_mult)
+            )
+
+    def Channelize(self, i, s):
+        s1 = s
+        if self.use_ewl1:
+            s1 = self.ewl1[i](s1)
+        s1 = s1.unsqueeze(-1)
+        s1 = self.fc0[i](s1)
+        ss = self.fc1[i](s).unsqueeze(-2)
+        ss = ss.expand(s1.shape)
+        return self.act(s1 + ss)
+
+    def forward(self, states):
+        states = torch.cat(
+            [self.Channelize(i, s) for i, s in enumerate(states)], dim=-1
+        )
+        states = self.fc2(states)
+        states = states.transpose(-2, -1)
+        states = [states[:, :, i, :] for i in range(self.output_mult)]
+        if self.use_ewl2:
+            states = [self.ewl2[i](s) for i, s in enumerate(states)]
+        return states
+
+
+class CLIPTextDeprojectorVRNN_MLP(CLIPTextDeprojectorModel):
+    def __init__(
+        self,
+        config: CLIPTextDeprojectorVRNNConfig,
+        f_size,
+        input_mult,
+        output_mult,
+        split=False,
+    ):
+        super().__init__(config)
+        if f_size < 1:
+            raise ValueError(f"{f_size=} should be more than 0.")
+
+        self.act = ACT2FN[config.hidden_act]
+        self.o_f_size = -1
+        if split and (input_mult == output_mult):
+            self.fc1 = nn.ModuleList(
+                nn.Linear(self.embed_size, f_size) for _ in range(input_mult)
+            )
+            self.fc2 = nn.ModuleList(
+                nn.Linear(f_size, self.embed_size) for _ in range(input_mult)
+            )
+        elif split and (input_mult == 1):
+            self.fc1 = nn.ModuleList(
+                nn.Linear(self.embed_size, f_size * output_mult)
+                for _ in range(input_mult)
+            )
+            self.fc2 = nn.ModuleList(
+                nn.Linear(f_size, self.embed_size) for _ in range(output_mult)
+            )
+        else:
+            self.fc1 = nn.ModuleList(
+                nn.Linear(self.embed_size, f_size) for _ in range(input_mult)
+            )
+            self.fc2 = nn.Linear(f_size * input_mult, self.embed_size * output_mult)
+
+        self.split = split
+        self.f_size = f_size
+        self.input_mult = input_mult
+        self.output_mult = output_mult
+
+    def forward(self, states):
+        states = [self.fc1[i](s) for i, s in enumerate(states)]
+        if self.split and (self.input_mult == self.output_mult):
+            states = [self.act(s) for s in states]
+            states = [self.fc2[i](s) for i, s in enumerate(states)]
+            return states
+        elif self.split and (self.input_mult == 1):
+            states = self.act(torch.cat(states, dim=-1))
+            states = states.view(states.shape[:-1] + (-1, self.f_size))
+            states = [self.fc2[i](states[:, :, i, :]) for i in range(self.output_mult)]
+            return states
+
+        states = torch.cat(states, dim=-1)
+        states = self.act(states)
+        states = self.fc2(states)
+        if self.output_mult == 1:
+            return [states]
+        states = states.view(states.shape[:-1] + (-1, self.embed_size))
+        return [states[:, :, i, :] for i in range(self.output_mult)]
+
+
+class CLIPTextDeprojectorVRNN_LowRankLinear(CLIPTextDeprojectorModel):
+    def __init__(
+        self,
+        config: CLIPTextDeprojectorVRNNConfig,
+        f_size,
+        input_mult,
+        output_mult,
+    ):
+        super().__init__(config)
+        if f_size < 1:
+            raise ValueError(f"{f_size=} should be more than 0.")
+
+        self.fc1 = nn.ModuleList(
+            nn.Linear(self.embed_size, f_size) for _ in range(input_mult)
+        )
+        self.fc2 = nn.Linear(f_size * input_mult, self.embed_size * output_mult)
+
+        self.output_mult = output_mult
+
+    def forward(self, states):
+        states = [self.fc1[i](s) for i, s in enumerate(states)]
+        states = torch.cat(states, dim=-1)
+        states = self.fc2(states)
+        if self.output_mult == 1:
+            return [states]
+        states = states.view(states.shape[:-1] + (-1, self.embed_size))
+        return [states[:, :, i, :] for i in range(self.output_mult)]
+
+
+class CLIPTextDeprojectorVRNN_PoolMLP(CLIPTextDeprojectorModel):
+    def __init__(
+        self,
+        config: CLIPTextDeprojectorVRNNConfig,
+        p_size,
+        f_size,
+        input_mult,
+        output_mult,
+    ):
+        super().__init__(config)
+        if f_size < 1:
+            raise ValueError(f"{f_size=} should be more than 0.")
+
+        self.pool = nn.MaxPool1d(p_size)
+        self.fc1 = nn.ModuleList(
+            nn.Linear(self.embed_size, f_size * p_size) for _ in range(input_mult)
+        )
+        self.fc2 = nn.Linear(f_size * input_mult, self.embed_size * output_mult)
+
+        self.output_mult = output_mult
+
+    def forward(self, states):
+        states = [self.pool(self.fc1[i](s)) for i, s in enumerate(states)]
+        states = torch.cat(states, dim=-1)
+        states = self.fc2(states)
+        if self.output_mult == 1:
+            return [states]
+        states = states.view(states.shape[:-1] + (-1, self.embed_size))
+        return [states[:, :, i, :] for i in range(self.output_mult)]
+
+
+#
+# -- Ensemble --
+#
+class CLIPTextDeprojectorEnsemble(CLIPTextDeprojectorBase):
+    default_fuse = 0.0
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.embed_dim = self.embed_size
+
+    def forward(self, embeds, states):
+        raise NotImplementedError()
+
     def average(self, ls, size):
         if size == 1:
             return ls[0]
         else:
             return sum(ls) / size
-
-    def OffloadTensor(self, *ts):
-        for t in ts:
-            t.to("cpu")
-        torch.cuda.empty_cache()
 
     def RunForTraining(self, embeds, final_states, **kwargs):
         if self.config.ensemble_size > 1:
@@ -2811,12 +3424,11 @@ class CLIPTextDeprojectorConfig(CLIPTextConfig):
         )
 
 
-class CLIPTextDeprojectorBase(CLIPPreTrainedModel):
+class CLIPTextDeprojector(CLIPPreTrainedModel):
     config_class = CLIPTextDeprojectorConfig
     _no_split_modules = ["CLIPEncoderLayer"]
 
-    def __init__(self, config: CLIPTextDeprojectorConfig):
-        super().__init__(config)
+    default_fuse = 0.0
 
     def _build_causal_attention_mask(self, bsz, seq_len, dtype):
         # lazily create causal attention mask, with full attention between the vision tokens
@@ -2826,10 +3438,6 @@ class CLIPTextDeprojectorBase(CLIPPreTrainedModel):
         mask.triu_(1)  # zero out the lower diagonal
         mask = mask.unsqueeze(1)  # expand mask
         return mask
-
-
-class CLIPTextDeprojector(CLIPTextDeprojectorBase):
-    default_fuse = 0.0
 
     def __init__(self, config: CLIPTextDeprojectorConfig):
         super().__init__(config)
